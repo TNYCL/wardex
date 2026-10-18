@@ -16,6 +16,10 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/wardex daemon --config %h/.config/wardex/wardex.toml
+# The systemd user manager's PATH usually lacks ~/.local/bin, where the
+# claude and codex CLIs are commonly installed. Adjust, or set absolute paths
+# in drivers.claude.bin / drivers.codex.bin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # WARDEX_TOKEN, webhook URLs and secrets.
 EnvironmentFile=-%h/.config/wardex/env
 Restart=on-failure
