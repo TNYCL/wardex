@@ -174,7 +174,7 @@ transparently.
 | M0 | Repo skeleton, licenses, CI, example config, scope (done) |
 | M1 | Spikes: Claude question flow, Codex app-server handshake; record fixtures (done, see `drivers.md`) |
 | M2 | Event model, store, session manager (done) |
-| M3 | Claude driver |
+| M3 | Claude driver (done) |
 | M4 | CLI + Unix socket API |
 | M5 | Codex driver |
 | M6 | Stuck/reminder detection, webhooks |

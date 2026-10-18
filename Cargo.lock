@@ -1545,6 +1545,10 @@ name = "wardex-drivers"
 version = "0.0.1"
 dependencies = [
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
  "wardex-core",
 ]
 

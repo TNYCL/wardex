@@ -16,6 +16,9 @@ All notable changes to this project are documented here. The format follows
 - Config loading (file, env, flags) with path expansion.
 - Process launcher with optional systemd scopes and resource sampling.
 - Git helpers for change summaries and `--worktree`.
+- Claude Code driver: stream-json + SDK control protocol (questions,
+  permission requests, interrupts), resume via `--resume`, read-only via plan
+  mode with permission requests denied.
 
 - `docs/drivers.md`: verified Claude Code and Codex protocol behavior (M1).
 - Sanitized driver fixtures recorded from real sessions, plus recording and
