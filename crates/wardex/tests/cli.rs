@@ -35,6 +35,10 @@ systemd_scope = false
 
 [drivers.claude]
 bin = "{script}"
+
+# Never start a real agent CLI from tests.
+[drivers.codex]
+bin = "{script}"
 "#,
                 dir = dir.path().display(),
                 script = script.display()
@@ -218,7 +222,16 @@ fn errors_are_reported() {
     assert!(!out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["code"], "not_found");
-    let out = env.run(&["run", "--driver", "codex", "--prompt", "x"]);
+    let out = env.run(&[
+        "run",
+        "--driver",
+        "claude",
+        "--prompt",
+        "x",
+        "--slice",
+        "nope.slice",
+    ]);
     assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("resources.slices"));
     env.stop_daemon(daemon);
 }

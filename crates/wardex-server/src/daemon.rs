@@ -12,7 +12,7 @@ use wardex_core::driver::Driver;
 use wardex_core::manager::Manager;
 use wardex_core::process::Launcher;
 use wardex_core::store::{Store, StoreError};
-use wardex_drivers::ClaudeDriver;
+use wardex_drivers::{ClaudeDriver, CodexDriver};
 
 use crate::{http, socket, webhook};
 
@@ -32,7 +32,10 @@ pub enum DaemonError {
 
 /// Drivers for every supported CLI.
 pub fn drivers(config: &Config) -> Vec<Arc<dyn Driver>> {
-    vec![Arc::new(ClaudeDriver::new(config.drivers.claude.clone()))]
+    vec![
+        Arc::new(ClaudeDriver::new(config.drivers.claude.clone())),
+        Arc::new(CodexDriver::new(config.drivers.codex.clone())),
+    ]
 }
 
 pub async fn run(config: Config) -> Result<(), DaemonError> {

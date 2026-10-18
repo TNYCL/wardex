@@ -2,6 +2,8 @@
 //! into [`wardex_core::Event`]s. Protocol details: `docs/drivers.md`.
 
 pub mod claude;
+pub mod codex;
 pub mod runner;
 
 pub use claude::ClaudeDriver;
+pub use codex::CodexDriver;
