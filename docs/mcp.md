@@ -1,11 +1,38 @@
 # MCP
 
-Wardex serves an MCP endpoint at `http://<http_listen>/mcp` (Streamable HTTP).
 Every CLI capability is an MCP tool, and the tools return the same JSON as the
-CLI's `--json` output. Bots use it to start sessions, answer questions and
+CLI's `--json` output. Bots use them to start sessions, answer questions and
 read results; webhooks ([`webhooks.md`](webhooks.md)) tell them when to look.
+Two transports serve the same tools:
 
-## Enabling it
+- **stdio:** `wardex mcp --stdio` forwards every call to the running daemon
+  over its Unix socket. No token or HTTP needed; a client on another machine
+  reaches it over SSH, e.g. with the command `ssh <host> wardex mcp --stdio`.
+- **Streamable HTTP:** `http://<http_listen>/mcp`, served by the daemon when a
+  token is set, for clients that can only connect by URL (usually through a
+  tunnel).
+
+## stdio over SSH
+
+Configure the MCP client to run a command instead of a URL:
+
+```json
+{
+  "mcpServers": {
+    "wardex": {
+      "command": "ssh",
+      "args": ["<host>", "~/.local/bin/wardex", "mcp", "--stdio"]
+    }
+  }
+}
+```
+
+Non-interactive SSH sessions often lack `~/.local/bin` in `PATH`, hence the
+full path. The SSH login is the access control: whoever can run commands as
+that user can drive Wardex anyway. If the daemon is not running, tools return
+an `unavailable:` error.
+
+## Enabling HTTP
 
 HTTP (and with it MCP) is only served when the token env var
 (`auth.token_env`, default `WARDEX_TOKEN`) is set. Without a token the daemon

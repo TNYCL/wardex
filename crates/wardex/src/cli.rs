@@ -50,6 +50,15 @@ pub enum Command {
         /// While following, also print streamed message text as it arrives.
         #[arg(long)]
         deltas: bool,
+        /// With --since-seq: if there is nothing newer yet, wait up to SECS
+        /// (max 60) for the next event.
+        #[arg(
+            long,
+            value_name = "SECS",
+            requires = "since_seq",
+            conflicts_with = "follow"
+        )]
+        wait: Option<u64>,
     },
     /// Summarize a session: result, changes, duration, counts.
     Summary { id: String },
@@ -79,6 +88,14 @@ pub enum Command {
     },
     /// List pending questions and approvals of all sessions.
     Pending,
+    /// Serve the MCP tools on stdin/stdout, forwarding to the running daemon
+    /// (e.g. `ssh host wardex mcp --stdio` as an MCP client command).
+    Mcp {
+        /// Use stdin/stdout (the only transport here; HTTP MCP is served by
+        /// the daemon at /mcp).
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Live sessions with questions, resources and latest events, plus
     /// sessions ended in the last 24 hours.
     Overview {

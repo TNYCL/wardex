@@ -259,3 +259,99 @@ fn run_prints_only_the_id_on_stdout() {
     }
     env.stop_daemon(daemon);
 }
+
+/// `wardex mcp --stdio` as an MCP client would spawn it (e.g. over ssh):
+/// tools forward to the daemon; without a daemon they report it.
+#[test]
+fn mcp_over_stdio() {
+    use rmcp::ServiceExt;
+    use rmcp::model::{CallToolRequestParams, CallToolResult};
+    use rmcp::transport::TokioChildProcess;
+
+    fn text(r: &CallToolResult) -> &str {
+        &r.content[0].as_text().unwrap().text
+    }
+
+    let env = Env::new("question");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut cmd = tokio::process::Command::new(BIN);
+    cmd.arg("--config")
+        .arg(&env.config)
+        .args(["mcp", "--stdio"])
+        .env_remove("WARDEX_SOCKET")
+        .env_remove("WARDEX_TOKEN")
+        .current_dir(env.dir.path());
+    let client = rt
+        .block_on(().serve(TokioChildProcess::new(cmd).unwrap()))
+        .expect("mcp handshake");
+    let call = |tool: &str, args: Value| {
+        let Value::Object(args) = args else { panic!() };
+        rt.block_on(
+            client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args)),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(rt.block_on(client.list_all_tools()).unwrap().len(), 12);
+    let r = call("overview", serde_json::json!({}));
+    assert_eq!(r.is_error, Some(true));
+    assert!(text(&r).starts_with("unavailable:"), "{}", text(&r));
+
+    let daemon = env.start_daemon();
+    let cwd = env.dir.path().to_string_lossy().into_owned();
+    let r = call(
+        "run",
+        serde_json::json!({"driver": "claude", "cwd": cwd, "prompt": "ask", "agent": "ssh-bot"}),
+    );
+    let id = serde_json::from_str::<Value>(text(&r)).unwrap()["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.wait_state(&id, "waiting_input");
+    let pending: Value =
+        serde_json::from_str(text(&call("pending_questions", serde_json::json!({})))).unwrap();
+    let qid = pending[0]["question_id"].as_str().unwrap();
+    let r = call(
+        "answer",
+        serde_json::json!({"id": id, "question_id": qid, "text": "blue"}),
+    );
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    // Long-poll until the turn is done (the wait happens in the daemon).
+    let mut since = 0;
+    let mut done = false;
+    for _ in 0..20 {
+        let r = call(
+            "tail",
+            serde_json::json!({"id": id, "since_seq": since, "wait_secs": 5}),
+        );
+        for e in serde_json::from_str::<Value>(text(&r))
+            .unwrap()
+            .as_array()
+            .unwrap()
+        {
+            since = e["seq"].as_u64().unwrap();
+            done |= e["type"] == "done";
+        }
+        if done {
+            break;
+        }
+    }
+    assert!(done);
+    env.wait_state(&id, "done");
+    let summary: Value =
+        serde_json::from_str(text(&call("summary", serde_json::json!({"id": id})))).unwrap();
+    assert_eq!(summary["last_result"], "blue");
+    assert_eq!(summary["agent"], "ssh-bot");
+
+    // The CLI's `tail --wait` returns once the wait is over.
+    let out = env.run(&["--json", "tail", &id, "--since-seq", "1000", "--wait", "1"]);
+    assert!(out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        serde_json::json!([])
+    );
+
+    rt.block_on(client.cancel()).unwrap();
+    env.stop_daemon(daemon);
+}

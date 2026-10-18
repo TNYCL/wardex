@@ -375,6 +375,20 @@ pub fn expand_path(input: &str) -> String {
     expand_with(input, |k| std::env::var(k).ok())
 }
 
+/// `/run/user/<uid>` when it exists (where systemd puts `XDG_RUNTIME_DIR`),
+/// so a CLI started without the variable, e.g. from a non-interactive SSH
+/// command, finds the socket of a daemon running under systemd.
+fn default_runtime_dir() -> String {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::metadata("/proc/self") {
+        let dir = format!("/run/user/{}", meta.uid());
+        if Path::new(&dir).is_dir() {
+            return dir;
+        }
+    }
+    std::env::temp_dir().display().to_string()
+}
+
 fn expand_with(input: &str, get: impl Fn(&str) -> Option<String>) -> String {
     let home = get("HOME").unwrap_or_else(|| "/tmp".into());
     let lookup = |name: &str| -> String {
@@ -386,7 +400,7 @@ fn expand_with(input: &str, get: impl Fn(&str) -> Option<String>) -> String {
             "XDG_CONFIG_HOME" => format!("{home}/.config"),
             "XDG_STATE_HOME" => format!("{home}/.local/state"),
             "XDG_DATA_HOME" => format!("{home}/.local/share"),
-            "XDG_RUNTIME_DIR" => std::env::temp_dir().display().to_string(),
+            "XDG_RUNTIME_DIR" => default_runtime_dir(),
             _ => String::new(),
         }
     };

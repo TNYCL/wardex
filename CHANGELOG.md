@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `wardex mcp --stdio`: the MCP tools on stdin/stdout, forwarding to the
+  daemon's Unix socket, so remote clients can connect with
+  `ssh <host> wardex mcp --stdio` without HTTP, tunnel or token.
+- `tail --wait SECS` (with `--since-seq`) and `wait_secs` in the socket API:
+  the daemon waits for the next event.
 - MCP server at `/mcp` (rmcp, stateless Streamable HTTP with JSON
   responses): `run`, `overview`, `list`, `status`, `tail` (paging with
   `since_seq`, long-poll with `wait_secs`), `summary`, `pending_questions`,
@@ -58,6 +63,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Without `XDG_RUNTIME_DIR` (e.g. a non-interactive SSH command), the default
+  socket path falls back to `/run/user/<uid>` instead of the temp dir, so the
+  CLI finds a daemon running under systemd.
 - `run` prints warnings on stderr so stdout holds only the session id.
 - Daemon logs use colors only on a terminal.
 - Question rows are written in order with events, so `pending` never misses
