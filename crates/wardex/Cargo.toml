@@ -1,0 +1,21 @@
+[package]
+name = "wardex"
+description = "Daemon and CLI that runs, watches and manages Claude Code and Codex sessions, exposed over MCP"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+wardex-core.workspace = true
+wardex-drivers.workspace = true
+wardex-server.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

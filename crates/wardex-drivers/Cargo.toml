@@ -1,0 +1,15 @@
+[package]
+name = "wardex-drivers"
+description = "Claude Code and Codex drivers for Wardex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+wardex-core.workspace = true
+
+[lints]
+workspace = true

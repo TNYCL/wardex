@@ -1,0 +1,25 @@
+# systemd user unit for Wardex.
+#
+#   install -Dm755 target/release/wardex ~/.local/bin/wardex
+#   install -Dm644 deploy/wardex.service ~/.config/systemd/user/wardex.service
+#   systemctl --user daemon-reload && systemctl --user enable --now wardex
+#   loginctl enable-linger "$USER"   # keep running after logout
+#
+# Run an installed release binary, never one built from a working checkout.
+# Sessions live in their own systemd scopes, so they are not part of this
+# unit's cgroup.
+
+[Unit]
+Description=Wardex agent session daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wardex daemon --config %h/.config/wardex/wardex.toml
+# WARDEX_TOKEN, webhook URLs and secrets.
+EnvironmentFile=-%h/.config/wardex/env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

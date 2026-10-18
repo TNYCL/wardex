@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TNYCL/wardex"
+homepage = "https://github.com/TNYCL/wardex"
+keywords = ["claude-code", "codex", "agents", "orchestrator", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+wardex-core = { path = "crates/wardex-core", version = "0.0.1" }
+wardex-drivers = { path = "crates/wardex-drivers", version = "0.0.1" }
+wardex-server = { path = "crates/wardex-server", version = "0.0.1" }
+
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

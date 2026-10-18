@@ -1,0 +1,53 @@
+# Example Wardex config. Copy to ~/.config/wardex/wardex.toml and adjust.
+# Precedence: this file < environment (WARDEX_*) < CLI flags.
+# Secrets are never written here; only the names of env vars that hold them.
+
+[daemon]
+# Local CLI API. No token needed; protected by file permissions.
+socket = "$XDG_RUNTIME_DIR/wardex.sock"
+# HTTP for /healthz and /mcp. Refuses to start without a token.
+http_listen = "127.0.0.1:7878"
+database = "$XDG_STATE_HOME/wardex/wardex.db"
+
+[auth]
+# Env var holding the bearer token for HTTP/MCP. Always required.
+token_env = "WARDEX_TOKEN"
+
+[sessions]
+# Resume orphaned sessions automatically when the daemon starts.
+auto_resume_orphaned = false
+# Directory (relative to the repo) for --worktree sessions.
+worktree_dir = ".worktree"
+
+[timeouts]
+question_reminder_secs = 180
+question_stuck_secs = 480
+# Silence while no tool is running before a session counts as stuck.
+idle_stuck_secs = 480
+
+[retention]
+events_days = 30
+max_db_mb = 2048
+
+[drivers.claude]
+bin = "claude"
+# default_model = "..."
+
+[drivers.codex]
+bin = "codex"
+# default_model = "..."
+# default_reasoning = "medium"
+
+[resources]
+systemd_scope = true
+# Slices that `wardex run --slice <name>` may use.
+slices = ["build.slice", "tests.slice"]
+
+# Webhooks. Repeat the table for multiple targets.
+[[webhooks]]
+url_env = "WARDEX_WEBHOOK_URL"
+events = ["question", "approval", "reminder", "done", "error", "stuck"]
+# Optional: env var with an HMAC-SHA256 secret; sent as X-Wardex-Signature.
+hmac_secret_env = "WARDEX_WEBHOOK_SECRET"
+# Optional extra headers; values are env var names.
+# headers = { "Authorization" = "WARDEX_WEBHOOK_AUTH" }

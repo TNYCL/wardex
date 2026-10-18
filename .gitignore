@@ -1,0 +1,21 @@
+/target/
+
+# Local config and secrets
+wardex.toml
+.env
+.env.*
+!.env.example
+
+# Local state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/.worktree/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
