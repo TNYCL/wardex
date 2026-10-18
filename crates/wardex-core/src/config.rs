@@ -29,6 +29,7 @@ pub enum ConfigError {
 pub struct Config {
     pub daemon: DaemonConfig,
     pub auth: AuthConfig,
+    pub http: HttpConfig,
     pub sessions: SessionsConfig,
     pub timeouts: TimeoutsConfig,
     pub retention: RetentionConfig,
@@ -71,6 +72,28 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             token_env: "WARDEX_TOKEN".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    /// `Host` header values `/mcp` accepts besides `localhost`, `127.0.0.1`
+    /// and `::1` (DNS rebinding protection). Add the tunnel hostname here.
+    /// `"*"` accepts any host.
+    pub allowed_hosts: Vec<String>,
+    /// Requests per minute with a missing or wrong token before HTTP answers
+    /// `429` to every unauthenticated request. Requests with the right token
+    /// are never limited. 0 disables the limit.
+    pub auth_failures_per_minute: u32,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            auth_failures_per_minute: 30,
         }
     }
 }
@@ -285,6 +308,14 @@ impl Config {
         if let Some(v) = get("WARDEX_HTTP_LISTEN") {
             self.daemon.http_listen = v;
         }
+        if let Some(v) = get("WARDEX_ALLOWED_HOSTS") {
+            self.http.allowed_hosts = v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(String::from)
+                .collect();
+        }
         if let Some(v) = get("WARDEX_DATABASE") {
             self.daemon.database = v;
         }
@@ -441,6 +472,16 @@ mod tests {
         let mut config = Config::parse("[daemon]\nsocket = \"/a.sock\"\n").unwrap();
         config.apply_env(env(&[("WARDEX_SOCKET", "/b.sock")]));
         assert_eq!(config.daemon.socket, "/b.sock");
+    }
+
+    #[test]
+    fn allowed_hosts_from_env() {
+        let mut config = Config::default();
+        config.apply_env(env(&[(
+            "WARDEX_ALLOWED_HOSTS",
+            "a.example, b.example:443,",
+        )]));
+        assert_eq!(config.http.allowed_hosts, ["a.example", "b.example:443"]);
     }
 
     #[test]

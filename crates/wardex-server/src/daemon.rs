@@ -90,7 +90,7 @@ pub async fn run_with(
     }
     webhook::spawn(&config, &manager);
 
-    if config.token().is_some() {
+    if let Some(token) = config.token() {
         let addr: SocketAddr = config
             .daemon
             .http_listen
@@ -99,7 +99,7 @@ pub async fn run_with(
         let m = manager.clone();
         let rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = http::serve(addr, m, rx).await {
+            if let Err(e) = http::serve(addr, m, token, rx).await {
                 tracing::error!(error = %e, "http server failed");
             }
         });

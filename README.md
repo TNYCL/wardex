@@ -35,10 +35,21 @@ wardex list [-a] | status <id> | summary <id> | pending
 wardex tail <id> [-f] [-n N] [--since-seq N] [--deltas]
 wardex answer <id> <text> | answer <id> --item ID=TEXT ... [--question Q]
 wardex send <id> <message> | interrupt <id> | stop <id> | resume <id> [message]
+wardex overview [-n EVENTS]        # live sessions, questions, resources at a glance
 ```
 
 Session ids can be shortened to any unique prefix. Every command accepts
 `--json`. The CLI talks to the daemon over a Unix socket (mode 0600).
+
+## MCP
+
+With a token set (`WARDEX_TOKEN`), the daemon serves the same capabilities as
+MCP tools at `http://127.0.0.1:7878/mcp` (Streamable HTTP, bearer token
+required): `run`, `overview`, `list`, `status`, `tail`, `summary`,
+`pending_questions`, `answer`, `send`, `interrupt`, `stop`, `resume`. See
+[`docs/mcp.md`](docs/mcp.md) for the tools and the bot loop, and
+[`deploy/tunnel.md`](deploy/tunnel.md) for exposing it through Cloudflare
+Tunnel or Tailscale Funnel.
 
 ## License
 

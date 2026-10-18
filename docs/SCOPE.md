@@ -204,15 +204,20 @@ interrupts (`done` interrupted on both drivers).
 ### 2.1 MCP server (rmcp, Streamable HTTP)
 
 - Every CLI capability is an MCP tool: `run`, `list`, `status`, `tail`
-  (paged with `since_seq`), `summary`, `answer`, `send`, `stop`, `resume`,
-  `pending_questions`.
+  (paged with `since_seq`, optional long-poll with `wait_secs`), `summary`,
+  `answer`, `send`, `interrupt`, `stop`, `resume`, `pending_questions`.
+  Results are the CLI's `--json` output. Reference: [`mcp.md`](mcp.md).
+- Stateless Streamable HTTP with JSON responses (no MCP session to lose on a
+  daemon restart).
 - `overview`: all live sessions with state, pending questions, latest events,
   duration and resource usage in one call.
 - **Auth:** a bearer token from env is **always required** for HTTP/MCP; the
   daemon refuses to serve HTTP without one. Tunnels forward traffic to
   localhost, so "localhost without token" would be open to the internet.
   Tokenless access exists only on the local Unix socket. Constant-time token
-  comparison and basic rate limiting.
+  comparison and a rate limit on failed authentications
+  (`http.auth_failures_per_minute`). `/mcp` checks the `Host` header against
+  localhost and `http.allowed_hosts` (DNS rebinding protection).
 - MCP is pull-based. Webhooks wake clients; clients pull details over MCP.
 
 ### 2.2 Exposure
@@ -231,6 +236,28 @@ and retiring a previous tmux-based setup after running both in parallel.
    result.
 2. `overview` shows all sessions correctly in one call.
 3. A webhook wakes a bot and the bot pulls details over MCP.
+
+### Phase 2 milestones
+
+| | Milestone |
+|---|---|
+| M9 | MCP server, `overview`, HTTP auth/rate limit/host check, tunnel guide, acceptance (done, see below) |
+
+### Phase 2 acceptance results (2026-10-18)
+
+Run against Claude Code 2.1.302 (haiku) and Codex 0.163.0 (gpt-6-luna) with a
+temporary daemon (MCP on a separate port, systemd scopes on) and a local
+webhook receiver acting as a bot:
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | A bot starts a session over MCP, sees and answers its question, reads the result | pass: Claude Code (haiku) as the MCP client ran `run`, `tail` with `wait_secs`, `answer`, `summary`, `overview` on its own |
+| 2 | `overview` shows all sessions correctly in one call | pass: 3 live sessions (2 Claude, 1 Codex; running, running tool, waiting_input) matched `status` for each; restarted daemon's orphans listed as recently ended |
+| 3 | A webhook wakes a bot and the bot pulls details over MCP | pass: `question` and `reminder` webhooks woke the bot, it answered via `pending_questions` + `answer` and read `summary` on `done` (17 deliveries, all signatures valid) |
+
+Also verified over MCP with real agents: `send` to an idle session,
+`interrupt` of a running Codex command, `stop` then `resume` with context,
+token rejection, and a `tools/call` from plain `curl` without `initialize`.
 
 ## 3. Out of scope (Phase 3)
 

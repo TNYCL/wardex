@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 use wardex_core::Event;
-use wardex_core::manager::{SessionStatus, SessionSummary, SessionView};
+use wardex_core::manager::{Overview, SessionStatus, SessionSummary, SessionView};
 use wardex_core::store::QuestionRow;
 use wardex_core::time::{clock, human_duration, now_ms};
 
@@ -206,6 +206,81 @@ pub fn pending(rows: &[QuestionRow]) -> String {
             human_duration(now_ms() - q.asked_ms),
             request.map(|r| r.describe()).unwrap_or_default()
         );
+    }
+    out
+}
+
+pub fn overview(o: &Overview) -> String {
+    let mut out = String::new();
+    let counts: Vec<String> = o.counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
+    let _ = writeln!(
+        out,
+        "{} live ({}), {} pending question(s)",
+        o.live.len(),
+        if counts.is_empty() {
+            "-".into()
+        } else {
+            counts.join(", ")
+        },
+        o.pending_questions
+    );
+    for s in &o.live {
+        let mut res = String::new();
+        if let Some(rss) = s.rss_bytes {
+            let _ = write!(res, " {:.0}MB", rss as f64 / 1_048_576.0);
+        }
+        if let Some(cpu) = s.cpu_percent {
+            let _ = write!(res, " {cpu:.0}%cpu");
+        }
+        let _ = writeln!(
+            out,
+            "\n{} {} {} agent={} task={} age={} idle={}{}  {}",
+            s.id,
+            s.state.as_str(),
+            s.driver.as_str(),
+            opt(&s.agent),
+            opt(&s.task),
+            human_duration(s.duration_ms),
+            human_duration(o.now_ms - s.last_activity_ms),
+            res,
+            short_path(&s.cwd)
+        );
+        if !s.running_tools.is_empty() {
+            let _ = writeln!(out, "  tools: {}", s.running_tools.join(", "));
+        }
+        for p in &s.pending {
+            let _ = writeln!(
+                out,
+                "  ? {} ({}): {}",
+                p.question_id,
+                p.kind,
+                p.request.describe()
+            );
+        }
+        for e in &s.latest {
+            let _ = writeln!(out, "  {} #{} {}", clock(e.ts_ms), e.seq, e.text);
+        }
+    }
+    if !o.recently_ended.is_empty() {
+        let _ = writeln!(out, "\nended in the last 24h:");
+        for s in &o.recently_ended {
+            let ago = s
+                .ended_ms
+                .map(|t| human_duration(o.now_ms - t))
+                .unwrap_or_else(|| "-".into());
+            let text = s.last_error.as_ref().or(s.last_result.as_ref());
+            let _ = writeln!(
+                out,
+                "{} {} {} agent={} task={} {} ago: {}",
+                s.id,
+                s.state.as_str(),
+                s.driver.as_str(),
+                opt(&s.agent),
+                opt(&s.task),
+                ago,
+                truncate(text.map(String::as_str).unwrap_or("-"), 100).replace('\n', " ")
+            );
+        }
     }
     out
 }

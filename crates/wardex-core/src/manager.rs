@@ -114,6 +114,89 @@ pub struct SessionSummary {
     pub git: Option<GitState>,
 }
 
+/// Everything a client needs at a glance: live sessions with their state,
+/// questions, resources and latest events, plus recently ended sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Overview {
+    pub now_ms: i64,
+    /// Live sessions per state.
+    pub counts: BTreeMap<String, usize>,
+    pub pending_questions: usize,
+    pub live: Vec<OverviewSession>,
+    pub recently_ended: Vec<EndedSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewSession {
+    pub id: SessionId,
+    pub driver: DriverKind,
+    pub state: SessionState,
+    pub agent: Option<String>,
+    pub task: Option<String>,
+    pub model: Option<String>,
+    pub cwd: PathBuf,
+    pub branch: Option<String>,
+    pub readonly: bool,
+    pub created_ms: i64,
+    pub duration_ms: i64,
+    pub last_activity_ms: i64,
+    pub last_seq: u64,
+    pub rss_bytes: Option<u64>,
+    pub cpu_percent: Option<f64>,
+    pub running_tools: Vec<String>,
+    pub pending: Vec<PendingView>,
+    pub latest: Vec<EventBrief>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndedSession {
+    pub id: SessionId,
+    pub driver: DriverKind,
+    pub state: SessionState,
+    pub agent: Option<String>,
+    pub task: Option<String>,
+    pub ended_ms: Option<i64>,
+    pub last_seq: u64,
+    /// Truncated; `summary` has the full text.
+    pub last_result: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// One-line form of an event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventBrief {
+    pub seq: u64,
+    pub ts_ms: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+impl From<&Event> for EventBrief {
+    fn from(e: &Event) -> Self {
+        Self {
+            seq: e.seq,
+            ts_ms: e.ts_ms,
+            kind: e.kind.name().into(),
+            text: truncate(&e.kind.describe(), OVERVIEW_TEXT_LIMIT),
+        }
+    }
+}
+
+const OVERVIEW_TEXT_LIMIT: usize = 300;
+/// How far back `overview` lists ended sessions.
+const OVERVIEW_ENDED_WINDOW_MS: i64 = 24 * 3600 * 1000;
+const OVERVIEW_ENDED_LIMIT: i64 = 20;
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 #[derive(Clone)]
 pub struct Manager {
     inner: Arc<Inner>,
@@ -819,6 +902,121 @@ impl Manager {
             running_tools: Vec::new(),
             last_activity_ms: None,
         })
+    }
+
+    /// Live sessions with their latest `events` events each, plus sessions
+    /// that ended in the last 24 hours.
+    pub async fn overview(&self, events: i64) -> Result<Overview> {
+        let now = now_ms();
+        let snapshot: Vec<OverviewSession> = self
+            .live()
+            .values()
+            .map(|l| OverviewSession {
+                id: l.record.id.clone(),
+                driver: l.record.driver,
+                state: l.record.state,
+                agent: l.record.agent.clone(),
+                task: l.record.task.clone(),
+                model: l.record.model.clone(),
+                cwd: l.record.cwd.clone(),
+                branch: l.record.branch.clone(),
+                readonly: l.record.readonly,
+                created_ms: l.record.created_ms,
+                duration_ms: now - l.record.created_ms,
+                last_activity_ms: l.last_activity_ms,
+                last_seq: l.record.last_seq,
+                rss_bytes: l.rss_bytes,
+                cpu_percent: l.cpu_percent,
+                running_tools: l.running_tools.values().cloned().collect(),
+                pending: l
+                    .pending
+                    .iter()
+                    .map(|p| PendingView {
+                        question_id: p.question_id.clone(),
+                        kind: p.kind().into(),
+                        asked_ms: p.asked_ms,
+                        request: p.request.clone(),
+                    })
+                    .collect(),
+                latest: Vec::new(),
+            })
+            .collect();
+        let store = &self.inner.store;
+        store.flush().await;
+        let mut live = snapshot;
+        if events > 0 {
+            for s in &mut live {
+                s.latest = store
+                    .last_events(&s.id, events)
+                    .await?
+                    .iter()
+                    .map(EventBrief::from)
+                    .collect();
+            }
+        }
+        live.sort_by_key(|s| s.created_ms);
+        let mut counts = BTreeMap::new();
+        for s in &live {
+            *counts.entry(s.state.as_str().to_string()).or_insert(0) += 1;
+        }
+        let pending_questions = live.iter().map(|s| s.pending.len()).sum();
+        let recently_ended = store
+            .ended_since(now - OVERVIEW_ENDED_WINDOW_MS, OVERVIEW_ENDED_LIMIT)
+            .await?
+            .into_iter()
+            .filter(|r| !live.iter().any(|s| s.id == r.id))
+            .map(|r| EndedSession {
+                id: r.id,
+                driver: r.driver,
+                state: r.state,
+                agent: r.agent,
+                task: r.task,
+                ended_ms: r.ended_ms,
+                last_seq: r.last_seq,
+                last_result: r.last_result.map(|t| truncate(&t, OVERVIEW_TEXT_LIMIT)),
+                last_error: r.last_error,
+            })
+            .collect();
+        Ok(Overview {
+            now_ms: now,
+            counts,
+            pending_questions,
+            live,
+            recently_ended,
+        })
+    }
+
+    /// Wait up to `timeout` until the session has a persisted event after
+    /// `after_seq`. Returns whether one arrived.
+    pub async fn wait_for_event(
+        &self,
+        id: &SessionId,
+        after_seq: u64,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let mut rx = self.subscribe();
+        if self.record(id).await?.last_seq > after_seq {
+            return Ok(true);
+        }
+        let wait = async {
+            loop {
+                match rx.recv().await {
+                    Ok(e) if &e.session_id == id && !e.kind.is_delta() && e.seq > after_seq => {
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Ok(r) = self.record(id).await
+                            && r.last_seq > after_seq
+                        {
+                            return true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return false,
+                }
+            }
+        };
+        Ok(tokio::time::timeout(timeout, wait).await.unwrap_or(false))
     }
 
     /// Persisted events after `since_seq`. Waits for queued events first.

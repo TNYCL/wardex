@@ -13,6 +13,13 @@ database = "$XDG_STATE_HOME/wardex/wardex.db"
 # Env var holding the bearer token for HTTP/MCP. Always required.
 token_env = "WARDEX_TOKEN"
 
+[http]
+# Host headers /mcp accepts besides localhost. Add your tunnel hostname, e.g.
+# allowed_hosts = ["wardex.example.com"]. Env: WARDEX_ALLOWED_HOSTS (comma list).
+allowed_hosts = []
+# Unauthenticated requests per minute before HTTP answers 429. 0 = no limit.
+auth_failures_per_minute = 30
+
 [sessions]
 # Resume orphaned sessions automatically when the daemon starts.
 auto_resume_orphaned = false

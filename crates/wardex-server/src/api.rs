@@ -1,5 +1,5 @@
 //! The daemon API: requests, responses and their handling. Transport-neutral;
-//! used by the Unix socket server (and later by MCP).
+//! used by the Unix socket server and the MCP tools.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +9,9 @@ use wardex_core::{Event, EventKind, RunSpec};
 /// Default number of events `tail` shows.
 pub const DEFAULT_TAIL: i64 = 20;
 const MAX_EVENTS: i64 = 10_000;
+/// Default number of latest events per session in `overview`.
+pub const DEFAULT_OVERVIEW_EVENTS: i64 = 3;
+const MAX_OVERVIEW_EVENTS: i64 = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -61,6 +64,12 @@ pub enum Request {
         message: Option<String>,
     },
     Pending,
+    /// Live sessions with their latest `events` events, plus recently ended
+    /// sessions.
+    Overview {
+        #[serde(default)]
+        events: Option<i64>,
+    },
     /// Stop the daemon. With `drain_secs`, first wait up to that long for
     /// running turns to finish.
     Shutdown {
@@ -185,6 +194,14 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             to_value(&m.resume(&id, message).await?)
         }
         Request::Pending => to_value(&m.pending_questions().await?),
+        Request::Overview { events } => to_value(
+            &m.overview(
+                events
+                    .unwrap_or(DEFAULT_OVERVIEW_EVENTS)
+                    .clamp(0, MAX_OVERVIEW_EVENTS),
+            )
+            .await?,
+        ),
         Request::Shutdown { drain_secs } => {
             json!({"shutting_down": true, "drain_secs": drain_secs})
         }

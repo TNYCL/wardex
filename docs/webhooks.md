@@ -2,8 +2,8 @@
 
 Wardex POSTs notable events to every configured webhook (see
 `[[webhooks]]` in `deploy/wardex.example.toml`). Webhooks are meant to wake a
-client up; the client then pulls details from Wardex (CLI or, in Phase 2,
-MCP).
+client up; the client then pulls details from Wardex (CLI or MCP, see
+[`mcp.md`](mcp.md)).
 
 ## Events
 

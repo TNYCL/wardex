@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/TNYCL/wardex"
 homepage = "https://github.com/TNYCL/wardex"
@@ -23,7 +23,9 @@ clap = { version = "4.6", features = ["derive", "env"] }
 hex = "0.4"
 hmac = "0.13"
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -31,6 +33,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
