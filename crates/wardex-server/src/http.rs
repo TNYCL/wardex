@@ -1,32 +1,88 @@
-//! HTTP endpoint. Only served when a token is configured, because tunnels
-//! forward remote traffic to localhost (see `deploy/tunnel.md`). Phase 1
-//! serves `/healthz`; the MCP endpoint joins it in Phase 2.
+//! HTTP endpoint: `/healthz` and the MCP endpoint `/mcp`. Only served when a
+//! token is configured, because tunnels forward remote traffic to localhost
+//! (see `deploy/tunnel.md`). `/mcp` always requires the bearer token.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::{Value, json};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use wardex_core::config::HttpConfig;
 use wardex_core::manager::Manager;
+
+use crate::mcp::WardexMcp;
+
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 #[derive(Clone)]
 struct AppState {
     manager: Manager,
+    token: Arc<str>,
+    limiter: Arc<FailureLimiter>,
+}
+
+/// The HTTP app for the given token: `/healthz` and `/mcp`.
+pub fn router(manager: Manager, token: &str, shutdown: CancellationToken) -> Router {
+    let http = manager.config().http.clone();
+    let state = AppState {
+        manager: manager.clone(),
+        token: token.into(),
+        limiter: Arc::new(FailureLimiter::new(http.auth_failures_per_minute)),
+    };
+    let mcp = StreamableHttpService::new(
+        move || Ok(WardexMcp::new(manager.clone())),
+        Arc::new(LocalSessionManager::default()),
+        mcp_config(&http, shutdown),
+    );
+    let protected = Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(middleware::from_fn_with_state(state.clone(), require_token));
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
+        .with_state(state)
+}
+
+/// Stateless Streamable HTTP with plain JSON responses: every tool call is
+/// one request, nothing to lose across daemon restarts.
+fn mcp_config(http: &HttpConfig, shutdown: CancellationToken) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(shutdown);
+    if http.allowed_hosts.iter().any(|h| h == "*") {
+        config.disable_allowed_hosts()
+    } else {
+        config.with_allowed_hosts(
+            LOOPBACK_HOSTS
+                .iter()
+                .map(|h| h.to_string())
+                .chain(http.allowed_hosts.iter().cloned()),
+        )
+    }
 }
 
 pub async fn serve(
     addr: SocketAddr,
     manager: Manager,
+    token: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .with_state(AppState { manager });
+    let cancel = CancellationToken::new();
+    let app = router(manager, &token, cancel.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "http listening");
+    tracing::info!(%addr, "http listening (/healthz, /mcp)");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             while shutdown.changed().await.is_ok() {
@@ -34,23 +90,75 @@ pub async fn serve(
                     break;
                 }
             }
+            cancel.cancel();
         })
         .await
 }
 
-async fn healthz(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
+/// Liveness without a token; the session count only with one.
+async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    let mut body = json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
-        "live_sessions": state.manager.live_ids().len(),
-    }))
+    });
+    if authorized(&headers, &state.token) {
+        body["live_sessions"] = json!(state.manager.live_ids().len());
+    }
+    Json(body)
+}
+
+async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if authorized(req.headers(), &state.token) {
+        return next.run(req).await;
+    }
+    if !state.limiter.allow() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many unauthorized requests\n",
+        )
+            .into_response();
+    }
+    tracing::debug!("unauthorized http request");
+    let mut resp = (StatusCode::UNAUTHORIZED, "bearer token required\n").into_response();
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    resp
+}
+
+/// Fixed one-minute window over failed authentications. Behind a tunnel every
+/// request comes from localhost, so the limit is global rather than per IP.
+struct FailureLimiter {
+    per_minute: u32,
+    window: Mutex<(Instant, u32)>,
+}
+
+impl FailureLimiter {
+    fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute,
+            window: Mutex::new((Instant::now(), 0)),
+        }
+    }
+
+    /// Count a failure; false once the window's budget is spent.
+    fn allow(&self) -> bool {
+        if self.per_minute == 0 {
+            return true;
+        }
+        let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        if w.0.elapsed() >= Duration::from_secs(60) {
+            *w = (Instant::now(), 0);
+        }
+        w.1 = w.1.saturating_add(1);
+        w.1 <= self.per_minute
+    }
 }
 
 /// Whether the request carries `Authorization: Bearer <token>`. Compares in
 /// constant time.
 pub fn authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(value) = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     else {
         return false;
@@ -85,5 +193,14 @@ mod tests {
         assert!(!authorized(&h, "secre"));
         h.insert("authorization", "Basic secret".parse().unwrap());
         assert!(!authorized(&h, "secret"));
+    }
+
+    #[test]
+    fn failure_limiter() {
+        let l = FailureLimiter::new(2);
+        assert!(l.allow());
+        assert!(l.allow());
+        assert!(!l.allow());
+        assert!(FailureLimiter::new(0).allow());
     }
 }

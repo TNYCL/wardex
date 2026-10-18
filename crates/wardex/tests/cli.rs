@@ -170,6 +170,12 @@ fn question_flow_survives_a_daemon_restart() {
     assert_eq!(pending.as_array().unwrap().len(), 1);
     let human = env.run(&["status", &id[..4]]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("pending"));
+    let overview = env.json(&["overview"]);
+    assert_eq!(overview["counts"]["waiting_input"], 1);
+    assert_eq!(overview["live"][0]["id"], id.as_str());
+    let human = env.run(&["overview"]);
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("1 pending question"), "{human}");
 
     let ans = env.run(&["answer", &id, "blue"]);
     assert!(

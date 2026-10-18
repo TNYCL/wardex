@@ -79,6 +79,13 @@ pub enum Command {
     },
     /// List pending questions and approvals of all sessions.
     Pending,
+    /// Live sessions with questions, resources and latest events, plus
+    /// sessions ended in the last 24 hours.
+    Overview {
+        /// Latest events per live session.
+        #[arg(short = 'n', long, default_value_t = 3)]
+        events: i64,
+    },
 }
 
 #[derive(Debug, Args)]

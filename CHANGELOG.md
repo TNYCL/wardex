@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- MCP server at `/mcp` (rmcp, stateless Streamable HTTP with JSON
+  responses): `run`, `overview`, `list`, `status`, `tail` (paging with
+  `since_seq`, long-poll with `wait_secs`), `summary`, `pending_questions`,
+  `answer`, `send`, `interrupt`, `stop`, `resume`. Results match the CLI's
+  `--json` output (`docs/mcp.md`).
+- `overview` (MCP tool and `wardex overview`): live sessions with state,
+  pending questions, running tools, resources and latest events, plus
+  sessions ended in the last 24 hours.
+- `[http]` config: `allowed_hosts` (Host header check for `/mcp`, env
+  `WARDEX_ALLOWED_HOSTS`) and `auth_failures_per_minute` (rate limit on
+  failed authentications).
 - Session manager: run, send, answer, stop, interrupt, resume, list, status,
   summary; stuck and reminder detection; idle shutdown with transparent
   resume; orphan recovery on startup; retention.
@@ -57,6 +68,8 @@ All notable changes to this project are documented here. The format follows
 - Event model: `tool_call` has a `call_id` and start/finish status,
   `question` carries question items with options, `approval` has a kind,
   `done` reports interrupts.
+- Minimum Rust version is 1.88 (required by rmcp).
+- `/healthz` reports `live_sessions` only to requests with the token.
 
 ## [0.0.1] - 2026-10-18
 

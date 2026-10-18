@@ -1,0 +1,128 @@
+# MCP
+
+Wardex serves an MCP endpoint at `http://<http_listen>/mcp` (Streamable HTTP).
+Every CLI capability is an MCP tool, and the tools return the same JSON as the
+CLI's `--json` output. Bots use it to start sessions, answer questions and
+read results; webhooks ([`webhooks.md`](webhooks.md)) tell them when to look.
+
+## Enabling it
+
+HTTP (and with it MCP) is only served when the token env var
+(`auth.token_env`, default `WARDEX_TOKEN`) is set. Without a token the daemon
+logs a warning and serves only the Unix socket.
+
+```sh
+openssl rand -hex 32    # → WARDEX_TOKEN in ~/.config/wardex/env
+```
+
+Every `/mcp` request needs `Authorization: Bearer <token>`. Wrong or missing
+tokens get `401`; once `http.auth_failures_per_minute` (default 30) such
+requests arrive in a minute, unauthenticated requests get `429` until the
+minute is over. Requests with the right token are never limited.
+
+`/mcp` also checks the `Host` header against `localhost`, `127.0.0.1`, `::1`
+and `http.allowed_hosts` (DNS rebinding protection). Behind a tunnel, add the
+public hostname there (or `WARDEX_ALLOWED_HOSTS`); see
+[`deploy/tunnel.md`](../deploy/tunnel.md). Requests with another host get `403`.
+
+`/healthz` needs no token and returns `{"ok": true, "version": …}`; with the
+token it also reports `live_sessions`.
+
+## Transport
+
+- Stateless: no `Mcp-Session-Id`, every request stands alone, so clients keep
+  working across daemon restarts.
+- Responses are plain `application/json` (no SSE stream to hold open).
+- Protocol versions from `2025-03-26` on are accepted.
+
+Any client that speaks Streamable HTTP and can send a custom header works.
+Example for Claude Code (`--mcp-config <file>`):
+
+```json
+{
+  "mcpServers": {
+    "wardex": {
+      "type": "http",
+      "url": "https://<your-hostname>/mcp",
+      "headers": { "Authorization": "Bearer ${WARDEX_TOKEN}" }
+    }
+  }
+}
+```
+
+## Tools
+
+Session ids can be shortened to any unique prefix.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `run` | `driver` (`claude`/`codex`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
+| `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration and latest events; counts per state; sessions ended in the last 24h |
+| `list` | optional `all` | session records, newest first |
+| `status` | `id` | record, pending questions, running tools, RSS/CPU |
+| `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60) | events, oldest first |
+| `summary` | `id` | final text, git state, duration, turn/event/tool counts |
+| `pending_questions` | – | open questions and approvals of all sessions |
+| `answer` | `id`; `text` **or** `answers` (item id → answer); optional `question_id` | `{session_id, question_id}` |
+| `send` | `id`, `message` | `{session_id, resumed}` |
+| `interrupt` | `id` | `{session_id}` |
+| `stop` | `id` | `{session_id}` |
+| `resume` | `id`; optional `message` | session record |
+
+Errors come back as tool results with `isError: true` and a text of the form
+`<code>: <message>`, where the code is `not_found`, `ambiguous`, `invalid`,
+`conflict` or `internal`.
+
+### Questions
+
+A question event (`tail`, `pending_questions`, `overview`) carries one or more
+items:
+
+```json
+{"type": "question", "payload": {"question_id": "q1", "items": [
+  {"id": "Which color?", "header": "Color", "text": "Which color?",
+   "options": [{"label": "blue", "description": "…"}], "multi_select": false,
+   "allow_other": true}
+]}}
+```
+
+- One item: `answer {"id": "…", "text": "blue"}` (an option label or, when
+  `allow_other` is set, free text).
+- Several items: `answer {"id": "…", "answers": {"<item id>": "…", …}}`.
+- Approvals (`type: approval`, id in `request_id`): `text` is `allow` or
+  `deny`. `pending_questions` lists both kinds under `question_id`.
+
+### Paging and waiting
+
+`tail` without `since_seq` returns the last `last` (default 20) events. With
+`since_seq`, it returns everything after that sequence number; pass the last
+`seq` you saw to continue. Add `wait_secs` to block until the next event if
+there is none yet, which lets a client follow a session without webhooks.
+Message deltas are never returned; full messages are.
+
+## The bot loop
+
+1. `run` with `agent` (who you are) and `task` (what for) labels. Keep the id.
+2. Wait for a webhook (`question`, `done`, `error`, `stuck`, `reminder`). It
+   carries the session id and the event; anything else, pull over MCP.
+3. On `question`: read it (from the webhook, `pending_questions` or `tail`)
+   and `answer`.
+4. On `done`: read `summary` (result text, changed files, branch). Either
+   `send` the next instruction or leave the session; idle sessions close after
+   `sessions.idle_shutdown_secs` and `send` resumes them later.
+5. Use `overview` to see everything at once, e.g. after a bot restart.
+
+Without webhooks, poll `overview` or follow one session with `tail` +
+`since_seq` + `wait_secs`.
+
+### Prompting bots
+
+A short description the bot's instructions can include:
+
+> Wardex (MCP server `wardex`) runs Claude Code and Codex sessions for you.
+> Start one with `run` (`driver` claude or codex, absolute `cwd`, `agent` set
+> to your name and `task` to a short label). Sessions work on their own. When
+> one asks a question it shows up in `pending_questions`; reply with `answer`.
+> When a turn is done, read `summary` and continue with `send` if needed.
+> `overview` shows all sessions. Do not start a second session for work that
+> is already running.

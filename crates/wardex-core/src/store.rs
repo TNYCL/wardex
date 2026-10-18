@@ -274,6 +274,18 @@ impl Store {
         rows.iter().map(session_from_row).collect()
     }
 
+    /// Sessions that ended at or after `since_ms`, most recent first.
+    pub async fn ended_since(&self, since_ms: i64, limit: i64) -> Result<Vec<SessionRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM sessions WHERE ended_ms >= ? ORDER BY ended_ms DESC LIMIT ?",
+        )
+        .bind(since_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(session_from_row).collect()
+    }
+
     pub async fn sessions_in_states(&self, states: &[SessionState]) -> Result<Vec<SessionRecord>> {
         let mut out = Vec::new();
         for state in states {

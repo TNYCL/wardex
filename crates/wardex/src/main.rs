@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde_json::Value;
-use wardex_core::manager::{AnswerInput, RunOutcome, SessionStatus, SessionSummary, SessionView};
+use wardex_core::manager::{
+    AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
+};
 use wardex_core::store::QuestionRow;
 use wardex_core::{Config, DriverKind, Event, RunSpec, SessionRecord};
 use wardex_server::Client;
@@ -239,6 +241,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 output::pending(&rows)
             })
         }
+        Command::Overview { events } => {
+            let resp = client
+                .request(&Request::Overview {
+                    events: Some(events),
+                })
+                .await?;
+            finish(json, resp, |v| {
+                match serde_json::from_value::<Overview>(v.clone()) {
+                    Ok(o) => output::overview(&o),
+                    Err(_) => output::json(v),
+                }
+            })
+        }
     }
 }
 
@@ -287,7 +302,9 @@ fn print_event(json: bool, e: &Event, in_delta: &mut bool) {
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        // rmcp logs every MCP request at info.
+        .unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn"));
     let json = std::env::var("WARDEX_LOG_FORMAT").is_ok_and(|v| v == "json");
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let builder = tracing_subscriber::fmt()
