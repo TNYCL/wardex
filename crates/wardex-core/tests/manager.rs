@@ -608,3 +608,71 @@ async fn recover_marks_live_sessions_orphaned() {
     m.resume(&id, Some("hello".into())).await.unwrap();
     wait_state(&m, &id, SessionState::Idle).await;
 }
+
+#[tokio::test]
+async fn worktree_session_is_created_and_cleaned_up() {
+    let h = harness().await;
+    let repo = h.dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut s = spec(&h, "hello");
+    s.cwd = repo.clone();
+    s.worktree = Some("w1".into());
+    s.branch = Some("feature/w1".into());
+    s.remove_worktree = true;
+    let out = h.manager.run(s).await.unwrap();
+    let id = out.session.id.clone();
+    let wt = repo.join(".worktree/w1");
+    assert_eq!(out.session.cwd, wt);
+    assert_eq!(out.session.origin_cwd.as_deref(), Some(repo.as_path()));
+    assert!(wt.join(".git").exists());
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    let summary = h.manager.summary(&id).await.unwrap();
+    assert_eq!(summary.git.unwrap().branch.as_deref(), Some("feature/w1"));
+
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    for _ in 0..100 {
+        if !wt.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !wt.exists(),
+        "clean worktree is removed when the session ends"
+    );
+
+    // A name that is already taken is refused.
+    std::fs::create_dir_all(repo.join(".worktree/taken")).unwrap();
+    let mut s = spec(&h, "hello");
+    s.cwd = repo.clone();
+    s.worktree = Some("taken".into());
+    assert!(matches!(
+        h.manager.run(s).await,
+        Err(ManagerError::Invalid(_))
+    ));
+}
