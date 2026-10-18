@@ -1,6 +1,5 @@
 //! Unified event model. Every driver translates its native output into these
-//! events. This is a first draft; it will be refined once the driver spikes
-//! (see `docs/SCOPE.md`, milestone M1) have recorded real CLI output.
+//! events. See `docs/drivers.md` for how each CLI's messages map onto them.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,26 +40,35 @@ pub enum EventKind {
         /// `true` for streaming deltas (broadcast only, not persisted).
         delta: bool,
     },
+    /// Emitted when a tool starts and again when it finishes, with the same
+    /// `call_id`. A session with a started but unfinished tool is not idle.
     ToolCall {
+        call_id: String,
         name: String,
         input_summary: String,
+        status: ToolStatus,
         result_summary: Option<String>,
     },
+    /// One pending request from the agent; it may hold several questions.
     Question {
         question_id: String,
-        text: String,
-        options: Vec<String>,
+        items: Vec<QuestionItem>,
     },
     Approval {
         request_id: String,
+        /// Driver-specific kind, e.g. `command`, `file_change`, `exit_plan`.
+        kind: String,
         summary: String,
     },
     Reminder {
         question_id: String,
         waited_secs: u64,
     },
+    /// The current turn finished; the session waits for the next message.
     Done {
         result: Option<String>,
+        /// The turn was ended by an interrupt Wardex sent.
+        interrupted: bool,
     },
     Error {
         message: String,
@@ -69,6 +77,33 @@ pub enum EventKind {
         reason: StuckReason,
         idle_secs: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionItem {
+    /// Stable key used when answering (Codex question id; Claude question
+    /// text).
+    pub id: String,
+    pub header: Option<String>,
+    pub text: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+    /// Free-text answers besides the options are accepted.
+    pub allow_other: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,12 +165,22 @@ mod tests {
     fn serializes_with_type_and_payload() {
         let ev = event(EventKind::Question {
             question_id: "q1".into(),
-            text: "Proceed?".into(),
-            options: vec!["yes".into(), "no".into()],
+            items: vec![QuestionItem {
+                id: "color".into(),
+                header: Some("Color".into()),
+                text: "Which color?".into(),
+                options: vec![QuestionOption {
+                    label: "Blue".into(),
+                    description: None,
+                }],
+                multi_select: false,
+                allow_other: true,
+            }],
         });
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "question");
         assert_eq!(json["payload"]["question_id"], "q1");
+        assert_eq!(json["payload"]["items"][0]["options"][0]["label"], "Blue");
         assert_eq!(json["driver"], "claude");
         assert_eq!(json["seq"], 7);
     }
@@ -153,8 +198,10 @@ mod tests {
     #[test]
     fn name_matches_serde_tag() {
         let ev = event(EventKind::ToolCall {
+            call_id: "c1".into(),
             name: "Bash".into(),
             input_summary: "ls".into(),
+            status: ToolStatus::Started,
             result_summary: None,
         });
         let json = serde_json::to_value(&ev).unwrap();
@@ -163,7 +210,13 @@ mod tests {
 
     #[test]
     fn notable_events() {
-        assert!(EventKind::Done { result: None }.is_notable());
+        assert!(
+            EventKind::Done {
+                result: None,
+                interrupted: false
+            }
+            .is_notable()
+        );
         assert!(
             !EventKind::Message {
                 text: String::new(),

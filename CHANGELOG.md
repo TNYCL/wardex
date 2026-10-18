@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `docs/drivers.md`: verified Claude Code and Codex protocol behavior (M1).
+- Sanitized driver fixtures recorded from real sessions, plus recording and
+  sanitizing tools in `tools/fixtures/`.
+
+### Changed
+
+- Event model: `tool_call` has a `call_id` and start/finish status,
+  `question` carries question items with options, `approval` has a kind,
+  `done` reports interrupts.
+
 ## [0.0.1] - 2026-10-18
 
 ### Added

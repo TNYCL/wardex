@@ -4,5 +4,7 @@
 pub mod event;
 pub mod session;
 
-pub use event::{DriverKind, Event, EventKind, StuckReason};
+pub use event::{
+    DriverKind, Event, EventKind, QuestionItem, QuestionOption, StuckReason, ToolStatus,
+};
 pub use session::{SessionId, SessionState};
