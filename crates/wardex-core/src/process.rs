@@ -188,6 +188,59 @@ mod tests {
         assert!(usage.rss_bytes > 0);
     }
 
+    /// Needs a systemd user manager; run with
+    /// `cargo test -p wardex-core -- --ignored systemd`. The transient scope
+    /// is collected when the process ends, so nothing is left behind.
+    #[tokio::test]
+    #[ignore]
+    async fn systemd_scope_spawn_and_sample() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let launcher = Launcher::new(true);
+        assert!(launcher.uses_scope(), "no systemd user manager");
+        let unit = format!("wardex-selftest-{}", std::process::id());
+        let mut spawned = launcher
+            .spawn(&LaunchRequest {
+                unit: &unit,
+                slice: None,
+                program: "sh",
+                args: &["-c".into(), "echo pid=$$; exec cat".into()],
+                cwd: Path::new("/"),
+            })
+            .unwrap();
+        assert_eq!(spawned.unit.as_deref(), Some(&*format!("{unit}.scope")));
+        let pid = spawned.pid.unwrap();
+        let mut stdout = BufReader::new(spawned.child.stdout.take().unwrap()).lines();
+        // `$$` reaches the shell unexpanded by systemd-run, and the PID we
+        // hold is the agent's own.
+        assert_eq!(
+            stdout.next_line().await.unwrap(),
+            Some(format!("pid={pid}"))
+        );
+        let mut stdin = spawned.child.stdin.take().unwrap();
+        stdin.write_all(b"ping\n").await.unwrap();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("ping"));
+        let usage = sample(pid).unwrap();
+        assert!(usage.scoped && usage.rss_bytes > 0);
+        Launcher::kill_unit(&format!("{unit}.scope")).await;
+        let status = spawned.child.wait().await.unwrap();
+        assert!(!status.success());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let out = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--no-legend",
+                &format!("{unit}.scope"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "scope left behind"
+        );
+    }
+
     #[tokio::test]
     async fn direct_spawn_pipes_stdio() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

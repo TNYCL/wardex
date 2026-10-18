@@ -267,3 +267,7 @@ systemd-run --user --scope --quiet --expand-environment=no
   `/sys/fs/cgroup<path>/memory.current` (bytes, whole process tree) and
   `cpu.stat` (`usage_usec`).
 - Without `loginctl enable-linger`, user scopes stop at logout.
+- Wardex adds `--collect`, so a scope whose process failed is unloaded too,
+  and kills the whole scope when a session ends.
+- `cargo test -p wardex-core -- --ignored systemd` checks all of the above on
+  a host with a systemd user manager.

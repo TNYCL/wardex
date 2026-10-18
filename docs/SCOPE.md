@@ -178,8 +178,8 @@ transparently.
 | M3 | Claude driver (done) |
 | M4 | CLI + Unix socket API (done) |
 | M5 | Codex driver (done) |
-| M6 | Stuck/reminder detection, webhooks |
-| M7 | systemd scopes, resource usage |
+| M6 | Stuck/reminder detection, webhooks (done, see `webhooks.md`) |
+| M7 | systemd scopes, resource usage (done) |
 | M8 | Restart/orphan/resume, 10+ session load test, acceptance |
 
 ## 2. Phase 2 — MCP + tunnel
