@@ -1,7 +1,7 @@
 # Wardex
 
-> **Status: pre-alpha.** Nothing works yet. The scope and milestones live in
-> [`docs/SCOPE.md`](docs/SCOPE.md).
+> **Status: pre-alpha.** Under active development; interfaces may change.
+> The scope and milestones live in [`docs/SCOPE.md`](docs/SCOPE.md).
 
 Wardex is a single-binary daemon and CLI, written in Rust, that starts,
 watches and manages [Claude Code](https://docs.claude.com/en/docs/claude-code)
@@ -22,17 +22,23 @@ Wardex has **no policy or approval layer**. Agents run with full permissions
 and to `CLAUDE.md` / `AGENTS.md` rules. Only run it on hosts where that is
 acceptable, and always protect the MCP endpoint with a token.
 
-## Planned CLI
+## CLI
 
 ```text
-wardex daemon
-wardex run --driver claude|codex --prompt "..." [--model M] [--reasoning R]
-           [--cwd DIR] [--worktree NAME] [--readonly] [--agent A] [--task T]
-wardex list | status <id> | tail <id> [-f] | summary <id>
-wardex answer <id> <text> | send <id> <message> | stop <id> | resume <id>
+wardex daemon                      # run the daemon (see deploy/wardex.service)
+wardex daemon stop                 # shut it down; live sessions become resumable
+wardex run --driver claude|codex --prompt "..." [--prompt-file F|-]
+           [--model M] [--reasoning R] [--cwd DIR] [--readonly]
+           [--worktree NAME [--branch B] [--rm-worktree]]
+           [--agent A] [--task T] [--slice S]
+wardex list [-a] | status <id> | summary <id> | pending
+wardex tail <id> [-f] [-n N] [--since-seq N] [--deltas]
+wardex answer <id> <text> | answer <id> --item ID=TEXT ... [--question Q]
+wardex send <id> <message> | interrupt <id> | stop <id> | resume <id> [message]
 ```
 
-Every command accepts `--json`.
+Session ids can be shortened to any unique prefix. Every command accepts
+`--json`. The CLI talks to the daemon over a Unix socket (mode 0600).
 
 ## License
 
