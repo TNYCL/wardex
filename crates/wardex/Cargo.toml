@@ -15,7 +15,16 @@ categories.workspace = true
 wardex-core.workspace = true
 wardex-drivers.workspace = true
 wardex-server.workspace = true
+anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

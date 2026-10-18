@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
 - Claude Code driver: stream-json + SDK control protocol (questions,
   permission requests, interrupts), resume via `--resume`, read-only via plan
   mode with permission requests denied.
+- Daemon with a Unix socket API (one JSON request per connection, streamed
+  `tail --follow`), `/healthz` over HTTP when a token is set, SIGTERM/SIGINT
+  handling and orphan recovery on start.
+- CLI: `daemon`, `daemon stop`, `run`, `list`, `status`, `tail`, `summary`,
+  `answer`, `send`, `interrupt`, `stop`, `resume`, `pending`, all with
+  `--json`; session id prefixes.
 
 - `docs/drivers.md`: verified Claude Code and Codex protocol behavior (M1).
 - Sanitized driver fixtures recorded from real sessions, plus recording and

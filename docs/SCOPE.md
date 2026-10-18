@@ -138,8 +138,9 @@ transparently.
 
 ### 1.7 CLI
 
-`daemon`, `run`, `list`, `status <id>`, `tail <id> [-f]`, `summary <id>`,
-`answer <id> <text>`, `send <id> <message>`, `stop <id>`, `resume <id>`.
+`daemon` (+ `daemon stop`), `run`, `list`, `status <id>`, `tail <id> [-f]`,
+`summary <id>`, `answer <id> <text>`, `send <id> <message>`, `stop <id>`,
+`interrupt <id>`, `resume <id>`, `pending`.
 
 - All accept `--json`. The CLI talks to the daemon over a local Unix socket.
 - `run`: `--driver claude|codex`, `--model`, `--reasoning`, `--cwd`,
@@ -175,7 +176,7 @@ transparently.
 | M1 | Spikes: Claude question flow, Codex app-server handshake; record fixtures (done, see `drivers.md`) |
 | M2 | Event model, store, session manager (done) |
 | M3 | Claude driver (done) |
-| M4 | CLI + Unix socket API |
+| M4 | CLI + Unix socket API (done) |
 | M5 | Codex driver |
 | M6 | Stuck/reminder detection, webhooks |
 | M7 | systemd scopes, resource usage |
