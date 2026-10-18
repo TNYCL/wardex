@@ -138,4 +138,10 @@ pub struct SessionRecord {
     pub last_error: Option<String>,
     /// Number of processes spawned for this session (1 + resumes).
     pub spawn_count: u32,
+    /// Orphaned and not resumed since (see `sessions.auto_resume_orphaned`).
+    #[serde(default)]
+    pub resume_pending: bool,
+    /// Orphaned mid-turn: an automatic resume sends `sessions.resume_prompt`.
+    #[serde(default)]
+    pub resume_with_prompt: bool,
 }

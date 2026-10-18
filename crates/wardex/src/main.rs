@@ -52,8 +52,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 wardex_server::daemon::run(config).await?;
                 Ok(ExitCode::SUCCESS)
             }
-            Some(DaemonAction::Stop) => {
-                let resp = client.request(&Request::Shutdown).await?;
+            Some(DaemonAction::Stop { drain }) => {
+                let resp = client
+                    .request(&Request::Shutdown { drain_secs: drain })
+                    .await?;
                 finish(json, resp, |_| "daemon is shutting down\n".into())
             }
         },
@@ -95,12 +97,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let resp = client.request(&Request::Run(spec)).await?;
             finish(json, resp, |v| {
                 match serde_json::from_value::<RunOutcome>(v.clone()) {
+                    // Only the id goes to stdout, so `id=$(wardex run ...)` works.
                     Ok(out) => {
-                        let mut s = format!("{}\n", out.session.id);
                         for w in out.warnings {
-                            s.push_str(&format!("warning: {w}\n"));
+                            eprintln!("warning: {w}");
                         }
-                        s
+                        format!("{}\n", out.session.id)
                     }
                     Err(_) => output::json(v),
                 }
@@ -287,9 +289,12 @@ fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let json = std::env::var("WARDEX_LOG_FORMAT").is_ok_and(|v| v == "json");
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false);
+        .with_target(false)
+        .with_ansi(ansi)
+        .with_writer(std::io::stderr);
     if json {
         builder.json().init();
     } else {
