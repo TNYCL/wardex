@@ -12,6 +12,7 @@ homepage.workspace = true
 wardex-core.workspace = true
 wardex-drivers.workspace = true
 axum.workspace = true
+fs2.workspace = true
 hex.workspace = true
 hmac.workspace = true
 nix.workspace = true

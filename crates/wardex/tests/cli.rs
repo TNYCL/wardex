@@ -4,7 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -58,7 +58,18 @@ bin = "{script}"
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
         c.arg("--config").arg(&self.config).args(args);
-        c.env_remove("WARDEX_SOCKET").env_remove("WARDEX_TOKEN");
+        for key in [
+            "WARDEX_SOCKET",
+            "WARDEX_DATABASE",
+            "WARDEX_TOKEN",
+            "WARDEX_HTTP_LISTEN",
+            "WARDEX_ALLOWED_HOSTS",
+            "WARDEX_CLAUDE_BIN",
+            "WARDEX_CODEX_BIN",
+            "WARDEX_SYSTEMD_SCOPE",
+        ] {
+            c.env_remove(key);
+        }
         c.current_dir(self.dir.path());
         c
     }
@@ -81,14 +92,22 @@ bin = "{script}"
     }
 
     fn start_daemon(&self) -> Child {
-        let child = self
+        let mut child = self
             .cmd(&["daemon"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let sock = self.dir.path().join("wardex.sock");
-        wait_until(|| sock.exists(), "daemon socket");
+        wait_until(
+            || {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "daemon exited on start"
+                );
+                self.run(&["list"]).status.success()
+            },
+            "daemon readiness",
+        );
         child
     }
 
@@ -99,18 +118,7 @@ bin = "{script}"
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let start = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                return;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "daemon did not exit"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(wait_for_exit(&mut child).success());
     }
 
     fn wait_state(&self, id: &str, state: &str) {
@@ -130,6 +138,28 @@ fn wait_until(mut f: impl FnMut() -> bool, what: &str) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_exit(child: &mut Child) -> ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() >= Duration::from_secs(15) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("temporary daemon did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_rejected(mut child: Child, message: &str) {
+    assert!(!wait_for_exit(&mut child).success());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(message), "{err}");
 }
 
 fn replay_script(fixture: &str, dir: &Path) -> PathBuf {
@@ -153,6 +183,184 @@ fn replay_script(fixture: &str, dir: &Path) -> PathBuf {
     std::fs::write(&file, script).unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
     file
+}
+
+fn duplicate_daemon_preserves_live_session(socket: &str) {
+    let env = Env::new("question");
+    let mut daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "ask me"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "waiting_input");
+    let pending = env.json(&["pending"]);
+    let before = env.json(&["status", id]);
+    let events = env.json(&["tail", id, "--since-seq", "0"]);
+    assert_eq!(pending.as_array().unwrap().len(), 1);
+    assert_eq!(
+        events.as_array().unwrap().last().unwrap()["seq"],
+        before["last_seq"]
+    );
+
+    let socket = env.dir.path().join(socket);
+    let second = env
+        .cmd(&["--socket", socket.to_str().unwrap(), "daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_rejected(second, "another daemon is already using this database");
+
+    assert!(daemon.try_wait().unwrap().is_none());
+    let after = env.json(&["status", id]);
+    for field in [
+        "state",
+        "live",
+        "pending",
+        "last_seq",
+        "resume_pending",
+        "pid",
+    ] {
+        assert_eq!(after[field], before[field], "changed {field}");
+    }
+    // These read persisted rows, so in-memory state cannot hide recovery writes.
+    assert_eq!(env.json(&["pending"]), pending);
+    assert_eq!(env.json(&["tail", id, "--since-seq", "0"]), events);
+    env.json(&["answer", id, "blue"]);
+    env.wait_state(id, "done");
+    assert_eq!(env.json(&["summary", id])["last_result"], "blue");
+    let events = env.json(&["tail", id, "--since-seq", "0"]);
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .all(|e| e[0]["seq"].as_u64().unwrap() < e[1]["seq"].as_u64().unwrap())
+    );
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn duplicate_daemon_on_same_socket_preserves_live_session() {
+    duplicate_daemon_preserves_live_session("wardex.sock");
+}
+
+#[test]
+fn duplicate_daemon_on_different_socket_preserves_live_session() {
+    duplicate_daemon_preserves_live_session("other.sock");
+}
+
+#[test]
+fn concurrent_daemons_have_one_database_owner() {
+    let env = Env::new("question");
+    let sockets = ["first.sock", "second.sock"].map(|name| env.dir.path().join(name));
+    let barrier = std::sync::Barrier::new(2);
+    let mut daemons = std::thread::scope(|scope| {
+        let starts: Vec<_> = sockets
+            .iter()
+            .map(|socket| {
+                let env = &env;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    env.cmd(&["--socket", socket.to_str().unwrap(), "daemon"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+            })
+            .collect();
+        starts
+            .into_iter()
+            .map(|start| start.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let mut loser = None;
+    wait_until(
+        || {
+            loser = daemons
+                .iter_mut()
+                .position(|child| child.try_wait().unwrap().is_some());
+            loser.is_some()
+        },
+        "one daemon to be rejected",
+    );
+    let loser = loser.unwrap();
+    assert_rejected(
+        daemons.remove(loser),
+        "another daemon is already using this database",
+    );
+    assert!(!sockets[loser].exists());
+    let mut winner = daemons.pop().unwrap();
+    let socket = sockets[1 - loser].to_str().unwrap();
+    wait_until(|| sockets[1 - loser].exists(), "winning daemon socket");
+    assert!(winner.try_wait().unwrap().is_none());
+    assert_eq!(
+        env.json(&["--socket", socket, "list"]),
+        serde_json::json!([])
+    );
+    env.json(&["--socket", socket, "daemon", "stop"]);
+    assert!(wait_for_exit(&mut winner).success());
+}
+
+#[test]
+fn live_socket_is_rejected_before_opening_another_database() {
+    let env = Env::new("question");
+    let daemon = env.start_daemon();
+    let second = Env::new("question");
+    let socket = env.dir.path().join("wardex.sock");
+    let child = second
+        .cmd(&["--socket", socket.to_str().unwrap(), "daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_rejected(child, "another daemon is already listening on");
+    assert!(!second.dir.path().join("state/wardex.db").exists());
+    assert_eq!(env.json(&["list"]), serde_json::json!([]));
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn database_lock_is_released_after_shutdown() {
+    let env = Env::new("question");
+    let daemon = env.start_daemon();
+    env.stop_daemon(daemon);
+    assert!(env.dir.path().join("state/wardex.db.lock").exists());
+    let daemon = env.start_daemon();
+    assert_eq!(env.json(&["list"]), serde_json::json!([]));
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn database_lock_is_released_after_crash_and_sessions_are_recovered() {
+    let env = Env::new("question");
+    let mut daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "ask me"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "waiting_input");
+    assert_eq!(env.json(&["pending"]).as_array().unwrap().len(), 1);
+    let before = env.json(&["status", id]);
+    // Crash only this test's temporary daemon, leaving a stale socket and live rows.
+    daemon.kill().unwrap();
+    assert!(!wait_for_exit(&mut daemon).success());
+    assert!(env.dir.path().join("wardex.sock").exists());
+
+    let daemon = env.start_daemon();
+    let recovered = env.json(&["status", id]);
+    assert_eq!(recovered["state"], "orphaned");
+    assert_eq!(recovered["live"], false);
+    // Automatic resume is disabled, so startup clears its pending flag.
+    assert_eq!(recovered["resume_pending"], false);
+    assert_eq!(
+        recovered["last_seq"].as_u64().unwrap(),
+        before["last_seq"].as_u64().unwrap() + 2
+    );
+    assert!(env.json(&["pending"]).as_array().unwrap().is_empty());
+    env.json(&["resume", id, "ask again"]);
+    env.wait_state(id, "waiting_input");
+    env.json(&["answer", id, "blue"]);
+    env.wait_state(id, "done");
+    env.stop_daemon(daemon);
 }
 
 #[test]
@@ -282,13 +490,7 @@ fn mcp_over_stdio() {
     let env = Env::new("question");
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
-    let mut cmd = tokio::process::Command::new(BIN);
-    cmd.arg("--config")
-        .arg(&env.config)
-        .args(["mcp", "--stdio"])
-        .env_remove("WARDEX_SOCKET")
-        .env_remove("WARDEX_TOKEN")
-        .current_dir(env.dir.path());
+    let cmd = tokio::process::Command::from(env.cmd(&["mcp", "--stdio"]));
     let client = rt
         .block_on(().serve(TokioChildProcess::new(cmd).unwrap()))
         .expect("mcp handshake");
