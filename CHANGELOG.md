@@ -27,6 +27,11 @@ All notable changes to this project are documented here. The format follows
   `turn/interrupt`), questions via `item/tool/requestUserInput` (opt-in),
   approvals for command, file change, permission and MCP elicitation requests
   (declined automatically in read-only sessions).
+- Webhook dispatcher: per-webhook ordered delivery, event filter, HMAC-SHA256
+  signature, extra headers from env, retry with exponential backoff, stable
+  delivery ids; URLs and secrets are never logged (`docs/webhooks.md`).
+- Sessions run in transient systemd user scopes (`--collect`), optionally in
+  a slice; scopes are killed when a session ends so no tool processes linger.
 - CLI: `daemon`, `daemon stop`, `run`, `list`, `status`, `tail`, `summary`,
   `answer`, `send`, `interrupt`, `stop`, `resume`, `pending`, all with
   `--json`; session id prefixes.
