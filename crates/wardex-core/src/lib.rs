@@ -1,10 +1,19 @@
-//! Core building blocks of Wardex: the unified event model, session state
-//! and (later) the session manager and SQLite store.
+//! Core building blocks of Wardex: the unified event model, configuration,
+//! the SQLite store, the driver interface and the session manager.
 
+pub mod config;
+pub mod driver;
 pub mod event;
+pub mod git;
+pub mod manager;
+pub mod process;
 pub mod session;
+pub mod store;
+pub mod time;
 
+pub use config::Config;
 pub use event::{
-    DriverKind, Event, EventKind, QuestionItem, QuestionOption, StuckReason, ToolStatus,
+    Answer, DriverKind, Event, EventKind, GitState, QuestionItem, QuestionOption, StuckReason,
+    ToolStatus,
 };
-pub use session::{SessionId, SessionState};
+pub use session::{RunSpec, SessionId, SessionRecord, SessionState};

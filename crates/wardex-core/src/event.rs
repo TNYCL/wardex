@@ -1,15 +1,34 @@
 //! Unified event model. Every driver translates its native output into these
 //! events. See `docs/drivers.md` for how each CLI's messages map onto them.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::SessionId;
+use crate::{SessionId, SessionState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     Claude,
     Codex,
+}
+
+impl DriverKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
 }
 
 /// One event in a session's stream.
@@ -30,10 +49,15 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum EventKind {
+    /// The agent process is up. Emitted once per process (also on resume).
     Started {
         /// The driver's own session/thread id, used for resume.
         driver_session_id: Option<String>,
         model: Option<String>,
+    },
+    /// A message sent to the agent (initial prompt or follow-up).
+    Prompt {
+        text: String,
     },
     Message {
         text: String,
@@ -60,6 +84,11 @@ pub enum EventKind {
         kind: String,
         summary: String,
     },
+    /// A question or approval was answered.
+    Answered {
+        question_id: String,
+        answer: Answer,
+    },
     Reminder {
         question_id: String,
         waited_secs: u64,
@@ -69,6 +98,9 @@ pub enum EventKind {
         result: Option<String>,
         /// The turn was ended by an interrupt Wardex sent.
         interrupted: bool,
+        /// Short turn summary written by the agent CLI, when it offers one.
+        note: Option<String>,
+        git: Option<GitState>,
     },
     Error {
         message: String,
@@ -76,6 +108,11 @@ pub enum EventKind {
     Stuck {
         reason: StuckReason,
         idle_secs: u64,
+    },
+    /// The agent process ended.
+    Ended {
+        state: SessionState,
+        exit_code: Option<i32>,
     },
 }
 
@@ -106,6 +143,27 @@ pub struct QuestionOption {
     pub description: Option<String>,
 }
 
+/// Answer to a pending question or approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Answer {
+    /// Answers per question item id.
+    Question {
+        items: BTreeMap<String, Vec<String>>,
+    },
+    Approval {
+        allow: bool,
+        message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitState {
+    pub branch: Option<String>,
+    /// Paths with uncommitted changes (`git status --porcelain`).
+    pub changed_files: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StuckReason {
@@ -115,33 +173,120 @@ pub enum StuckReason {
     NoOutput,
 }
 
+/// Event type names that are pushed to webhooks by default.
+pub const NOTABLE_EVENTS: &[&str] = &["question", "approval", "reminder", "done", "error", "stuck"];
+
 impl EventKind {
     /// Stable name used in config filters and webhook payloads.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Started { .. } => "started",
+            Self::Prompt { .. } => "prompt",
             Self::Message { .. } => "message",
             Self::ToolCall { .. } => "tool_call",
             Self::Question { .. } => "question",
             Self::Approval { .. } => "approval",
+            Self::Answered { .. } => "answered",
             Self::Reminder { .. } => "reminder",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
             Self::Stuck { .. } => "stuck",
+            Self::Ended { .. } => "ended",
         }
     }
 
     /// Events pushed to webhooks by default.
     pub fn is_notable(&self) -> bool {
-        matches!(
-            self,
-            Self::Question { .. }
-                | Self::Approval { .. }
-                | Self::Reminder { .. }
-                | Self::Done { .. }
-                | Self::Error { .. }
-                | Self::Stuck { .. }
-        )
+        NOTABLE_EVENTS.contains(&self.name())
+    }
+
+    /// Streaming deltas are broadcast live but never persisted.
+    pub fn is_delta(&self) -> bool {
+        matches!(self, Self::Message { delta: true, .. })
+    }
+
+    /// One-line human-readable description, used by `tail`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Started {
+                driver_session_id,
+                model,
+            } => format!(
+                "started (model {}, id {})",
+                model.as_deref().unwrap_or("default"),
+                driver_session_id.as_deref().unwrap_or("-")
+            ),
+            Self::Prompt { text } => format!("> {text}"),
+            Self::Message { text, .. } => text.clone(),
+            Self::ToolCall {
+                name,
+                input_summary,
+                status,
+                result_summary,
+                ..
+            } => match status {
+                ToolStatus::Started => format!("{name}: {input_summary}"),
+                ToolStatus::Completed => {
+                    format!("{name} done: {}", result_summary.as_deref().unwrap_or(""))
+                }
+                ToolStatus::Failed => {
+                    format!("{name} failed: {}", result_summary.as_deref().unwrap_or(""))
+                }
+            },
+            Self::Question { question_id, items } => {
+                let mut s = format!("question {question_id}:");
+                for item in items {
+                    s.push_str(&format!(" {}", item.text));
+                    if !item.options.is_empty() {
+                        let labels: Vec<&str> =
+                            item.options.iter().map(|o| o.label.as_str()).collect();
+                        s.push_str(&format!(" [{}]", labels.join(" / ")));
+                    }
+                }
+                s
+            }
+            Self::Approval {
+                request_id,
+                kind,
+                summary,
+            } => format!("approval {request_id} ({kind}): {summary}"),
+            Self::Answered {
+                question_id,
+                answer,
+            } => match answer {
+                Answer::Question { items } => {
+                    let parts: Vec<String> = items.values().map(|v| v.join(", ")).collect();
+                    format!("answered {question_id}: {}", parts.join("; "))
+                }
+                Answer::Approval { allow, .. } => format!(
+                    "answered {question_id}: {}",
+                    if *allow { "allow" } else { "deny" }
+                ),
+            },
+            Self::Reminder {
+                question_id,
+                waited_secs,
+            } => format!("reminder: {question_id} waiting for {waited_secs}s"),
+            Self::Done {
+                result,
+                interrupted,
+                ..
+            } => {
+                if *interrupted {
+                    "done (interrupted)".to_string()
+                } else {
+                    format!("done: {}", result.as_deref().unwrap_or(""))
+                }
+            }
+            Self::Error { message } => format!("error: {message}"),
+            Self::Stuck { reason, idle_secs } => {
+                format!("stuck ({reason:?}) for {idle_secs}s")
+            }
+            Self::Ended { state, exit_code } => match exit_code {
+                Some(code) => format!("ended: {} (exit {code})", state.as_str()),
+                None => format!("ended: {}", state.as_str()),
+            },
+        }
     }
 }
 
@@ -193,6 +338,16 @@ mod tests {
         });
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+
+        let ev = event(EventKind::Answered {
+            question_id: "q1".into(),
+            answer: Answer::Approval {
+                allow: true,
+                message: None,
+            },
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
     }
 
     #[test]
@@ -209,20 +364,19 @@ mod tests {
     }
 
     #[test]
-    fn notable_events() {
-        assert!(
-            EventKind::Done {
-                result: None,
-                interrupted: false
-            }
-            .is_notable()
-        );
-        assert!(
-            !EventKind::Message {
-                text: String::new(),
-                delta: true
-            }
-            .is_notable()
-        );
+    fn notable_and_delta() {
+        let done = EventKind::Done {
+            result: None,
+            interrupted: false,
+            note: None,
+            git: None,
+        };
+        assert!(done.is_notable());
+        let delta = EventKind::Message {
+            text: String::new(),
+            delta: true,
+        };
+        assert!(!delta.is_notable());
+        assert!(delta.is_delta());
     }
 }

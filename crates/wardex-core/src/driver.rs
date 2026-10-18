@@ -1,0 +1,117 @@
+//! Interface between the session manager and agent CLI drivers.
+//!
+//! A driver spawns one agent process per call and talks to it through two
+//! channels: commands in, events out. This keeps drivers free of manager
+//! state and makes them easy to test against recorded fixtures.
+
+use std::path::PathBuf;
+
+use tokio::sync::mpsc;
+
+use crate::process::Launcher;
+use crate::{Answer, DriverKind, EventKind, SessionId};
+
+/// Prepended to the first prompt of a read-only session, in addition to the
+/// driver's own read-only mode.
+pub const READONLY_PREFIX: &str = "[Read-only session] Do not create, modify or delete files and \
+     do not run commands that change state. Only read, analyze and answer.\n\n";
+
+#[derive(Debug, Clone)]
+pub struct SpawnSpec {
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub readonly: bool,
+    /// Driver session id to resume instead of starting fresh.
+    pub resume: Option<String>,
+    pub slice: Option<String>,
+    /// Unique systemd unit name for this process (without `.scope`).
+    pub unit: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DriverCommand {
+    /// Send a user message. Queued by the driver until it can be delivered.
+    Send(String),
+    Answer {
+        question_id: String,
+        answer: Answer,
+    },
+    /// Interrupt the running turn.
+    Interrupt,
+    /// End the process gracefully (close stdin).
+    Shutdown,
+    /// Kill the process (and its scope).
+    Kill,
+}
+
+#[derive(Debug, Clone)]
+pub enum DriverEvent {
+    Event(EventKind),
+    /// The process exited. Always the last event.
+    Exited {
+        code: Option<i32>,
+        stderr_tail: Vec<String>,
+    },
+}
+
+pub struct DriverHandle {
+    pub pid: Option<u32>,
+    pub unit: Option<String>,
+    pub commands: mpsc::UnboundedSender<DriverCommand>,
+    pub events: mpsc::UnboundedReceiver<DriverEvent>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DriverError {
+    #[error("cannot start {program}: {source}")]
+    Spawn {
+        program: String,
+        source: std::io::Error,
+    },
+}
+
+pub trait Driver: Send + Sync + 'static {
+    fn kind(&self) -> DriverKind;
+
+    /// Start the agent process. Must be called inside a Tokio runtime.
+    fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError>;
+}
+
+/// Collapse whitespace and cut to `max` characters, for one-line summaries.
+pub fn summarize(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    let mut last_space = false;
+    for c in text.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c == ' ' {
+            if last_space || out.is_empty() {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        if count == max {
+            out.push('…');
+            return out.trim_end().to_string();
+        }
+        out.push(c);
+        count += 1;
+    }
+    out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_collapses_and_truncates() {
+        assert_eq!(summarize("  a\n\n b  c ", 10), "a b c");
+        assert_eq!(summarize("abcdef", 3), "abc…");
+        assert_eq!(summarize("", 3), "");
+    }
+}

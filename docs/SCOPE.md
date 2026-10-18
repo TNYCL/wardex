@@ -12,7 +12,7 @@ on tmux, `send-keys` and output scraping.
 - **License:** MIT OR Apache-2.0.
 - **Visibility:** public from day one; pre-alpha until v0.1.
 - **Stack:** Rust, single binary. tokio, axum (HTTP and MCP), rmcp (MCP
-  server), sqlx + SQLite (offline mode, `.sqlx/` committed), clap, serde,
+  server), sqlx + SQLite (runtime queries, embedded migrations), clap, serde,
   tracing.
 - **No guard layer:** no policy engine, approval layer or command filter.
   Safety is left to prompts and `CLAUDE.md` / `AGENTS.md` rules.
@@ -70,9 +70,15 @@ Tested CLI versions are listed in `docs/drivers.md`.
 
 ### 1.2 Event model
 
-Events: `started`, `message` (delta and full text), `tool_call` (name, short
-input, result summary), `question`, `approval`, `reminder`, `done`, `error`,
-`stuck`.
+Events: `started`, `prompt`, `message` (delta and full text), `tool_call`
+(name, short input, result summary), `question`, `approval`, `answered`,
+`reminder`, `done`, `error`, `stuck`, `ended`.
+
+Session states: `starting`, `running`, `idle` (turn done, process waiting for
+the next message), `waiting_input`, and the resumable end states `done`,
+`error`, `stopped`, `orphaned`. An idle process is closed after
+`sessions.idle_shutdown_secs`; `send` to an ended session resumes it
+transparently.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.
@@ -167,7 +173,7 @@ input, result summary), `question`, `approval`, `reminder`, `done`, `error`,
 |---|---|
 | M0 | Repo skeleton, licenses, CI, example config, scope (done) |
 | M1 | Spikes: Claude question flow, Codex app-server handshake; record fixtures (done, see `drivers.md`) |
-| M2 | Event model, store, session manager |
+| M2 | Event model, store, session manager (done) |
 | M3 | Claude driver |
 | M4 | CLI + Unix socket API |
 | M5 | Codex driver |

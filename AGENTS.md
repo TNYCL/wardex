@@ -41,7 +41,9 @@ what Wardex does and in which milestone.
 - Match the surrounding style; no unnecessary abstractions.
 - Errors: `thiserror` in library crates, `anyhow` only in the `wardex` binary.
 - Logging via `tracing`. Never log secrets, tokens or full webhook URLs.
-- Migrations in `migrations/` are append-only. Never edit a merged migration.
+- Migrations in `crates/wardex-core/migrations/` are append-only. Never edit a
+  merged migration. Queries use the runtime `sqlx::query` API (no compile-time
+  macros, no `DATABASE_URL`).
 - Driver tests use mock processes and recorded fixtures of real CLI output
   (`crates/wardex-drivers/tests/fixtures/`). Tests must not call real
   `claude` / `codex` binaries or the network.
@@ -51,11 +53,11 @@ what Wardex does and in which milestone.
 ## Layout
 
 ```text
-crates/wardex-core     event model, session manager, store (SQLite)
+crates/wardex-core     event model, config, store (SQLite), session manager,
+                       driver interface, process launcher, git helpers
 crates/wardex-drivers  claude, codex
 crates/wardex-server   Unix socket API, HTTP (/healthz, MCP), webhooks
 crates/wardex          the binary (clap CLI)
-migrations/            SQLite migrations
 deploy/                systemd unit, example config, tunnel guide
 docs/                  scope and design docs
 ```

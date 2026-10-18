@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Session manager: run, send, answer, stop, interrupt, resume, list, status,
+  summary; stuck and reminder detection; idle shutdown with transparent
+  resume; orphan recovery on startup; retention.
+- SQLite store with an ordered single-writer queue for events and session
+  updates.
+- Config loading (file, env, flags) with path expansion.
+- Process launcher with optional systemd scopes and resource sampling.
+- Git helpers for change summaries and `--worktree`.
+
 - `docs/drivers.md`: verified Claude Code and Codex protocol behavior (M1).
 - Sanitized driver fixtures recorded from real sessions, plus recording and
   sanitizing tools in `tools/fixtures/`.
