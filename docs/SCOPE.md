@@ -18,6 +18,10 @@ on tmux, `send-keys` and output scraping.
   Safety is left to prompts and `CLAUDE.md` / `AGENTS.md` rules.
 - **No roles:** one MCP endpoint, one token. Every client sees and manages
   every session. Sessions are told apart by `agent` and `task` labels.
+- **Hands off CLI config:** Wardex only passes per-session flags (`--model`,
+  `-c`, `--enable`, …). It never edits `~/.claude*` or `~/.codex/` and does
+  not set a separate `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so sessions share the
+  user's existing settings, auth and quota.
 - **Generic:** nothing deployment-specific in the repo (URLs, keys, paths, bot
   names, host settings). Those live only in config and env. The repo ships
   `deploy/wardex.example.toml`.
@@ -26,24 +30,35 @@ on tmux, `send-keys` and output scraping.
 
 ### 1.1 Drivers
 
+Protocol details and verified behavior: [`drivers.md`](drivers.md).
+
 **Claude Code:** `claude -p --input-format stream-json --output-format
-stream-json --include-partial-messages --verbose`
+stream-json --include-partial-messages --verbose --permission-prompt-tool stdio`
 
 - `--permission-mode bypassPermissions`; model via `--model`.
-- Questions: `AskUserQuestion` is caught as a `tool_use` and turned into a
-  `question` event. The answer is written to stdin as a stream-json user
-  message. **Must be verified by a spike first (M1)**; if headless mode does
-  not block on it, route questions through `--permission-prompt-tool` to a
-  Wardex MCP tool (relay only, no filtering).
+- Wardex picks the Claude session id up front with `--session-id <uuid>`.
+- Questions: with `--permission-prompt-tool stdio`, `AskUserQuestion` arrives
+  as a `can_use_tool` control request and the CLI blocks until Wardex answers
+  with a `control_response` (verified in M1). Without that flag the tool is not
+  available in `-p` mode at all.
+- Interrupt with an `interrupt` control request; the resulting
+  `error_during_execution` result is reported as `done` (interrupted).
 - Resume with `--resume <session_id>`.
-- Read-only: `--permission-mode plan`.
+- Read-only: `--permission-mode plan` **and** the driver denies every
+  permission request except `AskUserQuestion` (plan mode alone lets writes
+  through when the host allows them).
 
 **Codex:** `codex app-server` (stdio JSON-RPC).
 
 - yolo equivalent: `approval_policy=never`, `sandbox=danger-full-access`.
 - `model` and `reasoning_effort` passed through.
 - Thread/turn management; approval requests become `approval` events.
-- Resume via thread id. Read-only: `sandbox=read-only`.
+- One app-server process per session. Resume via `thread/resume` with the
+  thread id (`excludeTurns: true`). Interrupt via `turn/interrupt`. Read-only:
+  `sandbox=read-only`.
+- Questions (`item/tool/requestUserInput`) need the under-development feature
+  `default_mode_request_user_input`. Opt-in via
+  `drivers.codex.request_user_input` (default off); works in 0.163.0.
 - The protocol changes often: pin the tested Codex version, derive types from
   the schema the app-server can generate, and keep contract tests against
   recorded JSON-RPC fixtures.
@@ -59,6 +74,8 @@ Events: `started`, `message` (delta and full text), `tool_call` (name, short
 input, result summary), `question`, `approval`, `reminder`, `done`, `error`,
 `stuck`.
 
+- `tool_call` is emitted when a tool starts and when it finishes (same
+  `call_id`). `question` carries one or more question items with options.
 - Every event carries `session_id`, `seq`, `ts`, `agent`, `task`, `driver`,
   `payload`.
 - Message deltas go only to the in-memory broadcast (`tail -f`, live MCP
@@ -148,8 +165,8 @@ input, result summary), `question`, `approval`, `reminder`, `done`, `error`,
 
 | | Milestone |
 |---|---|
-| M0 | Repo skeleton, licenses, CI, example config, scope |
-| M1 | Spikes: Claude question flow, Codex app-server handshake; record fixtures |
+| M0 | Repo skeleton, licenses, CI, example config, scope (done) |
+| M1 | Spikes: Claude question flow, Codex app-server handshake; record fixtures (done, see `drivers.md`) |
 | M2 | Event model, store, session manager |
 | M3 | Claude driver |
 | M4 | CLI + Unix socket API |

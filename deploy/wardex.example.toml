@@ -37,6 +37,9 @@ bin = "claude"
 bin = "codex"
 # default_model = "..."
 # default_reasoning = "medium"
+# Let Codex ask questions (item/tool/requestUserInput). Relies on the
+# under-development Codex feature `default_mode_request_user_input`.
+request_user_input = false
 
 [resources]
 systemd_scope = true
