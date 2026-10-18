@@ -5,6 +5,11 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now wardex
 #   loginctl enable-linger "$USER"   # keep running after logout
 #
+# Reload the config and env file (webhooks) without a restart:
+#   systemctl --user reload wardex    # or: wardex daemon reload
+# Restart without killing running turns (same PID, new binary):
+#   wardex daemon restart --drain 600
+#
 # Run an installed release binary, never one built from a working checkout.
 # Sessions live in their own systemd scopes, so they are not part of this
 # unit's cgroup.
@@ -20,8 +25,10 @@ ExecStart=%h/.local/bin/wardex daemon --config %h/.config/wardex/wardex.toml
 # claude and codex CLIs are commonly installed. Adjust, or set absolute paths
 # in drivers.claude.bin / drivers.codex.bin.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# WARDEX_TOKEN, webhook URLs and secrets.
+# WARDEX_TOKEN, webhook URLs and secrets. The daemon also reads this file
+# itself (daemon.env_file), so `reload` picks up changes.
 EnvironmentFile=-%h/.config/wardex/env
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 

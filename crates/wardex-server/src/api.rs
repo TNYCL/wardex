@@ -46,6 +46,14 @@ pub enum Request {
         /// events yet, wait up to this many seconds (max 60) for one.
         #[serde(default)]
         wait_secs: Option<u64>,
+        /// Include the full tool input/output on `tool_call` events.
+        #[serde(default)]
+        full: bool,
+    },
+    /// Full input and output of the tool call that event `seq` belongs to.
+    ToolOutput {
+        id: String,
+        seq: u64,
     },
     Summary {
         id: String,
@@ -79,11 +87,16 @@ pub enum Request {
         events: Option<i64>,
     },
     /// Stop the daemon. With `drain_secs`, first wait up to that long for
-    /// running turns to finish.
+    /// running turns to finish. With `restart`, the daemon starts again in
+    /// the same process (same PID) after stopping.
     Shutdown {
         #[serde(default)]
         drain_secs: Option<u64>,
+        #[serde(default)]
+        restart: bool,
     },
+    /// Re-read the config and env files and apply the webhook settings.
+    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,7 +166,11 @@ pub async fn handle(manager: &Manager, req: Request) -> Response {
 
 async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> {
     Ok(match req {
-        Request::Ping => json!({"version": env!("CARGO_PKG_VERSION")}),
+        Request::Ping => json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "started_ms": m.started_ms(),
+        }),
         Request::Run(spec) => to_value(&m.run(spec).await?),
         Request::List { all } => to_value(&m.list(all).await?),
         Request::Status { id } => {
@@ -165,6 +182,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             since_seq,
             last,
             wait_secs,
+            full,
             ..
         } => {
             let id = m.resolve(&id).await?;
@@ -172,7 +190,15 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
                 let wait = Duration::from_secs(wait.min(MAX_WAIT_SECS));
                 m.wait_for_event(&id, seq, wait).await?;
             }
-            to_value(&initial_events(m, &id, since_seq, last).await?)
+            let mut events = initial_events(m, &id, since_seq, last).await?;
+            if !full {
+                events.iter_mut().for_each(|e| e.kind.strip_tool_text());
+            }
+            to_value(&events)
+        }
+        Request::ToolOutput { id, seq } => {
+            let id = m.resolve(&id).await?;
+            to_value(&m.tool_output(&id, seq).await?)
         }
         Request::Summary { id } => {
             let id = m.resolve(&id).await?;
@@ -215,8 +241,16 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             )
             .await?,
         ),
-        Request::Shutdown { drain_secs } => {
-            json!({"shutting_down": true, "drain_secs": drain_secs})
+        Request::Shutdown {
+            drain_secs,
+            restart,
+        } => {
+            json!({"shutting_down": true, "drain_secs": drain_secs, "restart": restart})
+        }
+        Request::Reload => {
+            return Err(ManagerError::Invalid(
+                "reload is handled by the daemon's socket server".into(),
+            ));
         }
     })
 }

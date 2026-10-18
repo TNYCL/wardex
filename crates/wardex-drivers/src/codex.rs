@@ -5,7 +5,9 @@ use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 use wardex_core::config::CodexConfig;
-use wardex_core::driver::{Driver, DriverCommand, DriverError, DriverHandle, SpawnSpec, summarize};
+use wardex_core::driver::{
+    Driver, DriverCommand, DriverError, DriverHandle, SpawnSpec, cap_tool_text, summarize,
+};
 use wardex_core::process::{LaunchRequest, Launcher};
 use wardex_core::{Answer, DriverKind, EventKind, QuestionItem, QuestionOption, ToolStatus};
 
@@ -234,6 +236,7 @@ impl CodexProtocol {
                         .as_str()
                         .or(result["thread"]["model"].as_str())
                         .map(String::from),
+                    reasoning: result["reasoningEffort"].as_str().map(String::from),
                 });
                 self.next_queued(out);
             }
@@ -328,12 +331,15 @@ impl CodexProtocol {
                 if let Some(name) = tool_name(item) {
                     let id = item["id"].as_str().unwrap_or_default().to_string();
                     self.tools.insert(id.clone(), name.clone());
+                    let input = tool_input(item);
                     out.events.push(EventKind::ToolCall {
                         call_id: id,
                         name,
-                        input_summary: summarize(&tool_input(item), INPUT_SUMMARY),
+                        input_summary: summarize(&input, INPUT_SUMMARY),
                         status: ToolStatus::Started,
                         result_summary: None,
+                        input: Some(cap_tool_text(&input)),
+                        output: None,
                     });
                 }
             }
@@ -368,6 +374,8 @@ impl CodexProtocol {
                             ToolStatus::Completed
                         },
                         result_summary: Some(summarize(&result, RESULT_SUMMARY)),
+                        input: None,
+                        output: Some(cap_tool_text(&result)),
                     });
                 }
             }

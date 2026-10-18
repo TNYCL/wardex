@@ -8,6 +8,9 @@ socket = "$XDG_RUNTIME_DIR/wardex.sock"
 # HTTP for /healthz and /mcp. Refuses to start without a token.
 http_listen = "127.0.0.1:7878"
 database = "$XDG_STATE_HOME/wardex/wardex.db"
+# Secrets as KEY=VALUE lines (mode 600). Read at start and on
+# `wardex daemon reload` / SIGHUP; values win over the process env.
+env_file = "$XDG_CONFIG_HOME/wardex/env"
 
 [auth]
 # Env var holding the bearer token for HTTP/MCP. Always required.
@@ -59,10 +62,19 @@ systemd_scope = true
 # Slices that `wardex run --slice <name>` may use.
 slices = ["build.slice", "tests.slice"]
 
-# Webhooks. Repeat the table for multiple targets.
+# Webhooks. Repeat the table for multiple targets; see docs/webhooks.md.
+# URLs, secrets and header values are env var names (set in env_file).
+# After changes: wardex daemon reload (no restart needed).
 [[webhooks]]
+# Name used in logs instead of the URL.
+name = "bot-a"
 url_env = "WARDEX_WEBHOOK_URL"
 events = ["question", "approval", "reminder", "done", "error", "stuck"]
+# Optional: only sessions whose --agent / --task match these globs.
+agents = ["bot-a"]
+# tasks = ["fix-*"]
+# Optional: event types sent for every session regardless of the filters.
+# escalate = ["error", "stuck"]
 # Optional: env var with an HMAC-SHA256 secret; sent as X-Wardex-Signature.
 hmac_secret_env = "WARDEX_WEBHOOK_SECRET"
 # Optional extra headers; values are env var names.

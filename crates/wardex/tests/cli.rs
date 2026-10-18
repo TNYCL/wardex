@@ -18,6 +18,11 @@ struct Env {
 
 impl Env {
     fn new(fixture: &str) -> Self {
+        Self::with_config(fixture, "")
+    }
+
+    /// `extra` is appended to the config (e.g. `[[webhooks]]` tables).
+    fn with_config(fixture: &str, extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = replay_script(fixture, dir.path());
         let config = dir.path().join("wardex.toml");
@@ -28,6 +33,7 @@ impl Env {
 [daemon]
 socket = "{dir}/wardex.sock"
 database = "{dir}/state/wardex.db"
+env_file = "{dir}/env"
 tick_ms = 100
 
 [resources]
@@ -39,6 +45,7 @@ bin = "{script}"
 # Never start a real agent CLI from tests.
 [drivers.codex]
 bin = "{script}"
+{extra}
 "#,
                 dir = dir.path().display(),
                 script = script.display()
@@ -293,7 +300,7 @@ fn mcp_over_stdio() {
         .unwrap()
     };
 
-    assert_eq!(rt.block_on(client.list_all_tools()).unwrap().len(), 12);
+    assert_eq!(rt.block_on(client.list_all_tools()).unwrap().len(), 13);
     let r = call("overview", serde_json::json!({}));
     assert_eq!(r.is_error, Some(true));
     assert!(text(&r).starts_with("unavailable:"), "{}", text(&r));
@@ -353,5 +360,203 @@ fn mcp_over_stdio() {
     );
 
     rt.block_on(client.cancel()).unwrap();
+    env.stop_daemon(daemon);
+}
+
+/// A tiny HTTP receiver on a thread: records each request body's event type.
+fn hook_receiver() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                let _ = tx.send(v["event"]["type"].as_str().unwrap_or("").to_string());
+            }
+        }
+    });
+    (url, rx)
+}
+
+/// Webhooks come from the env file; `daemon reload` and SIGHUP apply it
+/// without a restart. `daemon stop` returns only once the daemon exited.
+#[test]
+fn reload_applies_env_file_webhooks() {
+    let env = Env::with_config(
+        "tool",
+        "[[webhooks]]\nname = \"bot\"\nurl_env = \"TEST_HOOK_URL\"\nevents = [\"done\"]\n",
+    );
+    let (url, hooks) = hook_receiver();
+    let mut daemon = env.start_daemon();
+    let cwd = env.dir.path().to_string_lossy().into_owned();
+    let run = || {
+        let id = String::from_utf8(
+            env.run(&["run", "--driver", "claude", "--cwd", &cwd, "--prompt", "go"])
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        env.wait_state(&id, "done");
+        id
+    };
+
+    // No URL yet: nothing is sent.
+    run();
+    assert!(hooks.recv_timeout(Duration::from_millis(500)).is_err());
+
+    std::fs::write(
+        env.dir.path().join("env"),
+        format!("# test\nTEST_HOOK_URL={url}\n"),
+    )
+    .unwrap();
+    let reloaded = env.json(&["daemon", "reload"]);
+    assert_eq!(reloaded["webhooks_active"], 1);
+    assert_eq!(reloaded["restart_needed"], serde_json::json!([]));
+    run();
+    assert_eq!(hooks.recv_timeout(Duration::from_secs(10)).unwrap(), "done");
+
+    // SIGHUP does the same: with the URL gone, nothing is sent any more.
+    std::fs::write(env.dir.path().join("env"), "# no hooks\n").unwrap();
+    let status = Command::new("kill")
+        .args(["-HUP", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "SIGHUP must not stop the daemon"
+    );
+    run();
+    assert!(hooks.recv_timeout(Duration::from_millis(500)).is_err());
+
+    // A changed section that cannot be applied live is reported.
+    let config = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        config.replace("tick_ms = 100", "tick_ms = 200"),
+    )
+    .unwrap();
+    let reloaded = env.json(&["daemon", "reload"]);
+    assert_eq!(reloaded["restart_needed"], serde_json::json!(["daemon"]));
+
+    let out = env.run(&["daemon", "stop"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "daemon stopped\n");
+    // Already exited when `stop` returned.
+    let start = Instant::now();
+    while daemon.try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "daemon still running after stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `daemon restart` comes back in the same process with history intact.
+#[test]
+fn restart_keeps_the_process_and_history() {
+    let env = Env::new("tool");
+    let mut daemon = env.start_daemon();
+    let before = env.json(&["list", "-a"]);
+    let cwd = env.dir.path().to_string_lossy().into_owned();
+    let out = env.run(&["run", "--driver", "claude", "--cwd", &cwd, "--prompt", "go"]);
+    let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    env.wait_state(&id, "done");
+    assert!(before.as_array().unwrap().is_empty());
+
+    let out = env.run(&["daemon", "restart"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "daemon restarted\n");
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "same process keeps running"
+    );
+    assert_eq!(env.json(&["list", "-a"])[0]["id"], id.as_str());
+    env.stop_daemon(daemon);
+}
+
+/// Full tool input/output: left out of `tail` by default, shown with
+/// `--full` and by `tool-output`.
+#[test]
+fn tool_output_is_stored_in_full() {
+    let env = Env::new("tool");
+    let daemon = env.start_daemon();
+    let cwd = env.dir.path().to_string_lossy().into_owned();
+    let out = env.run(&["run", "--driver", "claude", "--cwd", &cwd, "--prompt", "go"]);
+    let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    env.wait_state(&id, "done");
+
+    let events = env.json(&["tail", &id, "-n", "100"]);
+    let tools: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "tool_call")
+        .collect();
+    assert!(!tools.is_empty());
+    assert!(
+        tools
+            .iter()
+            .all(|e| e["payload"].get("output").is_none() && e["payload"].get("input").is_none())
+    );
+    let full = env.json(&["tail", &id, "-n", "100", "--full"]);
+    let done = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["payload"]["status"] != "started")
+        .unwrap();
+    let output = done["payload"]["output"].as_str().unwrap();
+    assert!(!output.is_empty());
+
+    let seq = done["seq"].as_u64().unwrap().to_string();
+    let tool = env.json(&["tool-output", &id, &seq]);
+    assert_eq!(tool["output"], output);
+    assert!(tool["input"].as_str().is_some_and(|i| i.starts_with('{')));
+    assert!(tool["started_seq"].as_u64().unwrap() < tool["finished_seq"].as_u64().unwrap());
+    let human = env.run(&["tool-output", &id, &seq]);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("--- output"));
+    let bad = env.run(&["tool-output", &id, "1"]);
+    assert!(!bad.status.success());
+
+    let summary = env.json(&["summary", &id]);
+    assert!(summary["last_turn_ms"].as_i64().unwrap() >= 0);
+    let ended_turn = summary["last_turn_ended_ms"].as_i64().unwrap();
+    assert_eq!(
+        summary["duration_ms"].as_i64().unwrap(),
+        ended_turn - summary["created_ms"].as_i64().unwrap()
+    );
     env.stop_daemon(daemon);
 }

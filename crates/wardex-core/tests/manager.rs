@@ -46,6 +46,7 @@ impl Driver for FakeDriver {
             send(EventKind::Started {
                 driver_session_id: Some(dsid),
                 model: Some(format!("fake-model-{n}")),
+                reasoning: Some("fake-effort".into()),
             });
             let mut pending_tool = false;
             while let Some(cmd) = cmd_rx.recv().await {
@@ -78,6 +79,8 @@ impl Driver for FakeDriver {
                                     input_summary: "cargo build".into(),
                                     status: ToolStatus::Started,
                                     result_summary: None,
+                                    input: None,
+                                    output: None,
                                 });
                             }
                             "crash" => {
@@ -261,6 +264,21 @@ async fn run_to_idle_and_persist() {
     assert_eq!(summary.prompts, 1);
     assert_eq!(summary.turns, 1);
     assert_eq!(summary.last_result.as_deref(), Some("echo hello"));
+    // The CLI-reported effort is recorded when none was given.
+    assert_eq!(status.session.reasoning.as_deref(), Some("fake-effort"));
+    // The duration stops at the end of the last turn, not at `summary` time.
+    let turn_end = summary.last_turn_ended_ms.unwrap();
+    assert_eq!(summary.duration_ms, turn_end - summary.created_ms);
+    assert!(summary.last_turn_ms.unwrap() >= 0);
+    assert!(
+        summary.ended_ms.is_none(),
+        "idle: the process is still alive"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.manager.summary(&id).await.unwrap().duration_ms,
+        summary.duration_ms
+    );
 
     // Prefix resolution.
     assert_eq!(h.manager.resolve(&id.as_str()[..4]).await.unwrap(), id);
@@ -495,6 +513,11 @@ async fn idle_shutdown_ends_as_done() {
     let h = harness_with(config).await;
     let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
     wait_state(&h.manager, &id, SessionState::Idle).await;
+    let o = h.manager.overview(0).await.unwrap();
+    let s = &o.live[0];
+    assert!(s.idle_since_ms.is_some());
+    let left = s.shutdown_in_ms.unwrap();
+    assert!((0..=1_000).contains(&left), "{left}");
     h.manager.tick(now_ms() + 1_500);
     wait_state(&h.manager, &id, SessionState::Done).await;
     assert!(matches!(
@@ -787,4 +810,16 @@ async fn orphans_are_not_resumed_unless_enabled() {
     let st = m.status(&id).await.unwrap().session;
     assert_eq!(st.state, SessionState::Orphaned);
     assert!(!st.resume_pending);
+}
+
+#[tokio::test]
+async fn explicit_reasoning_is_kept() {
+    let h = harness().await;
+    let mut s = spec(&h, "hello");
+    s.reasoning = Some("low".into());
+    let id = h.manager.run(s).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    let status = h.manager.status(&id).await.unwrap();
+    assert_eq!(status.session.reasoning.as_deref(), Some("low"));
+    assert_eq!(status.session.model.as_deref(), Some("fake-model-1"));
 }

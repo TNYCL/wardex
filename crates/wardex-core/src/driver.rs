@@ -79,6 +79,26 @@ pub trait Driver: Send + Sync + 'static {
     fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError>;
 }
 
+/// Cap for the full tool input/output stored on `tool_call` events.
+pub const TOOL_TEXT_LIMIT: usize = 256 * 1024;
+
+/// `text` cut to `TOOL_TEXT_LIMIT` bytes (at a char boundary), with a note
+/// of how much was cut.
+pub fn cap_tool_text(text: &str) -> String {
+    if text.len() <= TOOL_TEXT_LIMIT {
+        return text.to_string();
+    }
+    let mut end = TOOL_TEXT_LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[wardex: {} more bytes not stored]",
+        &text[..end],
+        text.len() - end
+    )
+}
+
 /// Collapse whitespace and cut to `max` characters, for one-line summaries.
 pub fn summarize(text: &str, max: usize) -> String {
     let mut out = String::new();

@@ -1,19 +1,25 @@
 //! The daemon: wires the store, drivers and manager together and serves the
 //! local socket, HTTP and webhooks until a signal or a `shutdown` request.
+//! SIGHUP or a `reload` request re-reads the config and env files and
+//! applies the webhook settings without a restart.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::json;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
 use wardex_core::Config;
+use wardex_core::config::{ConfigError, Env};
 use wardex_core::driver::Driver;
 use wardex_core::manager::Manager;
 use wardex_core::process::Launcher;
 use wardex_core::store::{Store, StoreError};
 use wardex_drivers::{ClaudeDriver, CodexDriver};
 
+use crate::api::Response;
+use crate::socket::Control;
 use crate::{http, socket, webhook};
 
 #[derive(Debug, thiserror::Error)]
@@ -26,8 +32,37 @@ pub enum DaemonError {
     Manager(#[from] wardex_core::manager::ManagerError),
     #[error("invalid daemon.http_listen {0:?}")]
     Listen(String),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// How the daemon ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Stopped,
+    /// A `restart` was requested: the caller starts the daemon again.
+    Restart,
+}
+
+/// Where the config comes from, so `reload` reads the same files.
+#[derive(Debug, Clone, Default)]
+pub struct Source {
+    /// `--config`; `None` uses the default path.
+    pub config_path: Option<PathBuf>,
+    /// `--socket`, which wins over the files.
+    pub socket: Option<String>,
+}
+
+impl Source {
+    pub fn load(&self) -> Result<(Config, Env), ConfigError> {
+        let (mut config, env) = Config::load_with_env(self.config_path.as_deref())?;
+        if let Some(socket) = &self.socket {
+            config.daemon.socket = socket.clone();
+        }
+        Ok((config, env))
+    }
 }
 
 /// Drivers for every supported CLI.
@@ -38,17 +73,20 @@ pub fn drivers(config: &Config) -> Vec<Arc<dyn Driver>> {
     ]
 }
 
-pub async fn run(config: Config) -> Result<(), DaemonError> {
+pub async fn run(source: Source) -> Result<Exit, DaemonError> {
+    let (config, env) = source.load()?;
     let launcher = Launcher::new(config.resources.systemd_scope);
-    run_with(config, drivers, launcher).await
+    run_with(source, config, env, drivers, launcher).await
 }
 
 /// Run with custom drivers (tests).
 pub async fn run_with(
+    source: Source,
     config: Config,
+    env: Env,
     make_drivers: impl Fn(&Config) -> Vec<Arc<dyn Driver>>,
     launcher: Launcher,
-) -> Result<(), DaemonError> {
+) -> Result<Exit, DaemonError> {
     let socket_path = config.socket_path();
     let db_path = config.database_path();
     let store = Store::open(&db_path).await?;
@@ -78,19 +116,43 @@ pub async fn run_with(
         systemd_scope = launcher.uses_scope(),
         "wardex daemon started"
     );
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(socket::serve(
-        listener,
-        manager.clone(),
-        shutdown_tx.clone(),
-    ));
+    let (control, mut reload_rx) = Control::new();
+    let shutdown_tx = control.shutdown.clone();
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(socket::serve(listener, manager.clone(), control.clone()));
     {
         let m = manager.clone();
         tokio::spawn(async move { m.supervise().await });
     }
-    webhook::spawn(&config, &manager);
+    let webhooks = webhook::spawn(
+        webhook::resolve_all(&config, |k| env.get(k)),
+        manager.clone(),
+    );
+    let token = config.token_from(&env);
 
-    if let Some(token) = config.token() {
+    {
+        let mut hup = signal(SignalKind::hangup())?;
+        let mut running = config.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let reply = tokio::select! {
+                    Some(tx) = reload_rx.recv() => Some(tx),
+                    Some(()) = hup.recv() => {
+                        tracing::info!("SIGHUP received");
+                        None
+                    }
+                    else => return,
+                };
+                let resp = reload(&source, &mut running, &token, &webhooks);
+                if let Some(tx) = reply {
+                    let _ = tx.send(resp);
+                }
+            }
+        });
+    }
+
+    if let Some(token) = token {
         let addr: SocketAddr = config
             .daemon
             .http_listen
@@ -125,6 +187,61 @@ pub async fn run_with(
     manager.shutdown(grace).await;
     let _ = std::fs::remove_file(&socket_path);
     store.close().await;
-    tracing::info!("wardex daemon stopped");
-    Ok(())
+    let exit = if control.restart_requested() {
+        tracing::info!("wardex daemon stopped; restarting");
+        Exit::Restart
+    } else {
+        tracing::info!("wardex daemon stopped");
+        Exit::Stopped
+    };
+    Ok(exit)
+}
+
+/// Re-read the config and env files. Webhooks switch over at once; other
+/// changed sections are reported, since they only apply after a restart.
+fn reload(
+    source: &Source,
+    running: &mut Config,
+    token: &Option<String>,
+    webhooks: &webhook::Webhooks,
+) -> Response {
+    let (new, env) = match source.load() {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            tracing::warn!(error = %e, "reload failed; keeping the current config");
+            return Response::err("invalid", e.to_string());
+        }
+    };
+    let targets = webhook::resolve_all(&new, |k| env.get(k));
+    let active = targets.len();
+    webhooks.replace(targets);
+    let mut restart_needed: Vec<&str> = [
+        ("daemon", running.daemon != new.daemon),
+        ("auth", running.auth != new.auth),
+        ("http", running.http != new.http),
+        ("sessions", running.sessions != new.sessions),
+        ("timeouts", running.timeouts != new.timeouts),
+        ("retention", running.retention != new.retention),
+        ("drivers", running.drivers != new.drivers),
+        ("resources", running.resources != new.resources),
+    ]
+    .into_iter()
+    .filter_map(|(name, changed)| changed.then_some(name))
+    .collect();
+    if *token != new.token_from(&env) {
+        restart_needed.push("token");
+    }
+    running.webhooks = new.webhooks.clone();
+    tracing::info!(
+        webhooks = new.webhooks.len(),
+        active,
+        env_vars = env.file_len(),
+        restart_needed = ?restart_needed,
+        "config reloaded"
+    );
+    Response::ok(json!({
+        "webhooks": new.webhooks.len(),
+        "webhooks_active": active,
+        "restart_needed": restart_needed,
+    }))
 }

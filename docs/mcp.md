@@ -84,11 +84,12 @@ Session ids can be shortened to any unique prefix.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `run` | `driver` (`claude`/`codex`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
-| `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration and latest events; counts per state; sessions ended in the last 24h |
+| `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration, `idle_since_ms`, `shutdown_in_ms` and latest events; counts per state; sessions ended in the last 24h |
 | `list` | optional `all` | session records, newest first |
 | `status` | `id` | record, pending questions, running tools, RSS/CPU |
-| `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60) | events, oldest first |
-| `summary` | `id` | final text, git state, duration, turn/event/tool counts |
+| `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60), `full` | events, oldest first |
+| `tool_output` | `id`, `seq` (of either `tool_call` event of the call) | the call's full `input` and `output` |
+| `summary` | `id` | final text, git state, durations, turn/event/tool counts |
 | `pending_questions` | – | open questions and approvals of all sessions |
 | `answer` | `id`; `text` **or** `answers` (item id → answer); optional `question_id` | `{session_id, question_id}` |
 | `send` | `id`, `message` | `{session_id, resumed}` |
@@ -119,6 +120,30 @@ items:
 - Approvals (`type: approval`, id in `request_id`): `text` is `allow` or
   `deny`. `pending_questions` lists both kinds under `question_id`.
 
+### Session records and summaries
+
+- `model` is the model the CLI reports it resolved (e.g. a full model id when
+  an alias or nothing was given).
+- `reasoning` is the effort Wardex passed, or else the one the CLI reports.
+  Codex reports its effective effort on `thread/start`; Claude Code does not
+  report it, so for Claude it stays empty unless given per run or through
+  `drivers.claude.default_reasoning`.
+- `summary.duration_ms` runs from creation to the end of the last turn (to
+  now while a turn runs). `last_turn_ended_ms` is when that turn ended and
+  `last_turn_ms` how long it took, from its prompt.
+- `ended_ms` is when the agent **process** ended. It stays empty while a
+  session is `idle`: the process is alive and waits for the next message. It
+  is set once the session stops, errors, or closes after
+  `sessions.idle_shutdown_secs`.
+
+### Tool output
+
+`tool_call` events carry a one-line `input_summary` and a 300-character
+`result_summary`. Wardex also stores each call's full input and output (up to
+256 KiB each). They are left out of `tail` (pass `full: true` to include
+them) and of webhooks; `tool_output {"id": …, "seq": …}` returns them for one
+call. CLI: `wardex tail <id> --full`, `wardex tool-output <id> <seq>`.
+
 ### Paging and waiting
 
 `tail` without `since_seq` returns the last `last` (default 20) events. With
@@ -135,9 +160,12 @@ Message deltas are never returned; full messages are.
 3. On `question`: read it (from the webhook, `pending_questions` or `tail`)
    and `answer`.
 4. On `done`: read `summary` (result text, changed files, branch). Either
-   `send` the next instruction or leave the session; idle sessions close after
-   `sessions.idle_shutdown_secs` and `send` resumes them later.
-5. Use `overview` to see everything at once, e.g. after a bot restart.
+   `send` the next instruction or leave the session alone.
+5. **Do not `stop` a session because its work is done.** An idle session
+   closes itself after `sessions.idle_shutdown_secs` (default 900 s;
+   `overview` shows `shutdown_in_ms`), and `send` resumes it with its context
+   later. Use `stop` only to abort work.
+6. Use `overview` to see everything at once, e.g. after a bot restart.
 
 Without webhooks, poll `overview` or follow one session with `tail` +
 `since_seq` + `wait_secs`.
@@ -151,5 +179,6 @@ A short description the bot's instructions can include:
 > to your name and `task` to a short label). Sessions work on their own. When
 > one asks a question it shows up in `pending_questions`; reply with `answer`.
 > When a turn is done, read `summary` and continue with `send` if needed.
-> `overview` shows all sessions. Do not start a second session for work that
-> is already running.
+> Do not `stop` finished sessions; idle ones close on their own and `send`
+> resumes them. `overview` shows all sessions. Do not start a second session
+> for work that is already running.

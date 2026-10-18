@@ -62,14 +62,64 @@ X-Wardex-Signature: sha256=<hex HMAC-SHA256 of the body>   (if a secret is set)
 
 `X-Wardex-Delivery` is stable across retries; use it to drop duplicates.
 
+## Routing
+
+Every `[[webhooks]]` table is one target. Several can point at different bots:
+
+```toml
+[[webhooks]]
+name = "bot-a"                  # used in logs instead of the URL
+url_env = "WARDEX_HOOK_BOT_A_URL"
+hmac_secret_env = "WARDEX_HOOK_BOT_A_SECRET"
+agents = ["bot-a"]              # only sessions started with --agent bot-a
+events = ["question", "approval", "reminder", "done", "error", "stuck"]
+
+[[webhooks]]
+name = "oncall"
+url_env = "WARDEX_HOOK_ONCALL_URL"
+agents = ["oncall"]             # its own sessions…
+events = ["question", "approval", "reminder", "done", "error", "stuck"]
+escalate = ["error", "stuck"]   # …plus errors and stuck sessions of everyone
+```
+
+A target gets an event when:
+
+- the event type is in `escalate` (any session, labeled or not), or
+- the type is in `events` **and** the session matches `agents` and `tasks`.
+
+`agents` and `tasks` are lists of globs (`*` any run of characters, `?` one
+character), e.g. `tasks = ["fix-*"]`. An empty or missing list matches every
+session. A non-empty list never matches a session without that label, so
+events of sessions started without `--agent` only go to targets without an
+`agents` filter (and to `escalate`). Each target gets an event at most once,
+even if it matches both ways.
+
+## Changing webhooks without a restart
+
+URLs and secrets live in the env file (`daemon.env_file`, default
+`~/.config/wardex/env`, mode 600), as `KEY=VALUE` lines. The daemon reads it
+itself at start and again on reload; its values win over the process env.
+
+```sh
+wardex daemon reload             # or: systemctl --user reload wardex (SIGHUP)
+```
+
+Reload re-reads the config and env files and switches webhooks over between
+two events: unchanged targets keep their queue, removed ones finish what is
+already queued, new ones start with the next event. Running sessions are not
+touched. Other changed sections (timeouts, drivers, …) are reported as
+`restart_needed`; apply them with `wardex daemon restart --drain <secs>`.
+
 ## Delivery
 
-- One worker per webhook; events are delivered in order.
+- One queue per webhook; events are delivered in order.
 - Retries on network errors, timeouts, 5xx, 408 and 429, with exponential
   backoff starting at 1 s (capped at 60 s), up to `max_attempts`.
 - Other 4xx responses are not retried.
 - URLs, header values and secrets are read from env vars and never logged;
-  logs refer to a webhook by its position in the config.
+  logs refer to a webhook by its `name` (default `webhooks[<index>]`).
+- `tool_call` events in webhooks carry the summaries only; the full tool
+  input/output is available over `tool_output`.
 
 ## Verifying the signature
 
