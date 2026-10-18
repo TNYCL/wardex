@@ -177,7 +177,7 @@ transparently.
 | M2 | Event model, store, session manager (done) |
 | M3 | Claude driver (done) |
 | M4 | CLI + Unix socket API (done) |
-| M5 | Codex driver |
+| M5 | Codex driver (done) |
 | M6 | Stuck/reminder detection, webhooks |
 | M7 | systemd scopes, resource usage |
 | M8 | Restart/orphan/resume, 10+ session load test, acceptance |

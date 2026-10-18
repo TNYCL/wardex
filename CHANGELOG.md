@@ -22,6 +22,11 @@ All notable changes to this project are documented here. The format follows
 - Daemon with a Unix socket API (one JSON request per connection, streamed
   `tail --follow`), `/healthz` over HTTP when a token is set, SIGTERM/SIGINT
   handling and orphan recovery on start.
+- Codex driver: `codex app-server` JSON-RPC (initialize, thread start and
+  resume with `excludeTurns`, turns with model and effort, queued follow-ups,
+  `turn/interrupt`), questions via `item/tool/requestUserInput` (opt-in),
+  approvals for command, file change, permission and MCP elicitation requests
+  (declined automatically in read-only sessions).
 - CLI: `daemon`, `daemon stop`, `run`, `list`, `status`, `tail`, `summary`,
   `answer`, `send`, `interrupt`, `stop`, `resume`, `pending`, all with
   `--json`; session id prefixes.
