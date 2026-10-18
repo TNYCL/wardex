@@ -119,7 +119,8 @@ driver **denies every `can_use_tool` request except `AskUserQuestion`**
 reports that it could not write.
 
 Notes: plan mode may switch model according to user settings, and writes its
-plan file under `~/.claude/plans/` regardless.
+plan file under `~/.claude/plans/` regardless (seen again in the acceptance
+run).
 
 ### Interrupt
 
@@ -172,6 +173,9 @@ client methods; Wardex only uses the ones below.
 - The user's `~/.codex/config.toml` applies (default model, effort, MCP
   servers), so Wardex should always pass `model` and `effort` explicitly when
   given.
+- Starting an app-server can trigger Codex's own background memory
+  consolidation (`~/.codex/memories/`) over the user's earlier sessions. This
+  is Codex behavior, independent of Wardex.
 - **Codex writes to the user's config.** `thread/start` in a git repository
   that is not yet trusted appends `[projects."<cwd>"] trust_level = "trusted"`
   to `~/.codex/config.toml` (observed in 0.163.0; non-git directories were not

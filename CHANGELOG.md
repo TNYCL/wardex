@@ -32,6 +32,11 @@ All notable changes to this project are documented here. The format follows
   delivery ids; URLs and secrets are never logged (`docs/webhooks.md`).
 - Sessions run in transient systemd user scopes (`--collect`), optionally in
   a slice; scopes are killed when a session ends so no tool processes linger.
+- Recovery: sessions orphaned by a daemon stop or crash are flagged; with
+  `sessions.auto_resume_orphaned` the next daemon resumes them, sending
+  `sessions.resume_prompt` to those that were mid-turn. Leftover scopes from
+  a crashed daemon are killed first. `daemon stop --drain SECS` waits for
+  running turns.
 - CLI: `daemon`, `daemon stop`, `run`, `list`, `status`, `tail`, `summary`,
   `answer`, `send`, `interrupt`, `stop`, `resume`, `pending`, all with
   `--json`; session id prefixes.
@@ -39,6 +44,13 @@ All notable changes to this project are documented here. The format follows
 - `docs/drivers.md`: verified Claude Code and Codex protocol behavior (M1).
 - Sanitized driver fixtures recorded from real sessions, plus recording and
   sanitizing tools in `tools/fixtures/`.
+
+### Fixed
+
+- `run` prints warnings on stderr so stdout holds only the session id.
+- Daemon logs use colors only on a terminal.
+- Question rows are written in order with events, so `pending` never misses
+  a question that was just asked.
 
 ### Changed
 

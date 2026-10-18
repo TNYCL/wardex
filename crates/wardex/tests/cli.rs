@@ -235,3 +235,21 @@ fn errors_are_reported() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("resources.slices"));
     env.stop_daemon(daemon);
 }
+
+#[test]
+fn run_prints_only_the_id_on_stdout() {
+    let env = Env::new("partial");
+    let daemon = env.start_daemon();
+    let first = env.run(&["run", "--driver", "claude", "--prompt", "a"]);
+    let second = env.run(&["run", "--driver", "claude", "--prompt", "b"]);
+    let id1 = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    let id2 = String::from_utf8_lossy(&second.stdout).trim().to_string();
+    assert_eq!(id1.len(), 8, "{id1:?}");
+    assert_eq!(id2.len(), 8, "{id2:?}");
+    // The same-cwd warning goes to stderr.
+    let err = String::from_utf8_lossy(&second.stderr);
+    if env.json(&["status", &id1])["live"] == true {
+        assert!(err.contains("warning:"), "{err}");
+    }
+    env.stop_daemon(daemon);
+}

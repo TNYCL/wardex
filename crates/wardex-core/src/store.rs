@@ -52,14 +52,21 @@ pub struct Store {
 }
 
 enum WriterMsg {
-    Event(Box<Event>),
-    Session(Box<SessionRecord>),
+    Item(Item),
     Flush(oneshot::Sender<()>),
 }
 
 enum Item {
     Event(Box<Event>),
     Session(Box<SessionRecord>),
+    Question(Box<QuestionRow>),
+    Answer {
+        session: SessionId,
+        question_id: String,
+        answer: serde_json::Value,
+        at_ms: i64,
+    },
+    Cancel(SessionId),
 }
 
 const BATCH: usize = 256;
@@ -102,13 +109,47 @@ impl Store {
 
     /// Queue an event for persistence. Deltas must not be passed here.
     pub fn append_event(&self, event: Event) {
-        let _ = self.writer.send(WriterMsg::Event(Box::new(event)));
+        let _ = self
+            .writer
+            .send(WriterMsg::Item(Item::Event(Box::new(event))));
+    }
+
+    /// Queue a new question row (ordered with events).
+    pub fn queue_question(&self, q: QuestionRow) {
+        let _ = self
+            .writer
+            .send(WriterMsg::Item(Item::Question(Box::new(q))));
+    }
+
+    /// Queue an answer for a question row (ordered with its insert).
+    pub fn queue_answer(
+        &self,
+        session: &SessionId,
+        question_id: &str,
+        answer: serde_json::Value,
+        at_ms: i64,
+    ) {
+        let _ = self.writer.send(WriterMsg::Item(Item::Answer {
+            session: session.clone(),
+            question_id: question_id.to_string(),
+            answer,
+            at_ms,
+        }));
+    }
+
+    /// Queue cancelling all open questions of a session.
+    pub fn queue_cancel(&self, session: &SessionId) {
+        let _ = self
+            .writer
+            .send(WriterMsg::Item(Item::Cancel(session.clone())));
     }
 
     /// Queue a session row update. Applied in order with queued events, so a
     /// later snapshot never gets overwritten by an earlier one.
     pub fn queue_session_update(&self, record: SessionRecord) {
-        let _ = self.writer.send(WriterMsg::Session(Box::new(record)));
+        let _ = self
+            .writer
+            .send(WriterMsg::Item(Item::Session(Box::new(record))));
     }
 
     /// Wait until every event queued so far is committed.
@@ -337,20 +378,7 @@ impl Store {
     }
 
     pub async fn insert_question(&self, q: &QuestionRow) -> Result<()> {
-        sqlx::query(
-            "INSERT OR REPLACE INTO questions (session_id, question_id, kind, body, asked_ms,
-                answered_ms, answer, cancelled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(q.session_id.as_str())
-        .bind(&q.question_id)
-        .bind(&q.kind)
-        .bind(q.body.to_string())
-        .bind(q.asked_ms)
-        .bind(q.answered_ms)
-        .bind(q.answer.as_ref().map(|a| a.to_string()))
-        .bind(q.cancelled)
-        .execute(&self.pool)
-        .await?;
+        insert_question_query(q).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -361,26 +389,15 @@ impl Store {
         answer: &serde_json::Value,
         at_ms: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE questions SET answered_ms = ?, answer = ? WHERE session_id = ? AND question_id = ?",
-        )
-        .bind(at_ms)
-        .bind(answer.to_string())
-        .bind(session.as_str())
-        .bind(question_id)
-        .execute(&self.pool)
-        .await?;
+        answer_question_query(session, question_id, answer, at_ms)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Mark all open questions of a session as cancelled.
     pub async fn cancel_questions(&self, session: &SessionId) -> Result<()> {
-        sqlx::query(
-            "UPDATE questions SET cancelled = 1 WHERE session_id = ? AND answered_ms IS NULL",
-        )
-        .bind(session.as_str())
-        .execute(&self.pool)
-        .await?;
+        cancel_questions_query(session).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -494,8 +511,7 @@ async fn writer_loop(pool: SqlitePool, mut rx: mpsc::UnboundedReceiver<WriterMsg
 
 fn push(batch: &mut Vec<Item>, waiters: &mut Vec<oneshot::Sender<()>>, msg: WriterMsg) {
     match msg {
-        WriterMsg::Event(e) => batch.push(Item::Event(e)),
-        WriterMsg::Session(s) => batch.push(Item::Session(s)),
+        WriterMsg::Item(item) => batch.push(item),
         WriterMsg::Flush(tx) => waiters.push(tx),
     }
 }
@@ -522,10 +538,63 @@ async fn write_batch(pool: &SqlitePool, batch: &[Item]) -> Result<()> {
             Item::Session(s) => {
                 update_session_query(s).execute(&mut *tx).await?;
             }
+            Item::Question(q) => {
+                insert_question_query(q).execute(&mut *tx).await?;
+            }
+            Item::Answer {
+                session,
+                question_id,
+                answer,
+                at_ms,
+            } => {
+                answer_question_query(session, question_id, answer, *at_ms)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Item::Cancel(session) => {
+                cancel_questions_query(session).execute(&mut *tx).await?;
+            }
         }
     }
     tx.commit().await?;
     Ok(())
+}
+
+type Query<'a> = sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>;
+
+fn insert_question_query(q: &QuestionRow) -> Query<'_> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO questions (session_id, question_id, kind, body, asked_ms,
+            answered_ms, answer, cancelled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(q.session_id.as_str())
+    .bind(&q.question_id)
+    .bind(&q.kind)
+    .bind(q.body.to_string())
+    .bind(q.asked_ms)
+    .bind(q.answered_ms)
+    .bind(q.answer.as_ref().map(|a| a.to_string()))
+    .bind(q.cancelled)
+}
+
+fn answer_question_query<'a>(
+    session: &'a SessionId,
+    question_id: &'a str,
+    answer: &serde_json::Value,
+    at_ms: i64,
+) -> Query<'a> {
+    sqlx::query(
+        "UPDATE questions SET answered_ms = ?, answer = ? WHERE session_id = ? AND question_id = ?",
+    )
+    .bind(at_ms)
+    .bind(answer.to_string())
+    .bind(session.as_str())
+    .bind(question_id)
+}
+
+fn cancel_questions_query(session: &SessionId) -> Query<'_> {
+    sqlx::query("UPDATE questions SET cancelled = 1 WHERE session_id = ? AND answered_ms IS NULL")
+        .bind(session.as_str())
 }
 
 fn update_session_query(

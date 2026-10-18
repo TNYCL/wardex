@@ -333,7 +333,7 @@ impl Manager {
                     exit_code: None,
                 },
             );
-            self.inner.store.cancel_questions(&record.id).await?;
+            self.inner.store.queue_cancel(&record.id);
             ids.push(record.id.clone());
         }
         self.inner.store.flush().await;
@@ -584,7 +584,6 @@ impl Manager {
             other => other,
         };
 
-        let mut question: Option<QuestionRow> = None;
         {
             let mut live = self.live();
             let Some(entry) = live.get_mut(id) else {
@@ -645,7 +644,8 @@ impl Manager {
                         reminded: false,
                         stuck: false,
                     };
-                    question = Some(QuestionRow {
+                    // Queued under the lock: ordered before any answer.
+                    self.inner.store.queue_question(QuestionRow {
                         session_id: id.clone(),
                         question_id,
                         kind: pending.kind().into(),
@@ -692,11 +692,6 @@ impl Manager {
             entry.recompute_state();
             let event = make_event(&mut entry.record, kind);
             self.publish(&event, Some(&entry.record));
-        }
-        if let Some(q) = question
-            && let Err(e) = self.inner.store.insert_question(&q).await
-        {
-            tracing::error!(session = %id, error = %e, "cannot store question");
         }
     }
 
@@ -745,9 +740,7 @@ impl Manager {
                 exit_code: code,
             },
         );
-        if let Err(e) = self.inner.store.cancel_questions(id).await {
-            tracing::error!(session = %id, error = %e, "cannot cancel questions");
-        }
+        self.inner.store.queue_cancel(id);
         tracing::info!(session = %id, state = state.as_str(), ?code, "session process ended");
         if let Some(unit) = &record.unit {
             // Clean up anything the agent left running in its scope.
@@ -885,7 +878,7 @@ impl Manager {
         question_id: Option<&str>,
         input: AnswerInput,
     ) -> Result<String> {
-        let (qid, answer) = {
+        let qid = {
             let mut live = self.live();
             let entry = live
                 .get_mut(id)
@@ -926,17 +919,14 @@ impl Manager {
                 },
             );
             self.publish(&event, Some(&entry.record));
-            (pending.question_id, answer)
-        };
-        self.inner
-            .store
-            .answer_question(
+            self.inner.store.queue_answer(
                 id,
-                &qid,
-                &serde_json::to_value(&answer).unwrap_or_default(),
+                &pending.question_id,
+                serde_json::to_value(&answer).unwrap_or_default(),
                 now_ms(),
-            )
-            .await?;
+            );
+            pending.question_id
+        };
         Ok(qid)
     }
 
@@ -1069,6 +1059,7 @@ impl Manager {
     }
 
     pub async fn pending_questions(&self) -> Result<Vec<QuestionRow>> {
+        self.inner.store.flush().await;
         Ok(self.inner.store.open_questions(None).await?)
     }
 

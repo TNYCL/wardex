@@ -180,7 +180,24 @@ transparently.
 | M5 | Codex driver (done) |
 | M6 | Stuck/reminder detection, webhooks (done, see `webhooks.md`) |
 | M7 | systemd scopes, resource usage (done) |
-| M8 | Restart/orphan/resume, 10+ session load test, acceptance |
+| M8 | Restart/orphan/resume, 10+ session load test, acceptance (done, see below) |
+
+### Phase 1 acceptance results (2026-10-18)
+
+Run against Claude Code 2.1.302 (haiku) and Codex 0.163.0 (gpt-6-luna) with a
+temporary daemon, systemd scopes on and a local webhook receiver:
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Claude and Codex sessions start from the CLI; `tail -f` streams live | pass |
+| 2 | A question is a `question` event; `answer` continues the session | pass (Claude and Codex) |
+| 3 | `done`, `error`, `stuck`, `reminder` reach the webhook | pass (31 deliveries, all signatures valid) |
+| 4 | After a daemon restart, `list` and history are intact; orphans resume | pass (both drivers resumed with their context; auto-resume continued a mid-turn session; `--drain` waited for a running turn) |
+| 5 | 10+ concurrent sessions | pass (21 live sessions, 12-session load batch all correct) |
+| 6 | Mock-process integration tests; CI with test, clippy, fmt | pass |
+
+Also verified: read-only mode (no files written by either driver) and
+interrupts (`done` interrupted on both drivers).
 
 ## 2. Phase 2 — MCP + tunnel
 
