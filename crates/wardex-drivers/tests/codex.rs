@@ -86,18 +86,35 @@ fn handshake_tool_call_and_done() {
     );
     match &events[0] {
         EventKind::Started {
-            driver_session_id, ..
-        } => assert_eq!(
-            driver_session_id.as_deref(),
-            Some("01a15013-9936-7f63-9424-379ccce357ea")
-        ),
+            driver_session_id,
+            model,
+            reasoning,
+        } => {
+            assert_eq!(
+                driver_session_id.as_deref(),
+                Some("01a15013-9936-7f63-9424-379ccce357ea")
+            );
+            // The resolved model and effort from `thread/start`.
+            assert!(model.is_some());
+            assert!(reasoning.is_some());
+        }
         e => panic!("{e:?}"),
     }
     let statuses: Vec<ToolStatus> = events
         .iter()
         .filter_map(|e| match e {
-            EventKind::ToolCall { status, name, .. } => {
+            EventKind::ToolCall {
+                status,
+                name,
+                input,
+                output,
+                ..
+            } => {
                 assert_eq!(name, "shell");
+                match status {
+                    ToolStatus::Started => assert!(input.is_some() && output.is_none()),
+                    _ => assert!(input.is_none() && output.is_some()),
+                }
                 Some(*status)
             }
             _ => None,

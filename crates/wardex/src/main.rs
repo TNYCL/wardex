@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -12,6 +13,7 @@ use wardex_core::store::QuestionRow;
 use wardex_core::{Config, DriverKind, Event, RunSpec, SessionRecord};
 use wardex_server::Client;
 use wardex_server::api::{Request, Response};
+use wardex_server::daemon::{Exit, Source};
 
 mod cli;
 mod output;
@@ -51,14 +53,79 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Daemon(args) => match args.action {
             None => {
                 init_logging();
-                wardex_server::daemon::run(config).await?;
-                Ok(ExitCode::SUCCESS)
+                let source = Source {
+                    config_path: cli.config.clone(),
+                    socket: cli
+                        .socket
+                        .as_ref()
+                        .map(|s| s.to_string_lossy().into_owned()),
+                };
+                match wardex_server::daemon::run(source).await? {
+                    Exit::Stopped => Ok(ExitCode::SUCCESS),
+                    Exit::Restart => Err(reexec()),
+                }
             }
             Some(DaemonAction::Stop { drain }) => {
+                let before = daemon_info(&client).await?;
                 let resp = client
-                    .request(&Request::Shutdown { drain_secs: drain })
+                    .request(&Request::Shutdown {
+                        drain_secs: drain,
+                        restart: false,
+                    })
                     .await?;
-                finish(json, resp, |_| "daemon is shutting down\n".into())
+                if !resp.ok {
+                    return finish(json, resp, |_| String::new());
+                }
+                let timeout = stop_timeout(&config, drain);
+                wait_until(timeout, || async { !daemon_alive(&client, &before).await })
+                    .await
+                    .with_context(|| {
+                        format!("the daemon did not exit within {}s", timeout.as_secs())
+                    })?;
+                finish(json, resp, |_| "daemon stopped\n".into())
+            }
+            Some(DaemonAction::Restart { drain }) => {
+                let before = daemon_info(&client).await?;
+                let resp = client
+                    .request(&Request::Shutdown {
+                        drain_secs: drain,
+                        restart: true,
+                    })
+                    .await?;
+                if !resp.ok {
+                    return finish(json, resp, |_| String::new());
+                }
+                let timeout = stop_timeout(&config, drain) + Duration::from_secs(30);
+                wait_until(timeout, || async {
+                    matches!(daemon_info(&client).await, Ok(now) if now.started_ms > before.started_ms)
+                })
+                .await
+                .with_context(|| {
+                    format!("the daemon did not come back within {}s", timeout.as_secs())
+                })?;
+                finish(json, resp, |_| "daemon restarted\n".into())
+            }
+            Some(DaemonAction::Reload) => {
+                let resp = client.request(&Request::Reload).await?;
+                finish(json, resp, |v| {
+                    let mut out = format!(
+                        "reloaded: {} webhook(s), {} active\n",
+                        v["webhooks"], v["webhooks_active"]
+                    );
+                    let restart: Vec<&str> = v["restart_needed"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s.as_str())
+                        .collect();
+                    if !restart.is_empty() {
+                        out.push_str(&format!(
+                            "changed sections that need `wardex daemon restart`: {}\n",
+                            restart.join(", ")
+                        ));
+                    }
+                    out
+                })
             }
         },
         Command::Run(args) => {
@@ -132,6 +199,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             since_seq,
             lines,
             deltas,
+            full,
             wait,
         } => {
             let req = Request::Tail {
@@ -141,6 +209,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 follow,
                 deltas,
                 wait_secs: wait,
+                full,
             };
             if follow {
                 let mut in_delta = false;
@@ -243,6 +312,31 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 output::pending(&rows)
             })
         }
+        Command::ToolOutput { id, seq } => {
+            let resp = client.request(&Request::ToolOutput { id, seq }).await?;
+            finish(json, resp, |v| {
+                let mut out = format!(
+                    "{} {} (events {}..{})\n",
+                    v["name"].as_str().unwrap_or("-"),
+                    v["status"].as_str().unwrap_or("running"),
+                    v["started_seq"],
+                    v["finished_seq"]
+                );
+                for key in ["input", "output"] {
+                    out.push_str(&format!("--- {key}\n"));
+                    match v[key].as_str() {
+                        Some(text) => {
+                            out.push_str(text);
+                            if !text.ends_with('\n') {
+                                out.push('\n');
+                            }
+                        }
+                        None => out.push_str("(not recorded)\n"),
+                    }
+                }
+                out
+            })
+        }
         Command::Mcp { stdio } => {
             if !stdio {
                 bail!(
@@ -267,6 +361,82 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
     }
+}
+
+/// What `ping` tells about the running daemon.
+struct DaemonInfo {
+    pid: Option<u32>,
+    started_ms: i64,
+}
+
+async fn daemon_info(client: &Client) -> Result<DaemonInfo> {
+    let resp = client.request(&Request::Ping).await?;
+    let data = resp.data.unwrap_or_default();
+    Ok(DaemonInfo {
+        pid: data["pid"].as_u64().map(|p| p as u32),
+        started_ms: data["started_ms"].as_i64().unwrap_or(0),
+    })
+}
+
+/// Whether the daemon `before` describes still runs: its process exists, or
+/// (for a daemon that does not report its pid) its socket still answers.
+async fn daemon_alive(client: &Client, before: &DaemonInfo) -> bool {
+    match before.pid {
+        Some(pid) => process_running(pid),
+        None => client.request(&Request::Ping).await.is_ok(),
+    }
+}
+
+/// Whether `pid` exists and is not a zombie (an exited child its parent has
+/// not reaped yet).
+fn process_running(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // `pid (comm) state ...`; comm may contain spaces and parentheses.
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|state| state != 'Z' && state != 'X'),
+        Err(_) => false,
+    }
+}
+
+fn stop_timeout(config: &Config, drain: Option<u64>) -> Duration {
+    Duration::from_secs(drain.unwrap_or(0) + config.sessions.stop_grace_secs + 30)
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, mut done: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while !done().await {
+        if start.elapsed() > timeout {
+            bail!("timed out");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// Replace this process with a fresh `wardex` run with the same arguments.
+/// Only returns on failure.
+fn reexec() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return anyhow!("cannot find the wardex binary to restart: {e}"),
+    };
+    // Linux reports a replaced binary as "<path> (deleted)"; run the new one.
+    let exe = exe
+        .to_str()
+        .and_then(|s| s.strip_suffix(" (deleted)"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(exe);
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow!("cannot restart {}: {err}", exe.display())
 }
 
 /// Print a response: JSON as-is with `--json`, otherwise via `human`.

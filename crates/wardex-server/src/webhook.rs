@@ -17,12 +17,21 @@ const QUEUE: usize = 4096;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// A webhook with its env values resolved.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Target {
-    /// Position in the config, used in logs instead of the URL.
+    /// Position in the config.
     pub index: usize,
+    /// Label for logs (`name` from the config, else `webhooks[<index>]`);
+    /// the URL is never logged.
+    pub name: String,
     pub url: String,
     pub events: Vec<String>,
+    /// Agent globs; empty matches every session.
+    pub agents: Vec<String>,
+    /// Task globs; empty matches every session.
+    pub tasks: Vec<String>,
+    /// Event types sent for every session regardless of `agents`/`tasks`.
+    pub escalate: Vec<String>,
     pub secret: Option<String>,
     pub headers: Vec<(String, String)>,
     pub timeout: Duration,
@@ -37,26 +46,34 @@ impl Target {
         hook: &WebhookConfig,
         get: impl Fn(&str) -> Option<String>,
     ) -> Option<Self> {
+        let name = hook
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("webhooks[{index}]"));
         let Some(url) = get(&hook.url_env).filter(|u| !u.is_empty()) else {
-            tracing::warn!(webhook = index, env = %hook.url_env, "webhook disabled: URL env var not set");
+            tracing::warn!(webhook = %name, env = %hook.url_env, "webhook disabled: URL env var not set");
             return None;
         };
         let secret = hook.hmac_secret_env.as_deref().and_then(&get);
         let headers = hook
             .headers
             .iter()
-            .filter_map(|(name, env)| match get(env) {
-                Some(v) => Some((name.clone(), v)),
+            .filter_map(|(header, env)| match get(env) {
+                Some(v) => Some((header.clone(), v)),
                 None => {
-                    tracing::warn!(webhook = index, header = %name, env = %env, "webhook header env var not set");
+                    tracing::warn!(webhook = %name, header = %header, env = %env, "webhook header env var not set");
                     None
                 }
             })
             .collect();
         Some(Self {
             index,
+            name,
             url,
             events: hook.events.clone(),
+            agents: hook.agents.clone(),
+            tasks: hook.tasks.clone(),
+            escalate: hook.escalate.clone(),
             secret,
             headers,
             timeout: Duration::from_secs(hook.timeout_secs.max(1)),
@@ -65,75 +82,188 @@ impl Target {
         })
     }
 
-    fn wants(&self, event: &Event) -> bool {
-        !event.kind.is_delta() && self.events.iter().any(|e| e == event.kind.name())
+    /// A plain target: the given events of every session.
+    pub fn new(url: impl Into<String>, events: &[&str]) -> Self {
+        Self {
+            index: 0,
+            name: "webhooks[0]".into(),
+            url: url.into(),
+            events: events.iter().map(|e| e.to_string()).collect(),
+            agents: Vec::new(),
+            tasks: Vec::new(),
+            escalate: Vec::new(),
+            secret: None,
+            headers: Vec::new(),
+            timeout: Duration::from_secs(10),
+            max_attempts: 5,
+            backoff: Duration::from_secs(1),
+        }
+    }
+
+    /// Whether this target gets `event`: an escalated type always; otherwise
+    /// a listed type from a session matching the `agents` and `tasks` filters.
+    /// A filter never matches a session without that label.
+    pub fn wants(&self, event: &Event) -> bool {
+        if event.kind.is_delta() {
+            return false;
+        }
+        let kind = event.kind.name();
+        if self.escalate.iter().any(|e| e == kind) {
+            return true;
+        }
+        self.events.iter().any(|e| e == kind)
+            && matches_any(&self.agents, event.agent.as_deref())
+            && matches_any(&self.tasks, event.task.as_deref())
     }
 }
 
-/// Start one delivery worker per configured webhook.
-pub fn spawn(config: &Config, manager: &Manager) {
-    let targets: Vec<Target> = config
+fn matches_any(patterns: &[String], value: Option<&str>) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    value.is_some_and(|v| patterns.iter().any(|p| glob(p, v)))
+}
+
+/// `*` matches any run of characters, `?` one character; the rest literally.
+pub fn glob(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// Every configured webhook whose URL env var is set.
+pub fn resolve_all(config: &Config, get: impl Fn(&str) -> Option<String>) -> Vec<Target> {
+    config
         .webhooks
         .iter()
         .enumerate()
-        .filter_map(|(i, h)| Target::resolve(i, h, |k| std::env::var(k).ok()))
-        .collect();
-    for target in targets {
-        spawn_target(target, manager.clone());
+        .filter_map(|(i, h)| Target::resolve(i, h, &get))
+        .collect()
+}
+
+/// Handle to the running dispatcher.
+#[derive(Clone)]
+pub struct Webhooks {
+    reload: mpsc::UnboundedSender<Vec<Target>>,
+}
+
+impl Webhooks {
+    /// Switch to a new set of targets between two events: unchanged targets
+    /// keep their queue, removed ones finish what they have queued.
+    pub fn replace(&self, targets: Vec<Target>) {
+        let _ = self.reload.send(targets);
     }
 }
 
-pub fn spawn_target(target: Target, manager: Manager) {
-    let (tx, mut rx) = mpsc::channel::<Value>(QUEUE);
+struct Worker {
+    target: Target,
+    queue: mpsc::Sender<Value>,
+}
+
+impl Worker {
+    fn start(target: Target) -> Self {
+        let (queue, mut rx) = mpsc::channel::<Value>(QUEUE);
+        let t = target.clone();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder().timeout(t.timeout).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(webhook = %t.name, error = %e, "cannot build http client");
+                    return;
+                }
+            };
+            // Ends once the dispatcher drops the worker and the queue is empty.
+            while let Some(payload) = rx.recv().await {
+                deliver(&client, &t, &payload).await;
+            }
+        });
+        Self { target, queue }
+    }
+}
+
+/// Start the dispatcher: one subscriber that routes each event to the
+/// targets that want it, in order, with one delivery queue per target.
+pub fn spawn(targets: Vec<Target>, manager: Manager) -> Webhooks {
+    let (reload, mut reload_rx) = mpsc::unbounded_channel::<Vec<Target>>();
     let mut events = manager.subscribe();
-    let filter = target.clone();
     tokio::spawn(async move {
+        let mut workers: Vec<Worker> = targets.into_iter().map(Worker::start).collect();
         loop {
-            match events.recv().await {
-                Ok(event) => {
-                    if !filter.wants(&event) {
-                        continue;
-                    }
-                    let session = manager.status(&event.session_id).await.ok().map(|s| {
-                        json!({
-                            "id": s.session.id,
-                            "state": s.session.state,
-                            "driver": s.session.driver,
-                            "agent": s.session.agent,
-                            "task": s.session.task,
-                            "cwd": s.session.cwd,
-                            "driver_session_id": s.session.driver_session_id,
-                            "pending_questions": s.pending.len(),
-                        })
-                    });
-                    let payload = json!({"event": event, "session": session});
-                    if tx.try_send(payload).is_err() {
-                        tracing::warn!(webhook = filter.index, "webhook queue full; event dropped");
-                    }
+            tokio::select! {
+                biased;
+                Some(targets) = reload_rx.recv() => {
+                    workers = reconcile(workers, targets);
+                    tracing::info!(webhooks = workers.len(), "webhooks reloaded");
                 }
-                Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        webhook = filter.index,
-                        skipped = n,
-                        "webhook subscriber lagged"
-                    );
-                }
-                Err(RecvError::Closed) => return,
+                received = events.recv() => match received {
+                    Ok(event) => dispatch(&manager, &workers, event).await,
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "webhook dispatcher lagged");
+                    }
+                    Err(RecvError::Closed) => return,
+                },
             }
         }
     });
-    tokio::spawn(async move {
-        let client = match reqwest::Client::builder().timeout(target.timeout).build() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(webhook = target.index, error = %e, "cannot build http client");
-                return;
-            }
-        };
-        while let Some(payload) = rx.recv().await {
-            deliver(&client, &target, &payload).await;
-        }
+    Webhooks { reload }
+}
+
+/// One target, every matching event (tests and simple setups).
+pub fn spawn_target(target: Target, manager: Manager) -> Webhooks {
+    spawn(vec![target], manager)
+}
+
+fn reconcile(mut old: Vec<Worker>, targets: Vec<Target>) -> Vec<Worker> {
+    targets
+        .into_iter()
+        .map(|t| match old.iter().position(|w| w.target == t) {
+            Some(i) => old.swap_remove(i),
+            None => Worker::start(t),
+        })
+        .collect()
+}
+
+async fn dispatch(manager: &Manager, workers: &[Worker], mut event: Event) {
+    let wanted: Vec<&Worker> = workers.iter().filter(|w| w.target.wants(&event)).collect();
+    if wanted.is_empty() {
+        return;
+    }
+    event.kind.strip_tool_text();
+    let session = manager.status(&event.session_id).await.ok().map(|s| {
+        json!({
+            "id": s.session.id,
+            "state": s.session.state,
+            "driver": s.session.driver,
+            "agent": s.session.agent,
+            "task": s.session.task,
+            "cwd": s.session.cwd,
+            "driver_session_id": s.session.driver_session_id,
+            "pending_questions": s.pending.len(),
+        })
     });
+    let payload = json!({"event": event, "session": session});
+    for w in wanted {
+        if w.queue.try_send(payload.clone()).is_err() {
+            tracing::warn!(webhook = %w.target.name, "webhook queue full; event dropped");
+        }
+    }
 }
 
 /// `sha256=<hex>` HMAC of the body.
@@ -171,13 +301,13 @@ async fn deliver(client: &reqwest::Client, target: &Target, payload: &Value) -> 
         }
         let retry = match req.body(body.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(webhook = target.index, event = %event_type, attempt, "webhook delivered");
+                tracing::debug!(webhook = %target.name, event = %event_type, attempt, "webhook delivered");
                 return true;
             }
             Ok(resp) => {
                 let status = resp.status();
                 let retryable = status.is_server_error() || status == 408 || status == 429;
-                tracing::warn!(webhook = target.index, event = %event_type, attempt, status = status.as_u16(), "webhook rejected");
+                tracing::warn!(webhook = %target.name, event = %event_type, attempt, status = status.as_u16(), "webhook rejected");
                 retryable
             }
             Err(e) => {
@@ -189,7 +319,7 @@ async fn deliver(client: &reqwest::Client, target: &Target, payload: &Value) -> 
                 } else {
                     "request"
                 };
-                tracing::warn!(webhook = target.index, event = %event_type, attempt, error = kind, "webhook failed");
+                tracing::warn!(webhook = %target.name, event = %event_type, attempt, error = kind, "webhook failed");
                 true
             }
         };
@@ -199,7 +329,7 @@ async fn deliver(client: &reqwest::Client, target: &Target, payload: &Value) -> 
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(MAX_BACKOFF);
     }
-    tracing::error!(webhook = target.index, event = %event_type, "webhook gave up");
+    tracing::error!(webhook = %target.name, event = %event_type, "webhook gave up");
     false
 }
 
@@ -216,6 +346,80 @@ mod tests {
             signature("Jefe", b"what do ya want for nothing?"),
             "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    fn event(kind: &str, agent: Option<&str>, task: Option<&str>) -> Event {
+        let kind = match kind {
+            "done" => wardex_core::EventKind::Done {
+                result: None,
+                interrupted: false,
+                note: None,
+                git: None,
+            },
+            "error" => wardex_core::EventKind::Error {
+                message: "boom".into(),
+            },
+            _ => wardex_core::EventKind::Prompt { text: "hi".into() },
+        };
+        Event {
+            session_id: wardex_core::SessionId("s1".into()),
+            seq: 1,
+            ts_ms: 0,
+            agent: agent.map(String::from),
+            task: task.map(String::from),
+            driver: wardex_core::DriverKind::Claude,
+            kind,
+        }
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob("bot-a", "bot-a"));
+        assert!(!glob("bot-a", "bot-a2"));
+        assert!(glob("fix-*", "fix-login"));
+        assert!(glob("fix-*", "fix-"));
+        assert!(!glob("fix-*", "feat-login"));
+        assert!(glob("*-login", "fix-login"));
+        assert!(glob("b?t", "bot"));
+        assert!(!glob("b?t", "boot"));
+        assert!(glob("*", ""));
+        assert!(glob("a*b*c", "aXXbYYc"));
+        assert!(!glob("a*b*c", "aXXbYY"));
+    }
+
+    #[test]
+    fn filters_and_escalation() {
+        let all = Target::new("u", &["done"]);
+        assert!(all.wants(&event("done", Some("bot-a"), None)));
+        assert!(all.wants(&event("done", None, None)));
+        assert!(!all.wants(&event("error", Some("bot-a"), None)));
+
+        let bot_a = Target {
+            agents: vec!["bot-a".into()],
+            ..Target::new("u", &["done", "error"])
+        };
+        assert!(bot_a.wants(&event("done", Some("bot-a"), None)));
+        assert!(!bot_a.wants(&event("done", Some("bot-b"), None)));
+        // A filter never matches a session without that label.
+        assert!(!bot_a.wants(&event("done", None, None)));
+
+        let fixes = Target {
+            tasks: vec!["fix-*".into()],
+            ..Target::new("u", &["done"])
+        };
+        assert!(fixes.wants(&event("done", Some("x"), Some("fix-login"))));
+        assert!(!fixes.wants(&event("done", Some("x"), Some("feat"))));
+        assert!(!fixes.wants(&event("done", Some("x"), None)));
+
+        let oncall = Target {
+            agents: vec!["oncall".into()],
+            escalate: vec!["error".into()],
+            ..Target::new("u", &["done"])
+        };
+        assert!(oncall.wants(&event("done", Some("oncall"), None)));
+        assert!(!oncall.wants(&event("done", Some("bot-a"), None)));
+        assert!(oncall.wants(&event("error", Some("bot-a"), None)));
+        assert!(oncall.wants(&event("error", None, None)));
     }
 
     #[test]

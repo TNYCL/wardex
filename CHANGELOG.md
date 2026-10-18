@@ -8,6 +8,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Webhook routing: `agents` and `tasks` glob filters per `[[webhooks]]`
+  table, `escalate` event types that go to a target for every session (e.g.
+  errors and stuck sessions to an on-call bot), and `name` for logs. Unknown
+  event types in `events`/`escalate` are rejected.
+- `wardex daemon reload`, SIGHUP and `ExecReload` in the systemd unit: re-read
+  the config and the env file (`daemon.env_file`, now read by the daemon
+  itself) and switch webhooks over without a restart; other changed sections
+  are reported as `restart_needed`.
+- `wardex daemon restart [--drain S]`: stop and start again in the same
+  process (same PID, currently installed binary) and wait until it answers.
+- Full tool input/output on `tool_call` events (up to 256 KiB each), shown by
+  `tail --full`, `wardex tool-output <id> <seq>` and the MCP tool
+  `tool_output`; left out of plain `tail` and webhooks.
+- `summary`: `last_turn_ended_ms` and `last_turn_ms`. `overview`:
+  `idle_since_ms` and `shutdown_in_ms` per session. `ping` reports the
+  daemon's pid and start time.
+- The effort Codex reports on `thread/start` is recorded as the session's
+  `reasoning` when none was given.
 - `wardex mcp --stdio`: the MCP tools on stdin/stdout, forwarding to the
   daemon's Unix socket, so remote clients can connect with
   `ssh <host> wardex mcp --stdio` without HTTP, tunnel or token.
@@ -63,6 +81,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `wardex daemon stop` returned before the daemon had exited, so an
+  immediate `systemctl --user start wardex` could fail on the still-bound
+  socket. It now waits for the process to exit.
+- `summary.duration_ms` counted up to the time of the `summary` call for idle
+  sessions; it now ends with the last turn.
 - Without `XDG_RUNTIME_DIR` (e.g. a non-interactive SSH command), the default
   socket path falls back to `/run/user/<uid>` instead of the temp dir, so the
   CLI finds a daemon running under systemd.

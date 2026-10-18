@@ -389,6 +389,48 @@ impl Store {
         .transpose()
     }
 
+    /// The last event of `kind` with `seq < before_seq`.
+    pub async fn last_event_before(
+        &self,
+        id: &SessionId,
+        kind: &str,
+        before_seq: u64,
+    ) -> Result<Option<Event>> {
+        let row = sqlx::query(
+            "SELECT body FROM events WHERE session_id = ? AND kind = ? AND seq < ?
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(id.as_str())
+        .bind(kind)
+        .bind(before_seq as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| decode_body(&r)).transpose()
+    }
+
+    /// One event by sequence number.
+    pub async fn event_at(&self, id: &SessionId, seq: u64) -> Result<Option<Event>> {
+        let row = sqlx::query("SELECT body FROM events WHERE session_id = ? AND seq = ?")
+            .bind(id.as_str())
+            .bind(seq as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| decode_body(&r)).transpose()
+    }
+
+    /// All `tool_call` events of one tool call, oldest first.
+    pub async fn tool_call_events(&self, id: &SessionId, call_id: &str) -> Result<Vec<Event>> {
+        let rows = sqlx::query(
+            "SELECT body FROM events WHERE session_id = ? AND kind = 'tool_call'
+             AND json_extract(body, '$.payload.call_id') = ? ORDER BY seq",
+        )
+        .bind(id.as_str())
+        .bind(call_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_body).collect()
+    }
+
     pub async fn insert_question(&self, q: &QuestionRow) -> Result<()> {
         insert_question_query(q).execute(&self.pool).await?;
         Ok(())
@@ -636,6 +678,11 @@ fn update_session_query(
 
 fn opt_path(v: Option<String>) -> Option<PathBuf> {
     v.map(PathBuf::from)
+}
+
+fn decode_body(row: &sqlx::sqlite::SqliteRow) -> Result<Event> {
+    let body: String = row.get("body");
+    serde_json::from_str(&body).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
 fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {

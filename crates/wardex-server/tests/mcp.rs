@@ -142,6 +142,7 @@ async fn bot_runs_answers_and_reads_result_over_mcp() {
             timeout: Duration::from_secs(5),
             max_attempts: 3,
             backoff: Duration::from_millis(20),
+            ..Target::new("", &[])
         },
         d.manager.clone(),
     );
@@ -186,7 +187,8 @@ async fn bot_runs_answers_and_reads_result_over_mcp() {
             "status",
             "stop",
             "summary",
-            "tail"
+            "tail",
+            "tool_output"
         ]
     );
 
@@ -403,7 +405,7 @@ async fn requires_token_and_limits_failures() {
 
     // The right token is never limited.
     let client = connect(&d.url).await;
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 12);
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 13);
     client.cancel().await.unwrap();
     d.cancel.cancel();
 }

@@ -27,8 +27,11 @@ session goes to `waiting_input` and the question shows up in `pending_questions`
 `overview` and as a `question` or `approval` event in `tail`. Reply with \
 `answer`. When a turn ends the session is `idle` and the result is in `summary` \
 or the `done` event; `send` gives it the next instruction and also resumes \
-ended sessions. `overview` shows every live session in one call. `tail` pages \
-events with `since_seq`; with `wait_secs` it waits for the next event. \
+ended sessions. Do not `stop` a session when its work is done: an idle session \
+closes itself after a while (see `shutdown_in_ms` in `overview`) and `send` \
+brings it back. `overview` shows every live session in one call. `tail` pages \
+events with `since_seq`; with `wait_secs` it waits for the next event; \
+`tool_output` has a tool call's full output. \
 Webhooks (if configured) announce questions, results, errors and stuck sessions, \
 so poll only when you have no webhook.";
 
@@ -115,6 +118,18 @@ pub struct TailParams {
     /// seconds (max 60) for one.
     #[serde(default)]
     pub wait_secs: Option<u64>,
+    /// Include each tool call's full input and output (can be large; see
+    /// also `tool_output`).
+    #[serde(default)]
+    pub full: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ToolOutputParams {
+    /// Session id or unique prefix.
+    pub id: String,
+    /// `seq` of the tool's `tool_call` event (its start or its end).
+    pub seq: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -296,6 +311,20 @@ impl WardexMcp {
             follow: false,
             deltas: false,
             wait_secs: p.wait_secs,
+            full: p.full,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Full input and output of one tool call (tool_call events carry only \
+                       300-character summaries). Output is stored up to 256 KiB.",
+        annotations(read_only_hint = true)
+    )]
+    async fn tool_output(&self, Parameters(p): Parameters<ToolOutputParams>) -> CallToolResult {
+        self.call(Request::ToolOutput {
+            id: p.id,
+            seq: p.seq,
         })
         .await
     }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::NOTABLE_EVENTS;
+use crate::event::{EVENT_NAMES, NOTABLE_EVENTS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -48,6 +48,9 @@ pub struct DaemonConfig {
     pub database: String,
     /// Interval of the supervision loop (stuck detection, resources).
     pub tick_ms: u64,
+    /// `KEY=VALUE` file with secrets (token, webhook URLs). The daemon reads
+    /// it at start and on `reload`; its values win over the process env.
+    pub env_file: String,
 }
 
 impl Default for DaemonConfig {
@@ -57,6 +60,7 @@ impl Default for DaemonConfig {
             http_listen: "127.0.0.1:7878".into(),
             database: "$XDG_STATE_HOME/wardex/wardex.db".into(),
             tick_ms: 2000,
+            env_file: "$XDG_CONFIG_HOME/wardex/env".into(),
         }
     }
 }
@@ -243,10 +247,20 @@ impl Default for ResourcesConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
+    /// Name used in logs (instead of the URL). Default: `webhooks[<index>]`.
+    pub name: Option<String>,
     /// Env var holding the target URL.
     pub url_env: String,
     /// Event types to send.
     pub events: Vec<String>,
+    /// Only sessions whose `agent` matches one of these globs (`*`, `?`).
+    /// Empty: every session, including those without an agent.
+    pub agents: Vec<String>,
+    /// Only sessions whose `task` matches one of these globs. Empty: any.
+    pub tasks: Vec<String>,
+    /// Event types sent for every session, regardless of `agents`/`tasks`
+    /// (e.g. `["error", "stuck"]` for an on-call bot).
+    pub escalate: Vec<String>,
     /// Env var holding an HMAC-SHA256 secret; sent as `X-Wardex-Signature`.
     pub hmac_secret_env: Option<String>,
     /// Extra headers: header name -> env var holding the value.
@@ -258,8 +272,12 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
+            name: None,
             url_env: String::new(),
             events: NOTABLE_EVENTS.iter().map(|s| s.to_string()).collect(),
+            agents: Vec::new(),
+            tasks: Vec::new(),
+            escalate: Vec::new(),
             hmac_secret_env: None,
             headers: BTreeMap::new(),
             timeout_secs: 10,
@@ -268,10 +286,110 @@ impl Default for WebhookConfig {
     }
 }
 
+/// Environment for the daemon: the env file's values, then the process env.
+/// The file wins because `reload` re-reads it, while the process env is
+/// fixed when the daemon starts.
+#[derive(Debug, Clone, Default)]
+pub struct Env {
+    file: BTreeMap<String, String>,
+}
+
+impl Env {
+    /// Only the process env.
+    pub fn process() -> Self {
+        Self::default()
+    }
+
+    /// The process env overlaid with these values.
+    pub fn with(file: BTreeMap<String, String>) -> Self {
+        Self { file }
+    }
+
+    /// Read `path` (missing is fine). Warns when others can read it.
+    pub fn read(path: &Path) -> Result<Self, ConfigError> {
+        use std::os::unix::fs::PermissionsExt;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!(path = %path.display(), "env file is readable by others; chmod 600 it");
+        }
+        Ok(Self {
+            file: parse_env_file(&text),
+        })
+    }
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.file
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+    }
+
+    /// Number of variables from the file.
+    pub fn file_len(&self) -> usize {
+        self.file.len()
+    }
+}
+
+/// `KEY=VALUE` lines as systemd's `EnvironmentFile` reads them: blank lines
+/// and `#`/`;` comments skipped, optional `export `, values optionally in
+/// single or double quotes.
+pub fn parse_env_file(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+            .unwrap_or(value);
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
 impl Config {
     /// Load the config: the given file (must exist), else the default file
     /// (`$XDG_CONFIG_HOME/wardex/wardex.toml`, optional), then env overrides.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut config = Self::read_file(path)?;
+        config.apply_env(|k| std::env::var(k).ok());
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Like `load`, but also reads `daemon.env_file`; env overrides and
+    /// secrets come from it first, then from the process env.
+    pub fn load_with_env(path: Option<&Path>) -> Result<(Self, Env), ConfigError> {
+        let mut config = Self::read_file(path)?;
+        let env = Env::read(&config.env_file_path())?;
+        config.apply_env(|k| env.get(k));
+        config.validate()?;
+        Ok((config, env))
+    }
+
+    fn read_file(path: Option<&Path>) -> Result<Self, ConfigError> {
         let path = match path {
             Some(p) => Some(p.to_path_buf()),
             None => {
@@ -279,7 +397,7 @@ impl Config {
                 default.exists().then_some(default)
             }
         };
-        let mut config = match path {
+        let config = match path {
             Some(path) => {
                 let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
                     path: path.clone(),
@@ -292,8 +410,6 @@ impl Config {
             }
             None => Self::default(),
         };
-        config.apply_env(|k| std::env::var(k).ok());
-        config.validate()?;
         Ok(config)
     }
 
@@ -342,6 +458,14 @@ impl Config {
                     "webhooks[{i}]: max_attempts must be at least 1"
                 )));
             }
+            for name in hook.events.iter().chain(&hook.escalate) {
+                if !EVENT_NAMES.contains(&name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "webhooks[{i}]: unknown event type {name:?} (known: {})",
+                        EVENT_NAMES.join(", ")
+                    )));
+                }
+            }
         }
         if self.daemon.tick_ms == 0 {
             return Err(ConfigError::Invalid("daemon.tick_ms must be > 0".into()));
@@ -355,6 +479,16 @@ impl Config {
 
     pub fn database_path(&self) -> PathBuf {
         PathBuf::from(expand_path(&self.daemon.database))
+    }
+
+    pub fn env_file_path(&self) -> PathBuf {
+        PathBuf::from(expand_path(&self.daemon.env_file))
+    }
+
+    /// The HTTP/MCP token from `env`, if set and non-empty.
+    pub fn token_from(&self, env: &Env) -> Option<String> {
+        env.get(&self.auth.token_env)
+            .filter(|t| !t.trim().is_empty())
     }
 
     /// The HTTP/MCP token, if the configured env var is set and non-empty.
@@ -486,6 +620,31 @@ mod tests {
         let mut config = Config::parse("[daemon]\nsocket = \"/a.sock\"\n").unwrap();
         config.apply_env(env(&[("WARDEX_SOCKET", "/b.sock")]));
         assert_eq!(config.daemon.socket, "/b.sock");
+    }
+
+    #[test]
+    fn env_file_parsing() {
+        let vars = parse_env_file(
+            "# comment\n\nA=1\nexport B = two words \nC=\"quoted=x\"\nD='single'\n;x\nnoequals\nE=\n",
+        );
+        assert_eq!(vars["A"], "1");
+        assert_eq!(vars["B"], "two words");
+        assert_eq!(vars["C"], "quoted=x");
+        assert_eq!(vars["D"], "single");
+        assert_eq!(vars["E"], "");
+        assert_eq!(vars.len(), 5);
+        let env = Env::with(vars);
+        assert_eq!(env.get("A").as_deref(), Some("1"));
+        assert_eq!(env.file_len(), 5);
+    }
+
+    #[test]
+    fn webhook_event_names_are_checked() {
+        let config = Config::parse(
+            "[[webhooks]]\nurl_env = \"U\"\nevents = [\"done\"]\nescalate = [\"stuk\"]\n",
+        )
+        .unwrap();
+        assert!(config.validate().unwrap_err().to_string().contains("stuk"));
     }
 
     #[test]

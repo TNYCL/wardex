@@ -134,6 +134,11 @@ the turn ends with `result` `subtype: "error_during_execution"`,
 interrupt it requested to `done` (interrupted), not `error`.** Closing stdin
 afterwards exits with code 1, which is not an error either.
 
+### Model and effort
+
+The `init` message reports the resolved model (`model`), but not the
+reasoning effort; the effort is only known when Wardex passes `--effort`.
+
 ### Resume
 
 Start a new process with `--resume <session_id>`; history is intact (verified
@@ -162,7 +167,9 @@ client methods; Wardex only uses the ones below.
 ← result {userAgent, codexHome, platformOs, ...}
 → initialized                                  (notification)
 → thread/start {cwd, approvalPolicy:"never", sandbox:"danger-full-access", model?}
-← result {thread:{id, ...}}                    thread id = resume id
+← result {thread:{id, ...}, model, reasoningEffort, ...}
+                                               thread id = resume id; model and
+                                               effort are the resolved values
 → turn/start {threadId, input:[{type:"text",text}], effort?, model?}
 ← result {turn:{id, status:"inProgress"}}
 ← notifications ... turn/completed {turn:{status, error, items}}

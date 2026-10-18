@@ -26,13 +26,16 @@ acceptable, and always protect the MCP endpoint with a token.
 
 ```text
 wardex daemon                      # run the daemon (see deploy/wardex.service)
-wardex daemon stop                 # shut it down; live sessions become resumable
+wardex daemon stop [--drain S]     # shut it down and wait; live sessions become resumable
+wardex daemon restart [--drain S]  # same PID, current binary; sessions resume
+wardex daemon reload               # re-read config + env file (webhooks), no restart
 wardex run --driver claude|codex --prompt "..." [--prompt-file F|-]
            [--model M] [--reasoning R] [--cwd DIR] [--readonly]
            [--worktree NAME [--branch B] [--rm-worktree]]
            [--agent A] [--task T] [--slice S]
 wardex list [-a] | status <id> | summary <id> | pending
-wardex tail <id> [-f] [-n N] [--since-seq N [--wait SECS]] [--deltas]
+wardex tail <id> [-f] [-n N] [--since-seq N [--wait SECS]] [--deltas] [--full]
+wardex tool-output <id> <seq>      # full input/output of one tool call
 wardex answer <id> <text> | answer <id> --item ID=TEXT ... [--question Q]
 wardex send <id> <message> | interrupt <id> | stop <id> | resume <id> [message]
 wardex overview [-n EVENTS]        # live sessions, questions, resources at a glance
@@ -46,7 +49,7 @@ Session ids can be shortened to any unique prefix. Every command accepts
 
 The same capabilities are MCP tools: `run`, `overview`, `list`, `status`,
 `tail`, `summary`, `pending_questions`, `answer`, `send`, `interrupt`, `stop`,
-`resume`. Two transports: `wardex mcp --stdio` (forwards to the daemon's
+`resume`, `tool_output`. Two transports: `wardex mcp --stdio` (forwards to the daemon's
 socket; remote clients use `ssh <host> wardex mcp --stdio`), and, with a token
 set (`WARDEX_TOKEN`), Streamable HTTP at `http://127.0.0.1:7878/mcp`. See
 [`docs/mcp.md`](docs/mcp.md) for the tools and the bot loop, and

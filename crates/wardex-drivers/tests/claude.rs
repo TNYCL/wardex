@@ -37,8 +37,11 @@ fn partial_messages_and_done() {
         EventKind::Started {
             driver_session_id,
             model,
+            reasoning,
         } => {
             assert!(driver_session_id.is_some());
+            // Claude does not report its effort.
+            assert!(reasoning.is_none());
             assert_eq!(model.as_deref(), Some("claude-haiku-5-5"));
         }
         e => panic!("{e:?}"),
@@ -80,6 +83,20 @@ fn tool_call_start_and_finish() {
         EventKind::ToolCall { input_summary, .. } => assert_eq!(input_summary, "ls"),
         _ => unreachable!(),
     }
+    // Full input on start, full output on finish.
+    let full: Vec<(Option<&str>, Option<&str>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventKind::ToolCall { input, output, .. } => {
+                Some((input.as_deref(), output.as_deref()))
+            }
+            _ => None,
+        })
+        .collect();
+    let input: serde_json::Value = serde_json::from_str(full[0].0.unwrap()).unwrap();
+    assert_eq!(input["command"], "ls");
+    assert!(full[0].1.is_none() && full[1].0.is_none());
+    assert!(!full[1].1.unwrap().is_empty());
     assert_eq!(names(&events).last(), Some(&"done"));
 }
 

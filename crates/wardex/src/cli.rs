@@ -50,6 +50,9 @@ pub enum Command {
         /// While following, also print streamed message text as it arrives.
         #[arg(long)]
         deltas: bool,
+        /// Include each tool call's full input and output.
+        #[arg(long)]
+        full: bool,
         /// With --since-seq: if there is nothing newer yet, wait up to SECS
         /// (max 60) for the next event.
         #[arg(
@@ -62,6 +65,8 @@ pub enum Command {
     },
     /// Summarize a session: result, changes, duration, counts.
     Summary { id: String },
+    /// Full input and output of a tool call, by the `seq` of its event.
+    ToolOutput { id: String, seq: u64 },
     /// Answer a pending question or approval.
     Answer {
         id: String,
@@ -113,13 +118,25 @@ pub struct DaemonArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonAction {
-    /// Ask the running daemon to shut down. Live sessions become orphaned
-    /// (resumable, automatically with `sessions.auto_resume_orphaned`).
+    /// Shut the running daemon down and wait until it has exited. Live
+    /// sessions become orphaned (resumable, automatically with
+    /// `sessions.auto_resume_orphaned`).
     Stop {
         /// First wait up to this many seconds for running turns to finish.
         #[arg(long, value_name = "SECS")]
         drain: Option<u64>,
     },
+    /// Stop the daemon and start it again in the same process (same PID, so
+    /// systemd keeps tracking it), running the currently installed binary.
+    /// Waits until the new daemon answers.
+    Restart {
+        /// First wait up to this many seconds for running turns to finish.
+        #[arg(long, value_name = "SECS")]
+        drain: Option<u64>,
+    },
+    /// Re-read the config and env files and apply webhook changes without a
+    /// restart (same as SIGHUP / `systemctl --user reload wardex`).
+    Reload,
 }
 
 #[derive(Debug, Args)]

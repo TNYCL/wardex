@@ -3,11 +3,13 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use wardex_core::manager::Manager;
 
 use crate::api::{self, Request, Response, StreamItem};
@@ -44,19 +46,50 @@ pub async fn bind(path: &Path) -> Result<UnixListener, SocketError> {
     Ok(listener)
 }
 
+/// How socket requests reach the daemon itself.
+#[derive(Clone)]
+pub struct Control {
+    /// Set to true to stop the daemon.
+    pub shutdown: watch::Sender<bool>,
+    /// Start again in the same process after stopping.
+    pub restart: Arc<AtomicBool>,
+    /// Reload requests; the daemon answers on the oneshot.
+    pub reload: mpsc::Sender<oneshot::Sender<Response>>,
+}
+
+impl Control {
+    /// A control whose reload requests go nowhere (tests).
+    pub fn new() -> (Self, mpsc::Receiver<oneshot::Sender<Response>>) {
+        let (shutdown, _) = watch::channel(false);
+        let (reload, rx) = mpsc::channel(8);
+        (
+            Self {
+                shutdown,
+                restart: Arc::new(AtomicBool::new(false)),
+                reload,
+            },
+            rx,
+        )
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart.load(Ordering::SeqCst)
+    }
+}
+
 /// Serve until `shutdown` turns true. A `shutdown` request sets it.
-pub async fn serve(listener: UnixListener, manager: Manager, shutdown_tx: watch::Sender<bool>) {
-    let mut shutdown = shutdown_tx.subscribe();
+pub async fn serve(listener: UnixListener, manager: Manager, control: Control) {
+    let mut shutdown = control.shutdown.subscribe();
     loop {
         tokio::select! {
             conn = listener.accept() => {
                 match conn {
                     Ok((stream, _)) => {
                         let m = manager.clone();
-                        let tx = shutdown_tx.clone();
-                        let stop = shutdown_tx.subscribe();
+                        let c = control.clone();
+                        let stop = control.shutdown.subscribe();
                         tokio::spawn(async move {
-                            if let Err(e) = connection(stream, m, tx, stop).await {
+                            if let Err(e) = connection(stream, m, c, stop).await {
                                 tracing::debug!(error = %e, "api connection ended");
                             }
                         });
@@ -76,7 +109,7 @@ pub async fn serve(listener: UnixListener, manager: Manager, shutdown_tx: watch:
 async fn connection(
     stream: UnixStream,
     manager: Manager,
-    shutdown_tx: watch::Sender<bool>,
+    control: Control,
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -101,6 +134,7 @@ async fn connection(
             last,
             follow: true,
             deltas,
+            full,
             ..
         } => {
             // Subscribe before reading history so nothing falls in between.
@@ -114,7 +148,10 @@ async fn connection(
                 Err(e) => return send(&mut write, &Response::from(e)).await,
             };
             let mut last_seq = 0;
-            for event in initial {
+            for mut event in initial {
+                if !full {
+                    event.kind.strip_tool_text();
+                }
                 last_seq = event.seq;
                 let end = api::ends_stream(&event) && !manager.live_ids().contains(&id);
                 send(&mut write, &StreamItem { event }).await?;
@@ -129,9 +166,12 @@ async fn connection(
             loop {
                 tokio::select! {
                     ev = rx.recv() => match ev {
-                        Ok(event) => {
+                        Ok(mut event) => {
                             if event.session_id != id {
                                 continue;
+                            }
+                            if !full {
+                                event.kind.strip_tool_text();
                             }
                             if event.kind.is_delta() {
                                 if deltas {
@@ -158,12 +198,35 @@ async fn connection(
                 }
             }
         }
-        Request::Shutdown { drain_secs } => {
+        Request::Reload => {
+            let (tx, rx) = oneshot::channel();
+            let resp = if control.reload.send(tx).await.is_err() {
+                Response::err("internal", "reload is not available")
+            } else {
+                rx.await
+                    .unwrap_or_else(|_| Response::err("internal", "reload was dropped"))
+            };
+            send(&mut write, &resp).await
+        }
+        Request::Shutdown {
+            drain_secs,
+            restart,
+        } => {
             send(
                 &mut write,
-                &api::handle(&manager, Request::Shutdown { drain_secs }).await,
+                &api::handle(
+                    &manager,
+                    Request::Shutdown {
+                        drain_secs,
+                        restart,
+                    },
+                )
+                .await,
             )
             .await?;
+            if restart {
+                control.restart.store(true, Ordering::SeqCst);
+            }
             if let Some(secs) = drain_secs {
                 tracing::info!(secs, "draining running turns before shutdown");
                 if !manager
@@ -173,7 +236,7 @@ async fn connection(
                     tracing::warn!("drain timed out; stopping anyway");
                 }
             }
-            let _ = shutdown_tx.send(true);
+            let _ = control.shutdown.send(true);
             Ok(())
         }
         req => send(&mut write, &api::handle(&manager, req).await).await,

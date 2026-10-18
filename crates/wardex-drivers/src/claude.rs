@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use wardex_core::config::ClaudeConfig;
-use wardex_core::driver::{Driver, DriverCommand, DriverError, DriverHandle, SpawnSpec, summarize};
+use wardex_core::driver::{
+    Driver, DriverCommand, DriverError, DriverHandle, SpawnSpec, cap_tool_text, summarize,
+};
 use wardex_core::process::{LaunchRequest, Launcher};
 use wardex_core::{Answer, DriverKind, EventKind, QuestionItem, QuestionOption, ToolStatus};
 
@@ -210,6 +212,7 @@ impl Protocol for ClaudeProtocol {
                     out.events.push(EventKind::Started {
                         driver_session_id: msg["session_id"].as_str().map(String::from),
                         model: msg["model"].as_str().map(String::from),
+                        reasoning: None,
                     });
                 }
                 "post_turn_summary" => {
@@ -257,6 +260,8 @@ impl Protocol for ClaudeProtocol {
                                 name,
                                 status: ToolStatus::Started,
                                 result_summary: None,
+                                input: Some(cap_tool_text(&block["input"].to_string())),
+                                output: None,
                             });
                         }
                         _ => {}
@@ -273,6 +278,7 @@ impl Protocol for ClaudeProtocol {
                         continue;
                     };
                     let failed = block["is_error"].as_bool().unwrap_or(false);
+                    let text = content_text(&block["content"]);
                     out.events.push(EventKind::ToolCall {
                         call_id: id.to_string(),
                         name,
@@ -282,10 +288,9 @@ impl Protocol for ClaudeProtocol {
                         } else {
                             ToolStatus::Completed
                         },
-                        result_summary: Some(summarize(
-                            &content_text(&block["content"]),
-                            RESULT_SUMMARY,
-                        )),
+                        result_summary: Some(summarize(&text, RESULT_SUMMARY)),
+                        input: None,
+                        output: Some(cap_tool_text(&text)),
                     });
                 }
             }

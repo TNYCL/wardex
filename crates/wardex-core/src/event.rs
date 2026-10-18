@@ -54,6 +54,10 @@ pub enum EventKind {
         /// The driver's own session/thread id, used for resume.
         driver_session_id: Option<String>,
         model: Option<String>,
+        /// Reasoning effort the CLI reports it uses (Codex; Claude does not
+        /// report it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     /// A message sent to the agent (initial prompt or follow-up).
     Prompt {
@@ -72,6 +76,14 @@ pub enum EventKind {
         input_summary: String,
         status: ToolStatus,
         result_summary: Option<String>,
+        /// Full input (on `started`), up to `TOOL_TEXT_LIMIT` bytes. Stored,
+        /// but left out of `tail` unless asked for and out of webhooks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+        /// Full output (on `completed`/`failed`), up to `TOOL_TEXT_LIMIT`
+        /// bytes. Same visibility as `input`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// One pending request from the agent; it may hold several questions.
     Question {
@@ -173,6 +185,22 @@ pub enum StuckReason {
     NoOutput,
 }
 
+/// Every event type name.
+pub const EVENT_NAMES: &[&str] = &[
+    "started",
+    "prompt",
+    "message",
+    "tool_call",
+    "question",
+    "approval",
+    "answered",
+    "reminder",
+    "done",
+    "error",
+    "stuck",
+    "ended",
+];
+
 /// Event type names that are pushed to webhooks by default.
 pub const NOTABLE_EVENTS: &[&str] = &["question", "approval", "reminder", "done", "error", "stuck"];
 
@@ -205,12 +233,21 @@ impl EventKind {
         matches!(self, Self::Message { delta: true, .. })
     }
 
+    /// Drop the full tool input/output, keeping the summaries.
+    pub fn strip_tool_text(&mut self) {
+        if let Self::ToolCall { input, output, .. } = self {
+            *input = None;
+            *output = None;
+        }
+    }
+
     /// One-line human-readable description, used by `tail`.
     pub fn describe(&self) -> String {
         match self {
             Self::Started {
                 driver_session_id,
                 model,
+                ..
             } => format!(
                 "started (model {}, id {})",
                 model.as_deref().unwrap_or("default"),
@@ -358,6 +395,8 @@ mod tests {
             input_summary: "ls".into(),
             status: ToolStatus::Started,
             result_summary: None,
+            input: Some("{\"command\":\"ls\"}".into()),
+            output: None,
         });
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], ev.kind.name());

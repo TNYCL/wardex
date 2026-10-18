@@ -157,7 +157,11 @@ pub fn summary(s: &SessionSummary) -> String {
     );
     let _ = writeln!(out, "agent     {} / task {}", opt(&s.agent), opt(&s.task));
     let _ = writeln!(out, "cwd       {}", short_path(&s.cwd));
-    let _ = writeln!(out, "duration  {}", human_duration(s.duration_ms));
+    let mut duration = human_duration(s.duration_ms);
+    if let Some(t) = s.last_turn_ms {
+        duration.push_str(&format!(" (last turn {})", human_duration(t)));
+    }
+    let _ = writeln!(out, "duration  {duration}");
     let _ = writeln!(out, "turns     {} (prompts {})", s.turns, s.prompts);
     if !s.tool_counts.is_empty() {
         let tools: Vec<String> = s
@@ -234,7 +238,7 @@ pub fn overview(o: &Overview) -> String {
         }
         let _ = writeln!(
             out,
-            "\n{} {} {} agent={} task={} age={} idle={}{}  {}",
+            "\n{} {} {} agent={} task={} age={} quiet={}{}{}  {}",
             s.id,
             s.state.as_str(),
             s.driver.as_str(),
@@ -242,6 +246,15 @@ pub fn overview(o: &Overview) -> String {
             opt(&s.task),
             human_duration(s.duration_ms),
             human_duration(o.now_ms - s.last_activity_ms),
+            match (s.idle_since_ms, s.shutdown_in_ms) {
+                (Some(since), Some(left)) => format!(
+                    " idle={} closes_in={}",
+                    human_duration(o.now_ms - since),
+                    human_duration(left)
+                ),
+                (Some(since), None) => format!(" idle={}", human_duration(o.now_ms - since)),
+                _ => String::new(),
+            },
             res,
             short_path(&s.cwd)
         );

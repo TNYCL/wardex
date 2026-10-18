@@ -102,8 +102,16 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub cwd: PathBuf,
     pub created_ms: i64,
+    /// When the agent process ended. Stays null while the process is alive,
+    /// including `idle` sessions waiting for their next message.
     pub ended_ms: Option<i64>,
+    /// From creation to the end of the last turn; while a turn runs (or none
+    /// has ended yet), to now.
     pub duration_ms: i64,
+    /// When the last turn ended (`done` or `error`).
+    pub last_turn_ended_ms: Option<i64>,
+    /// How long the last turn took, from its prompt to its end.
+    pub last_turn_ms: Option<i64>,
     pub prompts: i64,
     pub turns: i64,
     pub event_counts: BTreeMap<String, i64>,
@@ -140,6 +148,11 @@ pub struct OverviewSession {
     pub created_ms: i64,
     pub duration_ms: i64,
     pub last_activity_ms: i64,
+    /// Since when the session has been idle (no turn, no question).
+    pub idle_since_ms: Option<i64>,
+    /// Time left until an idle session's process is closed
+    /// (`sessions.idle_shutdown_secs`); `send` resumes it afterwards.
+    pub shutdown_in_ms: Option<i64>,
     pub last_seq: u64,
     pub rss_bytes: Option<u64>,
     pub cpu_percent: Option<f64>,
@@ -188,6 +201,13 @@ const OVERVIEW_TEXT_LIMIT: usize = 300;
 const OVERVIEW_ENDED_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const OVERVIEW_ENDED_LIMIT: i64 = 20;
 
+/// `idle_since_ms` of a session that is really idle.
+fn idle_since(l: &Live) -> Option<i64> {
+    (l.record.state == SessionState::Idle && !l.turn_active && l.pending.is_empty())
+        .then_some(l.idle_since_ms)
+        .flatten()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -195,6 +215,21 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out
+}
+
+/// One tool call with its full input and output (each capped at
+/// `driver::TOOL_TEXT_LIMIT`). `status` is empty while the tool runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolOutput {
+    pub call_id: String,
+    pub name: String,
+    pub started_seq: Option<u64>,
+    pub finished_seq: Option<u64>,
+    pub status: Option<ToolStatus>,
+    pub input_summary: String,
+    pub result_summary: Option<String>,
+    pub input: Option<String>,
+    pub output: Option<String>,
 }
 
 #[derive(Clone)]
@@ -210,6 +245,7 @@ struct Inner {
     live: Mutex<HashMap<SessionId, Live>>,
     tx: broadcast::Sender<Event>,
     shutting_down: AtomicBool,
+    started_ms: i64,
 }
 
 struct Live {
@@ -302,8 +338,14 @@ impl Manager {
                 live: Mutex::new(HashMap::new()),
                 tx,
                 shutting_down: AtomicBool::new(false),
+                started_ms: now_ms(),
             }),
         }
+    }
+
+    /// When this manager (the daemon) started.
+    pub fn started_ms(&self) -> i64 {
+        self.inner.started_ms
     }
 
     pub fn config(&self) -> &Config {
@@ -678,6 +720,7 @@ impl Manager {
                 EventKind::Started {
                     driver_session_id,
                     model,
+                    reasoning,
                 } => {
                     entry.started = true;
                     if driver_session_id.is_some() {
@@ -686,9 +729,14 @@ impl Manager {
                     if model.is_some() {
                         entry.record.model = model.clone();
                     }
+                    // An explicit effort wins; otherwise record what the CLI uses.
+                    if entry.record.reasoning.is_none() && reasoning.is_some() {
+                        entry.record.reasoning = reasoning.clone();
+                    }
                     EventKind::Started {
                         driver_session_id,
                         model,
+                        reasoning,
                     }
                 }
                 EventKind::ToolCall {
@@ -697,6 +745,8 @@ impl Manager {
                     input_summary,
                     status,
                     result_summary,
+                    input,
+                    output,
                 } => {
                     match status {
                         ToolStatus::Started => {
@@ -712,6 +762,8 @@ impl Manager {
                         input_summary,
                         status,
                         result_summary,
+                        input,
+                        output,
                     }
                 }
                 k @ (EventKind::Question { .. } | EventKind::Approval { .. }) => {
@@ -908,6 +960,7 @@ impl Manager {
     /// that ended in the last 24 hours.
     pub async fn overview(&self, events: i64) -> Result<Overview> {
         let now = now_ms();
+        let idle_shutdown_ms = self.inner.config.sessions.idle_shutdown_secs as i64 * 1000;
         let snapshot: Vec<OverviewSession> = self
             .live()
             .values()
@@ -924,6 +977,10 @@ impl Manager {
                 created_ms: l.record.created_ms,
                 duration_ms: now - l.record.created_ms,
                 last_activity_ms: l.last_activity_ms,
+                idle_since_ms: idle_since(l),
+                shutdown_in_ms: idle_since(l)
+                    .filter(|_| idle_shutdown_ms > 0)
+                    .map(|since| (idle_shutdown_ms - (now - since)).max(0)),
                 last_seq: l.record.last_seq,
                 rss_bytes: l.rss_bytes,
                 cpu_percent: l.cpu_percent,
@@ -1019,6 +1076,51 @@ impl Manager {
         Ok(tokio::time::timeout(timeout, wait).await.unwrap_or(false))
     }
 
+    /// Full input and output of the tool call that event `seq` belongs to.
+    pub async fn tool_output(&self, id: &SessionId, seq: u64) -> Result<ToolOutput> {
+        self.record(id).await?;
+        let store = &self.inner.store;
+        store.flush().await;
+        let call_id = match store.event_at(id, seq).await?.map(|e| e.kind) {
+            Some(EventKind::ToolCall { call_id, .. }) => call_id,
+            Some(_) => {
+                return Err(ManagerError::Invalid(format!(
+                    "event {seq} is not a tool_call"
+                )));
+            }
+            None => return Err(ManagerError::NotFound(format!("{id} event {seq}"))),
+        };
+        let mut out = ToolOutput {
+            call_id: call_id.clone(),
+            ..Default::default()
+        };
+        for e in store.tool_call_events(id, &call_id).await? {
+            if let EventKind::ToolCall {
+                name,
+                input_summary,
+                status,
+                result_summary,
+                input,
+                output,
+                ..
+            } = e.kind
+            {
+                out.name = name;
+                if status == ToolStatus::Started {
+                    out.started_seq = Some(e.seq);
+                    out.input_summary = input_summary;
+                    out.input = input;
+                } else {
+                    out.finished_seq = Some(e.seq);
+                    out.status = Some(status);
+                    out.result_summary = result_summary;
+                    out.output = output;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Persisted events after `since_seq`. Waits for queued events first.
     pub async fn events(&self, id: &SessionId, since_seq: u64, limit: i64) -> Result<Vec<Event>> {
         self.record(id).await?;
@@ -1045,7 +1147,26 @@ impl Manager {
             _ => None,
         };
         let git = git::state(&record.cwd).await;
-        let end = record.ended_ms.unwrap_or_else(now_ms);
+        let last_end = match (last_done, store.last_event_of(id, "error").await?) {
+            (Some(d), Some(e)) => Some(if d.seq > e.seq { d } else { e }),
+            (d, e) => d.or(e),
+        };
+        let last_turn_ended_ms = last_end.as_ref().map(|e| e.ts_ms);
+        let last_turn_ms = match &last_end {
+            Some(end) => store
+                .last_event_before(id, "prompt", end.seq)
+                .await?
+                .map(|p| end.ts_ms - p.ts_ms),
+            None => None,
+        };
+        let in_turn = matches!(
+            record.state,
+            SessionState::Starting | SessionState::Running | SessionState::WaitingInput
+        );
+        let end = match (in_turn, last_turn_ended_ms) {
+            (false, Some(t)) => t,
+            _ => record.ended_ms.unwrap_or_else(now_ms),
+        };
         Ok(SessionSummary {
             id: record.id.clone(),
             driver: record.driver,
@@ -1057,6 +1178,8 @@ impl Manager {
             created_ms: record.created_ms,
             ended_ms: record.ended_ms,
             duration_ms: end - record.created_ms,
+            last_turn_ended_ms,
+            last_turn_ms,
             prompts: event_counts.get("prompt").copied().unwrap_or(0),
             turns: event_counts.get("done").copied().unwrap_or(0)
                 + event_counts.get("error").copied().unwrap_or(0),
