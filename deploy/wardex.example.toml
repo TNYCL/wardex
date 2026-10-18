@@ -18,12 +18,18 @@ token_env = "WARDEX_TOKEN"
 auto_resume_orphaned = false
 # Directory (relative to the repo) for --worktree sessions.
 worktree_dir = ".worktree"
+# Close an idle agent process after this long; `send` resumes it. 0 = never.
+idle_shutdown_secs = 900
+# Seconds between closing stdin and killing a stopping session.
+stop_grace_secs = 5
 
 [timeouts]
 question_reminder_secs = 180
 question_stuck_secs = 480
 # Silence while no tool is running before a session counts as stuck.
 idle_stuck_secs = 480
+# CPU usage (% of one core) of a session's processes that counts as activity.
+busy_cpu_percent = 5.0
 
 [retention]
 events_days = 30
