@@ -68,6 +68,10 @@ pub async fn run_with(
     }
 
     let listener = socket::bind(&socket_path).await?;
+    let resumed = manager.auto_resume().await?;
+    if !resumed.is_empty() {
+        tracing::info!(count = resumed.len(), "resumed orphaned sessions");
+    }
     tracing::info!(
         socket = %socket_path.display(),
         database = %db_path.display(),

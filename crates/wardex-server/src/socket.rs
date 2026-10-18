@@ -157,8 +157,21 @@ async fn connection(
                 }
             }
         }
-        Request::Shutdown => {
-            send(&mut write, &api::handle(&manager, Request::Shutdown).await).await?;
+        Request::Shutdown { drain_secs } => {
+            send(
+                &mut write,
+                &api::handle(&manager, Request::Shutdown { drain_secs }).await,
+            )
+            .await?;
+            if let Some(secs) = drain_secs {
+                tracing::info!(secs, "draining running turns before shutdown");
+                if !manager
+                    .wait_for_turns(std::time::Duration::from_secs(secs))
+                    .await
+                {
+                    tracing::warn!("drain timed out; stopping anyway");
+                }
+            }
             let _ = shutdown_tx.send(true);
             Ok(())
         }

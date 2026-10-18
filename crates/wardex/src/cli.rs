@@ -90,8 +90,12 @@ pub struct DaemonArgs {
 #[derive(Debug, Subcommand)]
 pub enum DaemonAction {
     /// Ask the running daemon to shut down. Live sessions become orphaned
-    /// (resumable).
-    Stop,
+    /// (resumable, automatically with `sessions.auto_resume_orphaned`).
+    Stop {
+        /// First wait up to this many seconds for running turns to finish.
+        #[arg(long, value_name = "SECS")]
+        drain: Option<u64>,
+    },
 }
 
 #[derive(Debug, Args)]

@@ -136,6 +136,8 @@ struct Live {
     /// call_id -> tool name
     running_tools: HashMap<String, String>,
     turn_active: bool,
+    /// The agent reported `started`.
+    started: bool,
     first_prompt_sent: bool,
     last_activity_ms: i64,
     idle_since_ms: Option<i64>,
@@ -171,7 +173,7 @@ impl Live {
             SessionState::WaitingInput
         } else if self.turn_active {
             SessionState::Running
-        } else if self.record.state == SessionState::Starting && !self.first_prompt_sent {
+        } else if !self.started {
             SessionState::Starting
         } else {
             SessionState::Idle
@@ -298,15 +300,21 @@ impl Manager {
             .ok_or_else(|| ManagerError::NotFound(id.to_string()))
     }
 
-    /// Mark sessions that were live when the daemon last stopped as orphaned.
-    /// Returns their ids.
+    /// Mark sessions that were still live when the daemon last stopped (a
+    /// crash or kill) as orphaned, killing whatever is left in their scopes so
+    /// a resume never runs next to a stray process. Returns their ids.
     pub async fn recover(&self) -> Result<Vec<SessionId>> {
         let stale = self.inner.store.sessions_in_states(&LIVE_STATES).await?;
         let mut ids = Vec::new();
         for mut record in stale {
+            if let Some(unit) = &record.unit {
+                Launcher::kill_unit(unit).await;
+            }
             record.last_seq = record
                 .last_seq
                 .max(self.inner.store.max_seq(&record.id).await?);
+            record.resume_pending = true;
+            record.resume_with_prompt = record.state != SessionState::Idle;
             record.state = SessionState::Orphaned;
             record.ended_ms = Some(now_ms());
             record.pid = None;
@@ -436,6 +444,8 @@ impl Manager {
             last_result: None,
             last_error: None,
             spawn_count: 0,
+            resume_pending: false,
+            resume_with_prompt: false,
         };
         self.inner.store.insert_session(&record).await?;
         if let Err(e) = self.spawn_process(&mut record, None) {
@@ -490,6 +500,7 @@ impl Manager {
             pending: Vec::new(),
             running_tools: HashMap::new(),
             turn_active: false,
+            started: false,
             first_prompt_sent: false,
             last_activity_ms: now,
             idle_since_ms: Some(now),
@@ -586,6 +597,7 @@ impl Manager {
                     driver_session_id,
                     model,
                 } => {
+                    entry.started = true;
                     if driver_session_id.is_some() {
                         entry.record.driver_session_id = driver_session_id.clone();
                     }
@@ -694,6 +706,8 @@ impl Manager {
         };
         let mut record = entry.record;
         let state = if self.inner.shutting_down.load(Ordering::SeqCst) {
+            record.resume_pending = true;
+            record.resume_with_prompt = entry.turn_active || !entry.pending.is_empty();
             SessionState::Orphaned
         } else if entry.stop_requested {
             SessionState::Stopped
@@ -957,6 +971,8 @@ impl Manager {
         })?;
         record.last_seq = record.last_seq.max(self.inner.store.max_seq(id).await?);
         record.last_error = None;
+        record.resume_pending = false;
+        record.resume_with_prompt = false;
         self.spawn_process(&mut record, Some(resume_id))?;
         if let Some(text) = message {
             self.deliver(id, text)?;
@@ -1001,6 +1017,55 @@ impl Manager {
         entry.interrupt_requested = true;
         let _ = entry.commands.send(DriverCommand::Interrupt);
         Ok(())
+    }
+
+    /// Resume sessions orphaned by the previous daemon when
+    /// `sessions.auto_resume_orphaned` is on; otherwise just clear their
+    /// pending flag. Sessions that were mid-turn get `sessions.resume_prompt`.
+    /// Returns the resumed ids.
+    pub async fn auto_resume(&self) -> Result<Vec<SessionId>> {
+        let pending = self.inner.store.pending_resumes().await?;
+        let mut resumed = Vec::new();
+        for mut record in pending {
+            let enabled = self.inner.config.sessions.auto_resume_orphaned;
+            if !enabled || record.driver_session_id.is_none() {
+                record.resume_pending = false;
+                record.resume_with_prompt = false;
+                self.inner.store.update_session(&record).await?;
+                continue;
+            }
+            let message = record
+                .resume_with_prompt
+                .then(|| self.inner.config.sessions.resume_prompt.clone());
+            match self.resume(&record.id, message).await {
+                Ok(_) => resumed.push(record.id.clone()),
+                Err(e) => {
+                    tracing::error!(session = %record.id, error = %e, "automatic resume failed");
+                    record.resume_pending = false;
+                    self.inner.store.update_session(&record).await?;
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Wait until no live session has a running turn (sessions waiting for
+    /// an answer do not count). Returns false on timeout.
+    pub async fn wait_for_turns(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let busy = self
+                .live()
+                .values()
+                .any(|l| l.turn_active && l.pending.is_empty());
+            if !busy {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn pending_questions(&self) -> Result<Vec<QuestionRow>> {

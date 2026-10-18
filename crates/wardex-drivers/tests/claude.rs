@@ -325,3 +325,42 @@ async fn end_to_end_stop_kills_a_silent_process() {
     m.stop(&id).await.unwrap();
     wait_state(&m, &id, SessionState::Stopped).await;
 }
+
+#[tokio::test]
+async fn fifteen_concurrent_sessions_with_real_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = replay_script(&load("claude", "question"), dir.path());
+    let m = manager_for(&script, &dir.path().join("w.db")).await;
+    let mut ids = Vec::new();
+    for i in 0..15 {
+        let out = m
+            .run(RunSpec {
+                driver: Some(DriverKind::Claude),
+                prompt: format!("ask {i}"),
+                cwd: dir.path().to_path_buf(),
+                agent: Some(format!("agent-{}", i % 3)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        ids.push(out.session.id);
+    }
+    for id in &ids {
+        wait_state(&m, id, SessionState::WaitingInput).await;
+    }
+    assert_eq!(m.pending_questions().await.unwrap().len(), 15);
+    assert_eq!(m.list(false).await.unwrap().len(), 15);
+    for id in &ids {
+        m.answer(id, None, AnswerInput::Text("blue".into()))
+            .await
+            .unwrap();
+    }
+    for id in &ids {
+        wait_state(&m, id, SessionState::Done).await;
+        assert_eq!(
+            m.status(id).await.unwrap().session.last_result.as_deref(),
+            Some("blue")
+        );
+    }
+    assert!(m.live_ids().is_empty());
+}

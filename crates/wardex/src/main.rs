@@ -52,8 +52,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 wardex_server::daemon::run(config).await?;
                 Ok(ExitCode::SUCCESS)
             }
-            Some(DaemonAction::Stop) => {
-                let resp = client.request(&Request::Shutdown).await?;
+            Some(DaemonAction::Stop { drain }) => {
+                let resp = client
+                    .request(&Request::Shutdown { drain_secs: drain })
+                    .await?;
                 finish(json, resp, |_| "daemon is shutting down\n".into())
             }
         },

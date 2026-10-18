@@ -676,3 +676,115 @@ async fn worktree_session_is_created_and_cleaned_up() {
         Err(ManagerError::Invalid(_))
     ));
 }
+
+#[tokio::test]
+async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("w.db");
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let make = |config: Config, store: Store| {
+        let driver = Arc::new(FakeDriver {
+            spawns: Arc::new(AtomicU32::new(0)),
+            received: received.clone(),
+        });
+        Manager::new(config, store, vec![driver], Launcher::direct())
+    };
+    let run = |prompt: &str| RunSpec {
+        driver: Some(DriverKind::Claude),
+        prompt: prompt.into(),
+        cwd: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (busy, idle);
+    {
+        let store = Store::open(&db).await.unwrap();
+        let m = make(Config::default(), store.clone());
+        busy = m.run(run("hang")).await.unwrap().session.id;
+        idle = m.run(run("hello")).await.unwrap().session.id;
+        wait_state(&m, &busy, SessionState::Running).await;
+        wait_state(&m, &idle, SessionState::Idle).await;
+        // Drain gives up on the hanging turn but not on the idle session.
+        assert!(!m.wait_for_turns(Duration::from_millis(200)).await);
+        m.shutdown(Duration::from_secs(2)).await;
+        for id in [&busy, &idle] {
+            let st = m.status(id).await.unwrap().session;
+            assert_eq!(st.state, SessionState::Orphaned);
+            assert!(st.resume_pending);
+        }
+        assert!(m.status(&busy).await.unwrap().session.resume_with_prompt);
+        assert!(!m.status(&idle).await.unwrap().session.resume_with_prompt);
+        store.close().await;
+    }
+    let mut config = Config::default();
+    config.sessions.auto_resume_orphaned = true;
+    let m = make(config.clone(), Store::open(&db).await.unwrap());
+    assert!(m.recover().await.unwrap().is_empty());
+    let mut resumed = m.auto_resume().await.unwrap();
+    resumed.sort();
+    let mut expected = vec![busy.clone(), idle.clone()];
+    expected.sort();
+    assert_eq!(resumed, expected);
+    wait_state(&m, &idle, SessionState::Idle).await;
+    // Only the busy session is told to continue.
+    let prompts: Vec<String> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t == config.sessions.resume_prompt)
+        .cloned()
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    assert!(!m.status(&busy).await.unwrap().session.resume_pending);
+    // A second start resumes nothing.
+    assert!(m.auto_resume().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn orphans_are_not_resumed_unless_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("w.db");
+    let id;
+    {
+        let store = Store::open(&db).await.unwrap();
+        let driver = Arc::new(FakeDriver {
+            spawns: Arc::new(AtomicU32::new(0)),
+            received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let m = Manager::new(
+            Config::default(),
+            store.clone(),
+            vec![driver],
+            Launcher::direct(),
+        );
+        id = m
+            .run(RunSpec {
+                driver: Some(DriverKind::Claude),
+                prompt: "hello".into(),
+                cwd: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .session
+            .id;
+        wait_state(&m, &id, SessionState::Idle).await;
+        m.shutdown(Duration::from_secs(2)).await;
+        store.close().await;
+    }
+    let spawns = Arc::new(AtomicU32::new(0));
+    let driver = Arc::new(FakeDriver {
+        spawns: spawns.clone(),
+        received: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let m = Manager::new(
+        Config::default(),
+        Store::open(&db).await.unwrap(),
+        vec![driver],
+        Launcher::direct(),
+    );
+    assert!(m.auto_resume().await.unwrap().is_empty());
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    let st = m.status(&id).await.unwrap().session;
+    assert_eq!(st.state, SessionState::Orphaned);
+    assert!(!st.resume_pending);
+}

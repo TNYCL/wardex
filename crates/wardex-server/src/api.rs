@@ -61,7 +61,12 @@ pub enum Request {
         message: Option<String>,
     },
     Pending,
-    Shutdown,
+    /// Stop the daemon. With `drain_secs`, first wait up to that long for
+    /// running turns to finish.
+    Shutdown {
+        #[serde(default)]
+        drain_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,7 +185,9 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             to_value(&m.resume(&id, message).await?)
         }
         Request::Pending => to_value(&m.pending_questions().await?),
-        Request::Shutdown => json!({"shutting_down": true}),
+        Request::Shutdown { drain_secs } => {
+            json!({"shutting_down": true, "drain_secs": drain_secs})
+        }
     })
 }
 
