@@ -32,10 +32,11 @@ wardex run --driver claude|codex --prompt "..." [--prompt-file F|-]
            [--worktree NAME [--branch B] [--rm-worktree]]
            [--agent A] [--task T] [--slice S]
 wardex list [-a] | status <id> | summary <id> | pending
-wardex tail <id> [-f] [-n N] [--since-seq N] [--deltas]
+wardex tail <id> [-f] [-n N] [--since-seq N [--wait SECS]] [--deltas]
 wardex answer <id> <text> | answer <id> --item ID=TEXT ... [--question Q]
 wardex send <id> <message> | interrupt <id> | stop <id> | resume <id> [message]
 wardex overview [-n EVENTS]        # live sessions, questions, resources at a glance
+wardex mcp --stdio                 # MCP server on stdin/stdout (e.g. over ssh)
 ```
 
 Session ids can be shortened to any unique prefix. Every command accepts
@@ -43,10 +44,11 @@ Session ids can be shortened to any unique prefix. Every command accepts
 
 ## MCP
 
-With a token set (`WARDEX_TOKEN`), the daemon serves the same capabilities as
-MCP tools at `http://127.0.0.1:7878/mcp` (Streamable HTTP, bearer token
-required): `run`, `overview`, `list`, `status`, `tail`, `summary`,
-`pending_questions`, `answer`, `send`, `interrupt`, `stop`, `resume`. See
+The same capabilities are MCP tools: `run`, `overview`, `list`, `status`,
+`tail`, `summary`, `pending_questions`, `answer`, `send`, `interrupt`, `stop`,
+`resume`. Two transports: `wardex mcp --stdio` (forwards to the daemon's
+socket; remote clients use `ssh <host> wardex mcp --stdio`), and, with a token
+set (`WARDEX_TOKEN`), Streamable HTTP at `http://127.0.0.1:7878/mcp`. See
 [`docs/mcp.md`](docs/mcp.md) for the tools and the bot loop, and
 [`deploy/tunnel.md`](deploy/tunnel.md) for exposing it through Cloudflare
 Tunnel or Tailscale Funnel.

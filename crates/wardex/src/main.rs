@@ -132,6 +132,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             since_seq,
             lines,
             deltas,
+            wait,
         } => {
             let req = Request::Tail {
                 id,
@@ -139,6 +140,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 last: lines,
                 follow,
                 deltas,
+                wait_secs: wait,
             };
             if follow {
                 let mut in_delta = false;
@@ -240,6 +242,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 let rows: Vec<QuestionRow> = serde_json::from_value(v.clone()).unwrap_or_default();
                 output::pending(&rows)
             })
+        }
+        Command::Mcp { stdio } => {
+            if !stdio {
+                bail!(
+                    "only `wardex mcp --stdio` is supported; HTTP MCP is served by the daemon at /mcp"
+                );
+            }
+            init_logging();
+            wardex_server::mcp::serve_stdio(client).await?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Overview { events } => {
             let resp = client

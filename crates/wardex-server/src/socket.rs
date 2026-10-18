@@ -101,6 +101,7 @@ async fn connection(
             last,
             follow: true,
             deltas,
+            ..
         } => {
             // Subscribe before reading history so nothing falls in between.
             let mut rx = manager.subscribe();
@@ -192,13 +193,14 @@ async fn send<T: serde::Serialize>(
 type ResponseLines = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
 
 /// Client side of the socket API.
+#[derive(Debug, Clone)]
 pub struct Client {
     path: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("cannot reach the wardex daemon at {path}: {source} (is `wardex daemon` running?)")]
+    #[error("cannot reach the wardex daemon at {path} (is `wardex daemon` running?)")]
     Connect {
         path: PathBuf,
         source: std::io::Error,

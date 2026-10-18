@@ -1,6 +1,8 @@
 //! The daemon API: requests, responses and their handling. Transport-neutral;
 //! used by the Unix socket server and the MCP tools.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wardex_core::manager::{AnswerInput, Manager, ManagerError};
@@ -9,6 +11,8 @@ use wardex_core::{Event, EventKind, RunSpec};
 /// Default number of events `tail` shows.
 pub const DEFAULT_TAIL: i64 = 20;
 const MAX_EVENTS: i64 = 10_000;
+/// Upper bound for `tail`'s `wait_secs`; MCP clients time tool calls out.
+pub const MAX_WAIT_SECS: u64 = 60;
 /// Default number of latest events per session in `overview`.
 pub const DEFAULT_OVERVIEW_EVENTS: i64 = 3;
 const MAX_OVERVIEW_EVENTS: i64 = 50;
@@ -38,6 +42,10 @@ pub enum Request {
         /// Also stream message deltas while following.
         #[serde(default)]
         deltas: bool,
+        /// With `since_seq` and without `follow`: if there are no newer
+        /// events yet, wait up to this many seconds (max 60) for one.
+        #[serde(default)]
+        wait_secs: Option<u64>,
     },
     Summary {
         id: String,
@@ -156,9 +164,14 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             id,
             since_seq,
             last,
+            wait_secs,
             ..
         } => {
             let id = m.resolve(&id).await?;
+            if let (Some(seq), Some(wait)) = (since_seq, wait_secs.filter(|w| *w > 0)) {
+                let wait = Duration::from_secs(wait.min(MAX_WAIT_SECS));
+                m.wait_for_event(&id, seq, wait).await?;
+            }
             to_value(&initial_events(m, &id, since_seq, last).await?)
         }
         Request::Summary { id } => {

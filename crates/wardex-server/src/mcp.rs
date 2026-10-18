@@ -1,24 +1,23 @@
-//! MCP server (Streamable HTTP, stateless). Every tool maps to a daemon API
-//! request, so MCP clients and the CLI share one implementation. Served under
-//! `/mcp` behind the bearer token (see `http.rs`).
+//! MCP server. Every tool maps to a daemon API request, so MCP clients and
+//! the CLI share one implementation. Two transports: Streamable HTTP inside
+//! the daemon (`/mcp` behind the bearer token, see `http.rs`), and stdio
+//! (`wardex mcp --stdio`), which forwards requests to the daemon's Unix
+//! socket, e.g. for clients that connect with `ssh host wardex mcp --stdio`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use wardex_core::manager::{AnswerInput, Manager};
 use wardex_core::{DriverKind, RunSpec};
 
+use crate::Client;
 use crate::api::{self, DEFAULT_OVERVIEW_EVENTS, Request, Response};
-
-/// Upper bound for `tail`'s `wait_secs`; MCP clients time tool calls out.
-pub const MAX_WAIT_SECS: u64 = 60;
 
 const INSTRUCTIONS: &str = "\
 Wardex runs and supervises Claude Code and Codex agent sessions on one host. \
@@ -159,23 +158,59 @@ pub struct OverviewParams {
     pub events: Option<i64>,
 }
 
+/// Where tool calls go: the daemon's manager, or the daemon's socket.
+#[derive(Clone)]
+enum Backend {
+    Local(Manager),
+    Socket(Client),
+}
+
 #[derive(Clone)]
 pub struct WardexMcp {
-    manager: Manager,
+    backend: Backend,
     tool_router: ToolRouter<Self>,
 }
 
 impl WardexMcp {
+    /// Tools served inside the daemon.
     pub fn new(manager: Manager) -> Self {
         Self {
-            manager,
+            backend: Backend::Local(manager),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Tools that forward to a running daemon over its Unix socket.
+    pub fn remote(client: Client) -> Self {
+        Self {
+            backend: Backend::Socket(client),
             tool_router: Self::tool_router(),
         }
     }
 
     async fn call(&self, req: Request) -> CallToolResult {
-        respond(api::handle(&self.manager, req).await)
+        respond(match &self.backend {
+            Backend::Local(m) => api::handle(m, req).await,
+            Backend::Socket(c) => c.request(&req).await.unwrap_or_else(|e| {
+                let mut message = e.to_string();
+                if let Some(source) = std::error::Error::source(&e) {
+                    message = format!("{message}: {source}");
+                }
+                Response::err("unavailable", message)
+            }),
+        })
     }
+}
+
+/// Serve MCP on stdin/stdout until the client disconnects, forwarding every
+/// tool call to the daemon behind `client`.
+pub async fn serve_stdio(client: Client) -> std::io::Result<()> {
+    let service = WardexMcp::remote(client)
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(std::io::Error::other)?;
+    service.waiting().await.map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 /// Successful results are the same JSON the CLI prints with `--json`.
@@ -254,22 +289,13 @@ impl WardexMcp {
         annotations(read_only_hint = true)
     )]
     async fn tail(&self, Parameters(p): Parameters<TailParams>) -> CallToolResult {
-        if let (Some(seq), Some(wait)) = (p.since_seq, p.wait_secs.filter(|w| *w > 0)) {
-            let id = match self.manager.resolve(&p.id).await {
-                Ok(id) => id,
-                Err(e) => return respond(e.into()),
-            };
-            let wait = Duration::from_secs(wait.min(MAX_WAIT_SECS));
-            if let Err(e) = self.manager.wait_for_event(&id, seq, wait).await {
-                return respond(e.into());
-            }
-        }
         self.call(Request::Tail {
             id: p.id,
             since_seq: p.since_seq,
             last: p.last,
             follow: false,
             deltas: false,
+            wait_secs: p.wait_secs,
         })
         .await
     }
