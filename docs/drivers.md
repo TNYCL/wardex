@@ -176,6 +176,15 @@ reports the new id. Verified against the 2.1.302 `--help` text and argument
 validation; no fork transcript was recorded (the protocol after `init` is the
 same as for a resume).
 
+### Known limitations
+
+- Because the session id is recorded when the process starts, a Claude
+  session (or fork) whose process dies before its first event still has a
+  resume id. Claude may not have written a transcript for it yet, so a later
+  `resume`/`send` can fail with Claude's own "No conversation found" error
+  instead of Wardex's "the agent never reported a session id". Start a new
+  session (or adopt/fork the source again) in that case.
+
 ## Codex
 
 ### Invocation

@@ -268,6 +268,15 @@ everything, and MCP may be reachable through a tunnel, so a user's personal
 terminal history reaches that surface only with explicit consent
 (`mcp = true`). `--force` exists only in the CLI.
 
+## Known limitations
+
+- A Claude fork whose process dies before its first event keeps the fork id
+  Wardex chose up front, and resuming it may fail with Claude's "No
+  conversation found" error; see [`drivers.md`](drivers.md#known-limitations).
+  Fork the source again instead.
+- Liveness is detection only: a session opened in a terminal after Wardex
+  resumed it cannot be noticed until the next resume.
+
 ## Versions
 
 Tested: Claude Code 2.1.302 and Codex 0.163.0. Versions seen in transcripts
