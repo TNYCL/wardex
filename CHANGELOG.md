@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- External sessions (`docs/external-sessions.md`, off by default): with
+  `[external] enabled = true`, `wardex external list [--cwd DIR [--under] |
+  --here]` lists Claude Code and Codex sessions started outside Wardex from
+  the CLIs' own stores, with liveness (`live`, `recent`, `inactive`,
+  `unknown`) detected from `/proc` and the CLIs' registry files. `wardex
+  history <id>` prints a session's conversation (prompts, messages, tool
+  calls, compactions) read from its transcript on every call, paged by turns,
+  capped in bytes and with best-effort secret redaction (`text`, `markdown`
+  or `json`). The MCP tools `external_list` and `history` additionally need
+  `external.mcp = true`. Wardex never writes, locks or deletes anything in
+  the CLIs' stores, and history is not copied into its database.
 - `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
   filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
   find a closed session again. `list` shows when and why a session ended.

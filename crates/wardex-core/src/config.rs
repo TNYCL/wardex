@@ -38,6 +38,7 @@ pub struct Config {
     pub retention: RetentionConfig,
     pub drivers: DriversConfig,
     pub resources: ResourcesConfig,
+    pub external: ExternalConfig,
     pub webhooks: Vec<WebhookConfig>,
 }
 
@@ -266,6 +267,71 @@ impl Default for ResourcesConfig {
     }
 }
 
+/// Sessions started outside Wardex (`docs/external-sessions.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExternalConfig {
+    /// Discovery, history and adopt of external sessions (Unix socket).
+    pub enabled: bool,
+    /// Also expose them over MCP (HTTP and `mcp --stdio`). Needs `enabled`.
+    pub mcp: bool,
+    /// Claude's root. Default: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+    pub claude_home: Option<String>,
+    /// Codex's root. Default: `$CODEX_HOME`, else `~/.codex`.
+    pub codex_home: Option<String>,
+    /// A transcript written this recently counts as `recent` (in use).
+    pub quiet_secs: u64,
+    /// Globs (`*`, `?`) for session cwds that are visible. Empty: all.
+    pub cwd_allow: Vec<String>,
+    /// Larger transcripts are refused.
+    pub max_file_mb: u64,
+    /// Mask secrets in history on a best-effort basis.
+    pub redact: bool,
+}
+
+impl Default for ExternalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mcp: false,
+            claude_home: None,
+            codex_home: None,
+            quiet_secs: 120,
+            cwd_allow: Vec::new(),
+            max_file_mb: 128,
+            redact: true,
+        }
+    }
+}
+
+impl ExternalConfig {
+    pub fn claude_root(&self) -> PathBuf {
+        Self::root(&self.claude_home, "CLAUDE_CONFIG_DIR", "~/.claude")
+    }
+
+    pub fn codex_root(&self) -> PathBuf {
+        Self::root(&self.codex_home, "CODEX_HOME", "~/.codex")
+    }
+
+    fn root(configured: &Option<String>, env: &str, default: &str) -> PathBuf {
+        let raw = configured
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var(env).ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| default.to_string());
+        PathBuf::from(expand_path(&raw))
+    }
+
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// Whether external sessions may be served over MCP.
+    pub fn over_mcp(&self) -> bool {
+        self.enabled && self.mcp
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
@@ -489,6 +555,16 @@ impl Config {
                 }
             }
         }
+        if self.external.mcp && !self.external.enabled {
+            return Err(ConfigError::Invalid(
+                "external.mcp requires external.enabled".into(),
+            ));
+        }
+        if self.external.max_file_mb == 0 {
+            return Err(ConfigError::Invalid(
+                "external.max_file_mb must be > 0".into(),
+            ));
+        }
         if self.daemon.tick_ms == 0 {
             return Err(ConfigError::Invalid("daemon.tick_ms must be > 0".into()));
         }
@@ -629,6 +705,7 @@ mod tests {
         assert_eq!(config.timeouts.question_reminder_secs, 180);
         assert_eq!(config.webhooks.len(), 1);
         assert_eq!(config.sessions, SessionsConfig::default());
+        assert_eq!(config.external, ExternalConfig::default());
     }
 
     #[test]
@@ -731,6 +808,21 @@ mod tests {
         );
         assert_eq!(expand_with("~/x", &get), "/home/u/x");
         assert_eq!(expand_with("/plain/$", &get), "/plain/$");
+    }
+
+    #[test]
+    fn external_sessions_are_off_by_default() {
+        let e = Config::default().external;
+        assert!(!e.enabled && !e.mcp && !e.over_mcp());
+        assert!(e.redact);
+        assert_eq!(e.quiet_secs, 120);
+        let on = Config::parse("[external]\nenabled = true\nmcp = true\nclaude_home = \"/x/c\"\n")
+            .unwrap();
+        on.validate().unwrap();
+        assert!(on.external.over_mcp());
+        assert_eq!(on.external.claude_root(), Path::new("/x/c"));
+        let mcp_only = Config::parse("[external]\nmcp = true\n").unwrap();
+        assert!(mcp_only.validate().is_err());
     }
 
     #[test]

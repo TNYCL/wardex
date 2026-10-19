@@ -13,7 +13,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::config::SessionsConfig;
 use crate::driver::{Driver, DriverCommand, DriverError, DriverEvent, READONLY_PREFIX, SpawnSpec};
+use crate::external::{
+    ExternalError, ExternalFilter, ExternalSession, ExternalSource, HistoryPage, HistoryQuery,
+    cwd_matches, normalize_cwd,
+};
 use crate::process::{self, Launcher};
+use crate::procscan::{ProbeConfig, ProcSnapshot};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
@@ -50,9 +55,43 @@ pub enum ManagerError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Driver(#[from] DriverError),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<ExternalError> for ManagerError {
+    fn from(e: ExternalError) -> Self {
+        match e {
+            ExternalError::NotFound(id) => Self::NotFound(id),
+            ExternalError::Ambiguous(id) => Self::Ambiguous(id),
+            other => Self::Invalid(other.to_string()),
+        }
+    }
 }
 
 pub type Result<T, E = ManagerError> = std::result::Result<T, E>;
+
+/// Stores of sessions started outside Wardex, and where to look for live
+/// processes (`docs/external-sessions.md`).
+pub struct ExternalSetup {
+    pub sources: Vec<Arc<dyn ExternalSource>>,
+    /// Usually `/proc`.
+    pub proc_root: PathBuf,
+}
+
+impl Default for ExternalSetup {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            proc_root: PathBuf::from("/proc"),
+        }
+    }
+}
+
+const DEFAULT_EXTERNAL_LIMIT: usize = 50;
+const MAX_EXTERNAL_LIMIT: usize = 500;
+/// Shortest native id prefix accepted for external sessions.
+const MIN_EXTERNAL_PREFIX: usize = 8;
 
 /// How a caller answers a pending question or approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +380,8 @@ struct Inner {
     store: Store,
     drivers: HashMap<DriverKind, Arc<dyn Driver>>,
     launcher: Launcher,
+    external: Vec<Arc<dyn ExternalSource>>,
+    probe: ProbeConfig,
     live: Mutex<HashMap<SessionId, Live>>,
     records: Mutex<HashMap<SessionId, SessionRecord>>,
     read_warning: Mutex<Option<String>>,
@@ -473,14 +514,36 @@ impl Manager {
         drivers: Vec<Arc<dyn Driver>>,
         launcher: Launcher,
     ) -> Self {
+        Self::with_external(config, store, drivers, launcher, ExternalSetup::default())
+    }
+
+    /// A manager that can also read sessions started outside Wardex.
+    pub fn with_external(
+        config: Config,
+        store: Store,
+        drivers: Vec<Arc<dyn Driver>>,
+        launcher: Launcher,
+        external: ExternalSetup,
+    ) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let drivers = drivers.into_iter().map(|d| (d.kind(), d)).collect();
+        let probe = ProbeConfig {
+            proc_root: external.proc_root,
+            claude_root: external
+                .sources
+                .iter()
+                .find(|s| s.kind() == DriverKind::Claude)
+                .map(|s| s.root().to_path_buf()),
+            quiet_secs: config.external.quiet_secs,
+        };
         Self {
             inner: Arc::new(Inner {
                 config,
                 store,
                 drivers,
                 launcher,
+                external: external.sources,
+                probe,
                 live: Mutex::new(HashMap::new()),
                 records: Mutex::new(HashMap::new()),
                 read_warning: Mutex::new(None),
@@ -1349,6 +1412,231 @@ impl Manager {
         {
             tracing::warn!(session = %id, error = %e, "worktree kept");
         }
+    }
+
+    /// External sessions are enabled, and over MCP only when allowed.
+    fn external_allowed(&self, via_mcp: bool) -> Result<()> {
+        let e = &self.inner.config.external;
+        if !e.enabled {
+            return Err(ManagerError::Invalid(
+                "external sessions are disabled; set external.enabled = true in the config".into(),
+            ));
+        }
+        if via_mcp && !e.mcp {
+            return Err(ManagerError::Invalid(
+                "external sessions are not exposed over MCP; set external.mcp = true in the config"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Pids of this daemon's agent processes; never evidence of an
+    /// external writer.
+    fn own_pids(&self) -> HashSet<u32> {
+        self.live().values().filter_map(|l| l.record.pid).collect()
+    }
+
+    /// Run blocking store and `/proc` reads off the async workers.
+    async fn blocking<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| ManagerError::Internal(format!("external store task failed: {e}")))?
+    }
+
+    fn external_source(&self, kind: DriverKind) -> Result<Arc<dyn ExternalSource>> {
+        self.inner
+            .external
+            .iter()
+            .find(|s| s.kind() == kind)
+            .cloned()
+            .ok_or_else(|| {
+                ManagerError::Invalid(format!("no {} session store is configured", kind.as_str()))
+            })
+    }
+
+    /// `external.cwd_allow` admits sessions in `cwd` (normalized).
+    fn cwd_allowed(allow: &[String], cwd: &Path) -> bool {
+        let cwd = cwd.to_string_lossy();
+        allow.is_empty() || allow.iter().any(|p| crate::glob::glob(p, &cwd))
+    }
+
+    /// Mark sessions this daemon manages and flag Codex threads another
+    /// Wardex daemon started.
+    async fn mark_managed(&self, sessions: &mut [ExternalSession]) -> Result<()> {
+        let managed = self.inner.store.managed_driver_ids().await?;
+        for s in sessions {
+            s.managed_by = managed.get(&(s.driver, s.native_id.clone())).cloned();
+            if s.managed_by.is_none() && s.entrypoint.as_deref() == Some("wardex") {
+                s.warnings
+                    .push("started by a Wardex daemon that does not manage it".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sessions started outside Wardex, newest first, with their liveness.
+    pub async fn external_list(
+        &self,
+        filter: ExternalFilter,
+        via_mcp: bool,
+    ) -> Result<Vec<ExternalSession>> {
+        self.external_allowed(via_mcp)?;
+        let sources = self.inner.external.clone();
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let allow = self.inner.config.external.cwd_allow.clone();
+        let f = filter.clone();
+        let (mut sessions, snapshot) = Self::blocking(move || {
+            let want = f.cwd.as_deref().map(normalize_cwd);
+            let mut out = Vec::new();
+            for source in sources
+                .iter()
+                .filter(|s| f.driver.is_none_or(|d| d == s.kind()))
+            {
+                out.extend(source.discover(&f)?.into_iter().filter(|s| {
+                    let cwd = normalize_cwd(&s.cwd);
+                    Self::cwd_allowed(&allow, &cwd)
+                        && want
+                            .as_deref()
+                            .is_none_or(|w| cwd_matches(&cwd, w, f.under))
+                }));
+            }
+            Ok((out, ProcSnapshot::take(&probe, &pids)))
+        })
+        .await?;
+        self.mark_managed(&mut sessions).await?;
+        if !filter.include_managed {
+            sessions.retain(|s| s.managed_by.is_none());
+        }
+        sessions.sort_by(|a, b| {
+            b.updated_ms
+                .cmp(&a.updated_ms)
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        });
+        sessions.truncate(
+            filter
+                .limit
+                .unwrap_or(DEFAULT_EXTERNAL_LIMIT)
+                .clamp(1, MAX_EXTERNAL_LIMIT),
+        );
+        let now = now_ms();
+        for s in &mut sessions {
+            s.liveness = snapshot.liveness(s, now);
+        }
+        Ok(sessions)
+    }
+
+    /// Resolve `claude:<id>`, `codex:<id>`, a full id or a unique prefix of
+    /// at least 8 characters to an external session, with fresh metadata
+    /// and liveness.
+    pub async fn resolve_external(
+        &self,
+        id: &str,
+        driver: Option<DriverKind>,
+    ) -> Result<ExternalSession> {
+        let id = id.trim();
+        let (driver, prefix) = match id.split_once(':') {
+            Some((d, rest)) => {
+                let kind = DriverKind::parse(d).ok_or_else(|| {
+                    ManagerError::Invalid(format!("unknown driver prefix in {id:?}"))
+                })?;
+                if driver.is_some_and(|other| other != kind) {
+                    return Err(ManagerError::Invalid(format!(
+                        "{id:?} does not match the requested driver"
+                    )));
+                }
+                (Some(kind), rest)
+            }
+            None => (driver, id),
+        };
+        if prefix.len() < MIN_EXTERNAL_PREFIX {
+            return Err(ManagerError::Invalid(format!(
+                "external session ids need at least {MIN_EXTERNAL_PREFIX} characters"
+            )));
+        }
+        if !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Err(ManagerError::NotFound(id.into()));
+        }
+        let sources = self.inner.external.clone();
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let allow = self.inner.config.external.cwd_allow.clone();
+        let prefix = prefix.to_string();
+        let wanted = id.to_string();
+        let (mut session, snapshot) = Self::blocking(move || {
+            let mut found = Vec::new();
+            for source in sources
+                .iter()
+                .filter(|s| driver.is_none_or(|d| d == s.kind()))
+            {
+                found.extend(source.find(&prefix)?);
+            }
+            found.retain(|s| Self::cwd_allowed(&allow, &normalize_cwd(&s.cwd)));
+            let session = match found.len() {
+                0 => return Err(ManagerError::NotFound(wanted)),
+                1 => found.remove(0),
+                _ => {
+                    let exact: Vec<_> = found
+                        .into_iter()
+                        .filter(|s| s.native_id == prefix)
+                        .collect();
+                    match <[ExternalSession; 1]>::try_from(exact) {
+                        Ok([s]) => s,
+                        Err(_) => return Err(ManagerError::Ambiguous(wanted)),
+                    }
+                }
+            };
+            Ok((session, ProcSnapshot::take(&probe, &pids)))
+        })
+        .await?;
+        self.mark_managed(std::slice::from_mut(&mut session))
+            .await?;
+        session.liveness = snapshot.liveness(&session, now_ms());
+        Ok(session)
+    }
+
+    /// The native session behind a Wardex session id, if `id` is one.
+    async fn native_of(&self, id: &str) -> Result<Option<(DriverKind, String)>> {
+        let id = SessionId(id.trim().to_string());
+        let record = match self.record(&id).await {
+            Ok(r) => r,
+            Err(ManagerError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let native = record.driver_session_id.clone().ok_or_else(|| {
+            ManagerError::Conflict(format!("session {id} has no native session id yet"))
+        })?;
+        Ok(Some((record.driver, native)))
+    }
+
+    /// A page of a session's native conversation, read from its transcript.
+    /// `id` is a Wardex session id (exact) or an external session id.
+    pub async fn history(
+        &self,
+        id: &str,
+        driver: Option<DriverKind>,
+        mut query: HistoryQuery,
+        via_mcp: bool,
+    ) -> Result<HistoryPage> {
+        self.external_allowed(via_mcp)?;
+        let session = match self.native_of(id).await? {
+            Some((kind, native)) => self.resolve_external(&native, Some(kind)).await?,
+            None => self.resolve_external(id, driver).await?,
+        };
+        query.redact = self.inner.config.external.redact;
+        let source = self.external_source(session.driver)?;
+        let mut page = Self::blocking(move || {
+            let history = source.read_history(&session)?;
+            Ok(crate::external::page(session, history, &query)?)
+        })
+        .await?;
+        if page.session.liveness.is_live() {
+            page.warnings.push("live".into());
+        }
+        Ok(page)
     }
 
     pub async fn list(&self, all: bool) -> Result<Vec<SessionView>> {

@@ -1,7 +1,7 @@
 //! SQLite persistence. Events are written by a single writer task in batches;
 //! everything else goes through the pool directly.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -482,6 +482,28 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         row.map(|r| session_from_row(&r)).transpose()
+    }
+
+    /// Wardex session per driver session id (the newest when several share
+    /// one).
+    pub async fn managed_driver_ids(&self) -> Result<HashMap<(DriverKind, String), SessionId>> {
+        let rows = sqlx::query(
+            "SELECT id, driver, driver_session_id FROM sessions
+             WHERE driver_session_id IS NOT NULL ORDER BY created_ms, rowid",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let driver: String = r.get("driver");
+            if let Some(kind) = DriverKind::parse(&driver) {
+                out.insert(
+                    (kind, r.get::<String, _>("driver_session_id")),
+                    SessionId(r.get("id")),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Session ids starting with `prefix` (at most `limit`).

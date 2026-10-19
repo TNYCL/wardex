@@ -105,6 +105,12 @@ Session ids can be shortened to any unique prefix.
 | `interrupt` | `id` | `{session_id}` |
 | `stop` | `id` | `{session_id}` |
 | `resume` | `id`; optional `message` | session record |
+| `external_list` | optional `driver`, `cwd` (absolute), `under`, `since_secs`, `limit` (default 50), `include_managed` | `{sessions}`: sessions started outside Wardex, newest first, with `liveness` |
+| `history` | `id` (Wardex id or external id); optional `driver`, `turns` (default 20), `before`, `tools` (`none`/`summary`/`full`), `max_bytes` (default 65536) | `{session, items, next_before, truncated, warnings}` |
+
+`external_list` and `history` are listed only when the daemon has both
+`external.enabled` and `external.mcp` set (both off by default); see
+[External sessions](#external-sessions).
 
 Errors come back as tool results with `isError: true` and a text of the form
 `<code>: <message>`, where the code is `not_found`, `ambiguous`, `invalid`,
@@ -164,6 +170,24 @@ items:
 256 KiB each). They are left out of `tail` (pass `full: true` to include
 them) and of webhooks; `tool_output {"id": …, "seq": …}` returns them for one
 call. CLI: `wardex tail <id> --full`, `wardex tool-output <id> <seq>`.
+
+### External sessions
+
+With `[external] enabled = true` and `mcp = true`, clients can see Claude Code
+and Codex sessions that were started outside Wardex, for example in a
+terminal, and read their conversation. Every MCP client then sees the user's
+terminal history (Wardex has no roles), so only turn `mcp` on when that is
+acceptable. Details: [`external-sessions.md`](external-sessions.md).
+
+- `external_list {"cwd": "/srv/app", "under": true}`: sessions that started in
+  that directory or below. `liveness.state` is `live` (open in a CLI process
+  right now), `recent` (written within `external.quiet_secs`), `inactive` or
+  `unknown`.
+- `history {"id": "claude:1a2b3c4d"}`: the last 20 turns as `prompt`,
+  `message`, `tool_call` and `compaction` items, read from the CLI's
+  transcript every time (never copied into Wardex). Page back with
+  `before` = `next_before`. Secrets are masked on a best-effort basis; treat
+  the result as sensitive anyway. `history` also takes a Wardex session id.
 
 ### Paging and waiting
 

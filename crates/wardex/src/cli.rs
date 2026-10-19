@@ -136,6 +136,106 @@ pub enum Command {
         #[arg(short = 'n', long, default_value_t = 3)]
         events: i64,
     },
+    /// Sessions started outside Wardex (needs `external.enabled`).
+    External {
+        #[command(subcommand)]
+        action: ExternalAction,
+    },
+    /// Print a session's native conversation, read from the CLI's
+    /// transcript. ID: a Wardex session id, or an external session id
+    /// (`claude:<uuid>`, `codex:<uuid>`, a uuid or a prefix of 8+ characters).
+    History(HistoryArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExternalAction {
+    /// List sessions found in the Claude Code and Codex stores, newest first.
+    List(ExternalListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExternalListArgs {
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    /// Only sessions that started in DIR.
+    #[arg(long, value_name = "DIR", conflicts_with = "here")]
+    pub cwd: Option<PathBuf>,
+    /// Only sessions that started in the current directory.
+    #[arg(long)]
+    pub here: bool,
+    /// With --cwd or --here: also sessions in directories below it.
+    #[arg(long)]
+    pub under: bool,
+    /// Only sessions written within AGE (e.g. 90s, 30m, 12h, 7d).
+    #[arg(long, value_name = "AGE", value_parser = parse_age)]
+    pub since: Option<u64>,
+    /// Maximum number of sessions.
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub limit: usize,
+    /// Also sessions this Wardex already manages.
+    #[arg(long)]
+    pub include_managed: bool,
+    /// Also archived sessions (Codex).
+    #[arg(long)]
+    pub archived: bool,
+    /// Also subagent threads (Codex).
+    #[arg(long)]
+    pub include_subagents: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    pub id: String,
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    /// Turns (prompts) to show.
+    #[arg(long, default_value_t = 20)]
+    pub turns: usize,
+    /// Show the turns before this cursor (`next_before` of a page).
+    #[arg(long, value_name = "CURSOR")]
+    pub before: Option<String>,
+    /// How much of each tool call to show.
+    #[arg(long, value_enum, default_value_t = ToolsArg::Summary)]
+    pub tools: ToolsArg,
+    /// `markdown` is a context summary another agent can take as a prompt.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+    /// Byte budget for the shown items (default 64 KiB).
+    #[arg(long, value_name = "BYTES")]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ToolsArg {
+    None,
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    Text,
+    Markdown,
+    Json,
+}
+
+/// `90`, `90s`, `30m`, `12h` or `7d` as seconds.
+fn parse_age(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("invalid age {s:?}"))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Err(format!("invalid age {s:?}; use s, m, h, d or w")),
+    };
+    Ok(n.saturating_mul(mult))
 }
 
 #[derive(Debug, Args)]
@@ -304,6 +404,49 @@ mod tests {
         assert!(Cli::try_parse_from(["wardex", "send", "ab12", "next"]).is_ok());
         // Label patterns select a session only with --latest.
         assert!(Cli::try_parse_from(["wardex", "send", "--agent", "a", "ab12", "next"]).is_err());
+    }
+
+    #[test]
+    fn external_list_and_history() {
+        let cli = Cli::try_parse_from([
+            "wardex", "external", "list", "--here", "--under", "--since", "7d", "-n", "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::External {
+                action: ExternalAction::List(a),
+            } => {
+                assert!(a.here && a.under);
+                assert_eq!(a.since, Some(7 * 86_400));
+                assert_eq!(a.limit, 5);
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wardex", "external", "list", "--here", "--cwd", "/x"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["wardex", "external", "list", "--since", "3y"]).is_err());
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "history",
+            "claude:abcd1234",
+            "--tools",
+            "full",
+            "--format",
+            "markdown",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::History(h) => {
+                assert_eq!(h.id, "claude:abcd1234");
+                assert_eq!(h.tools, ToolsArg::Full);
+                assert_eq!(h.format, Format::Markdown);
+                assert_eq!(h.turns, 20);
+            }
+            c => panic!("{c:?}"),
+        }
+        assert_eq!(parse_age("90"), Ok(90));
+        assert_eq!(parse_age("30m"), Ok(1800));
     }
 
     #[test]

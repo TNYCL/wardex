@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde_json::Value;
+use wardex_core::external::{ExternalSession, HistoryPage, ToolDetail};
 use wardex_core::manager::{
     AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
 };
@@ -18,7 +19,7 @@ use wardex_server::daemon::{Exit, Source};
 mod cli;
 mod output;
 
-use cli::{Cli, Command, DaemonAction};
+use cli::{Cli, Command, DaemonAction, ExternalAction};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -149,10 +150,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let cwd = std::fs::canonicalize(&cwd)
                 .with_context(|| format!("cannot use cwd {}", cwd.display()))?;
             let spec = RunSpec {
-                driver: Some(match args.driver {
-                    cli::Driver::Claude => DriverKind::Claude,
-                    cli::Driver::Codex => DriverKind::Codex,
-                }),
+                driver: Some(driver_kind(args.driver)),
                 prompt,
                 model: args.model,
                 reasoning: args.reasoning,
@@ -392,6 +390,63 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             wardex_server::mcp::serve_stdio(client).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::External {
+            action: ExternalAction::List(a),
+        } => {
+            let cwd = if a.here {
+                Some(std::fs::canonicalize(std::env::current_dir()?)?)
+            } else {
+                a.cwd.map(|c| absolute_dir(&c)).transpose()?
+            };
+            if a.under && cwd.is_none() {
+                bail!("--under needs --cwd or --here");
+            }
+            let resp = client
+                .request(&Request::ExternalList {
+                    driver: a.driver.map(driver_kind),
+                    cwd,
+                    under: a.under,
+                    since_secs: a.since,
+                    limit: Some(a.limit),
+                    include_managed: a.include_managed,
+                    archived: a.archived,
+                    include_subagents: a.include_subagents,
+                    via_mcp: false,
+                })
+                .await?;
+            finish(json, resp, |v| {
+                let sessions: Vec<ExternalSession> =
+                    serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
+                output::external_list(&sessions)
+            })
+        }
+        Command::History(a) => {
+            let resp = client
+                .request(&Request::History {
+                    id: a.id,
+                    driver: a.driver.map(driver_kind),
+                    turns: Some(a.turns),
+                    before: a.before,
+                    tools: Some(match a.tools {
+                        cli::ToolsArg::None => ToolDetail::None,
+                        cli::ToolsArg::Summary => ToolDetail::Summary,
+                        cli::ToolsArg::Full => ToolDetail::Full,
+                    }),
+                    max_bytes: a.max_bytes,
+                    via_mcp: false,
+                })
+                .await?;
+            let format = a.format;
+            finish(
+                json || format == cli::Format::Json,
+                resp,
+                |v| match serde_json::from_value::<HistoryPage>(v.clone()) {
+                    Ok(page) if format == cli::Format::Markdown => output::history_markdown(&page),
+                    Ok(page) => output::history_text(&page),
+                    Err(_) => output::json(v),
+                },
+            )
+        }
         Command::Overview { events } => {
             let resp = client
                 .request(&Request::Overview {
@@ -406,6 +461,23 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
     }
+}
+
+fn driver_kind(d: cli::Driver) -> DriverKind {
+    match d {
+        cli::Driver::Claude => DriverKind::Claude,
+        cli::Driver::Codex => DriverKind::Codex,
+    }
+}
+
+/// `dir` as an absolute path, with symlinks resolved when it exists (a
+/// session's directory may be gone, e.g. a removed worktree).
+fn absolute_dir(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    Ok(match std::fs::canonicalize(dir) {
+        Ok(p) => p,
+        Err(_) if dir.is_absolute() => dir.to_path_buf(),
+        Err(_) => std::env::current_dir()?.join(dir),
+    })
 }
 
 /// What `ping` tells about the running daemon.

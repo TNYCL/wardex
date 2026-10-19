@@ -13,6 +13,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use wardex_core::external::ToolDetail;
 use wardex_core::manager::{AnswerInput, Manager};
 use wardex_core::{DriverKind, RunSpec};
 
@@ -34,6 +35,10 @@ events with `since_seq`; with `wait_secs` it waits for the next event; \
 `tool_output` has a tool call's full output. \
 Webhooks (if configured) announce questions, results, errors and stuck sessions, \
 so poll only when you have no webhook.";
+
+/// Tools for sessions started outside Wardex; listed only with
+/// `external.enabled` and `external.mcp`.
+const EXTERNAL_TOOLS: &[&str] = &["external_list", "history"];
 
 /// Inlined in the schema: some MCP clients do not resolve `$ref`.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -191,6 +196,69 @@ pub struct ResumeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExternalListParams {
+    /// Only this CLI's sessions.
+    #[serde(default)]
+    pub driver: Option<DriverArg>,
+    /// Absolute directory on the Wardex host: only sessions started there.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// With `cwd`: also sessions in directories below it (e.g. worktrees).
+    #[serde(default)]
+    pub under: bool,
+    /// Only sessions written in the last this many seconds.
+    #[serde(default)]
+    pub since_secs: Option<u64>,
+    /// Maximum number of sessions (default 50, newest first).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Also sessions this Wardex already manages.
+    #[serde(default)]
+    pub include_managed: bool,
+}
+
+/// Inlined in the schema: some MCP clients do not resolve `$ref`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum ToolsArg {
+    None,
+    Summary,
+    Full,
+}
+
+impl From<ToolsArg> for ToolDetail {
+    fn from(t: ToolsArg) -> Self {
+        match t {
+            ToolsArg::None => ToolDetail::None,
+            ToolsArg::Summary => ToolDetail::Summary,
+            ToolsArg::Full => ToolDetail::Full,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HistoryParams {
+    /// A Wardex session id, or an external session id: `claude:<uuid>`,
+    /// `codex:<uuid>`, a full uuid or a unique prefix of 8+ characters.
+    pub id: String,
+    #[serde(default)]
+    pub driver: Option<DriverArg>,
+    /// Turns (prompts) per page. Default: 20.
+    #[serde(default)]
+    pub turns: Option<usize>,
+    /// `next_before` of the previous page, for older turns.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Tool calls: none, summary (default) or full (input and output).
+    #[serde(default)]
+    pub tools: Option<ToolsArg>,
+    /// Byte budget for the page's items. Default: 65536.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct OverviewParams {
     /// Latest events per live session. Default: 3.
     #[serde(default)]
@@ -213,18 +281,30 @@ pub struct WardexMcp {
 impl WardexMcp {
     /// Tools served inside the daemon.
     pub fn new(manager: Manager) -> Self {
+        let external = manager.config().external.over_mcp();
         Self {
             backend: Backend::Local(manager),
-            tool_router: Self::tool_router(),
+            tool_router: Self::router(external),
         }
     }
 
     /// Tools that forward to a running daemon over its Unix socket.
-    pub fn remote(client: Client) -> Self {
+    /// `external`: the daemon exposes external sessions over MCP.
+    pub fn remote(client: Client, external: bool) -> Self {
         Self {
             backend: Backend::Socket(client),
-            tool_router: Self::tool_router(),
+            tool_router: Self::router(external),
         }
+    }
+
+    fn router(external: bool) -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        if !external {
+            for name in EXTERNAL_TOOLS {
+                router.remove_route(name);
+            }
+        }
+        router
     }
 
     async fn call(&self, req: Request) -> CallToolResult {
@@ -244,7 +324,12 @@ impl WardexMcp {
 /// Serve MCP on stdin/stdout until the client disconnects, forwarding every
 /// tool call to the daemon behind `client`.
 pub async fn serve_stdio(client: Client) -> std::io::Result<()> {
-    let service = WardexMcp::remote(client)
+    // The daemon decides; it also refuses the calls if this is stale.
+    let external = match client.request(&Request::Ping).await {
+        Ok(resp) => resp.data.is_some_and(|d| d["external_mcp"] == true),
+        Err(_) => false,
+    };
+    let service = WardexMcp::remote(client, external)
         .serve(rmcp::transport::stdio())
         .await
         .map_err(std::io::Error::other)?;
@@ -425,6 +510,47 @@ impl WardexMcp {
     #[tool(description = "Stop a session's process. It can be resumed later.")]
     async fn stop(&self, Parameters(p): Parameters<IdParams>) -> CallToolResult {
         self.call(Request::Stop { id: p.id }).await
+    }
+
+    #[tool(
+        description = "Sessions started outside Wardex (in a terminal or IDE) found in the \
+                       Claude Code and Codex stores, newest first, with liveness (`live` = \
+                       open in a process right now). Filter by `cwd` (`under` for subdirectories).",
+        annotations(read_only_hint = true)
+    )]
+    async fn external_list(&self, Parameters(p): Parameters<ExternalListParams>) -> CallToolResult {
+        self.call(Request::ExternalList {
+            driver: p.driver.map(Into::into),
+            cwd: p.cwd.map(PathBuf::from),
+            under: p.under,
+            since_secs: p.since_secs,
+            limit: p.limit,
+            include_managed: p.include_managed,
+            archived: false,
+            include_subagents: false,
+            via_mcp: true,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "A session's native conversation (prompts, messages, tool calls, \
+                       compactions), read from the CLI's transcript: the last `turns` turns; \
+                       page back with `before` = `next_before`. Secrets are masked on a best-effort \
+                       basis. Works for Wardex session ids and external session ids.",
+        annotations(read_only_hint = true)
+    )]
+    async fn history(&self, Parameters(p): Parameters<HistoryParams>) -> CallToolResult {
+        self.call(Request::History {
+            id: p.id,
+            driver: p.driver.map(Into::into),
+            turns: p.turns,
+            before: p.before,
+            tools: p.tools.map(Into::into),
+            max_bytes: p.max_bytes,
+            via_mcp: true,
+        })
+        .await
     }
 
     #[tool(
