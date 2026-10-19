@@ -184,6 +184,27 @@ fn legacy_rollouts_fall_back_to_response_items() {
 }
 
 #[test]
+fn odd_file_names_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let day = dir.path().join("sessions/2026/10/03");
+    std::fs::create_dir_all(&day).unwrap();
+    let valid = store().find(A).unwrap().remove(0).path;
+    for name in [
+        format!("rollout-é{}.jsonl", "a".repeat(35)),
+        format!("rollout-é{}.jsonl.zst", "a".repeat(35)),
+        "rollout-x.jsonl".to_string(),
+        "rollout-.jsonl".to_string(),
+    ] {
+        std::fs::copy(&valid, day.join(name)).unwrap();
+    }
+    std::fs::copy(&valid, day.join(valid.file_name().unwrap())).unwrap();
+    let store = CodexStore::new(dir.path().to_path_buf(), 16 * 1024 * 1024);
+    let found = store.discover(&ExternalFilter::default()).unwrap();
+    assert_eq!(ids(&found), [A]);
+    assert_eq!(store.find("").unwrap().len(), 1);
+}
+
+#[test]
 fn compressed_rollouts() {
     let dir = tempfile::tempdir().unwrap();
     let day = dir.path().join("sessions/2026/10/02");

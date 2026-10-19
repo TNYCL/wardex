@@ -45,10 +45,11 @@ fn rollout_id(path: &Path) -> Option<(String, bool)> {
         Some(stem) => (stem, true),
         None => (name.strip_suffix(".jsonl")?, false),
     };
-    if !stem.starts_with("rollout-") || stem.len() < 36 {
+    if !stem.starts_with("rollout-") {
         return None;
     }
-    let id = &stem[stem.len() - 36..];
+    // `get`, not indexing: a multi-byte character at the cut must not panic.
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
     is_uuid(id).then(|| (id.to_string(), compressed))
 }
 
@@ -511,5 +512,28 @@ fn legacy_items(history: &mut History, lines: &[(usize, Value)]) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollout_ids_from_odd_file_names_never_panic() {
+        let id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a01";
+        let ok = format!("rollout-2026-10-01T10-00-00-{id}.jsonl");
+        assert_eq!(rollout_id(Path::new(&ok)), Some((id.to_string(), false)));
+        let zst = format!("rollout-x-{id}.jsonl.zst");
+        assert_eq!(rollout_id(Path::new(&zst)), Some((id.to_string(), true)));
+        // The 36-byte cut lands inside the two-byte `é`.
+        let multibyte = format!("rollout-é{}.jsonl", "a".repeat(35));
+        assert_eq!(rollout_id(Path::new(&multibyte)), None);
+        let multibyte = format!("rollout-{}é{}.jsonl", "b".repeat(10), "c".repeat(35));
+        assert_eq!(rollout_id(Path::new(&multibyte)), None);
+        // Shorter than a uuid.
+        assert_eq!(rollout_id(Path::new("rollout-x.jsonl")), None);
+        assert_eq!(rollout_id(Path::new("rollout-.jsonl.zst")), None);
+        assert_eq!(rollout_id(Path::new(&format!("other-{id}.jsonl"))), None);
     }
 }
