@@ -338,3 +338,197 @@ async fn partial_drain_error_includes_closed_sessions_and_operator_steps() {
     }
     h.manager.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn cleanup_failed_drain_recommends_resume_or_force_in_error_and_data() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new().await;
+    let blocked = h.run("hello", SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+    let mut record = h
+        .manager
+        .store()
+        .get_session(&blocked)
+        .await
+        .unwrap()
+        .unwrap();
+    record.unit = Some("unverifiable.scope".into());
+    h.manager.store().update_session(&record).await.unwrap();
+    let controller = h.dir.path().join("scope-controller.sh");
+    std::fs::write(&controller, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manager = Manager::new(
+        Config::default(),
+        h.manager.store().clone(),
+        vec![],
+        Launcher::with_scope_command(controller),
+    );
+    assert!(manager.resume(&blocked, None).await.is_err());
+    let error = manager
+        .drain(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap_err();
+    let response = Response::from(error);
+    let text = response.error.unwrap();
+    assert!(text.contains("resume <id>"), "{text}");
+    assert!(text.contains("--force"), "{text}");
+    assert!(!text.contains("stop <id>"), "{text}");
+    let data = response.data.unwrap();
+    assert_eq!(data["blocked_sessions"], serde_json::json!([blocked]));
+    assert_eq!(data["cleanup_failed"], serde_json::json!([blocked]));
+    let steps = data["next_steps"].to_string();
+    assert!(steps.contains("resume <id>"), "{steps}");
+    assert!(steps.contains("--force"), "{steps}");
+    assert!(!steps.contains("stop <id>"), "{steps}");
+}
+
+#[tokio::test]
+async fn daemon_starts_with_failed_scope_and_keeps_quarantine_across_restarts() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use wardex_core::config::Env;
+    use wardex_server::daemon::{self, Exit, Source};
+
+    let h = Harness::new().await;
+    let blocked = h.run("hello", SessionState::Idle).await;
+    let healthy = h.run("hello", SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+    for (id, unit) in [(&blocked, "unverifiable.scope"), (&healthy, "empty.scope")] {
+        let mut record = h.manager.store().get_session(id).await.unwrap().unwrap();
+        record.state = SessionState::Idle;
+        record.unit = Some(unit.into());
+        h.manager.store().update_session(&record).await.unwrap();
+    }
+    h.manager.store().close().await.unwrap();
+    h.pool.close().await;
+    let controller = h.dir.path().join("scope-controller.sh");
+    std::fs::write(
+        &controller,
+        r##"#!/bin/sh
+cd "$(dirname "$0")"
+if [ "$2" = show ]; then
+    if [ "$4" = unverifiable.scope ] && [ ! -e repaired ]; then exit 1; fi
+    printf 'LoadState=loaded\nActiveState=inactive\nTasksCurrent=0\n'
+fi
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = Config::default();
+    config.daemon.database = h.manager.store().path().to_string_lossy().into_owned();
+    config.daemon.socket = h
+        .dir
+        .path()
+        .join("daemon.sock")
+        .to_string_lossy()
+        .into_owned();
+    config.daemon.env_file = h
+        .dir
+        .path()
+        .join("unused.env")
+        .to_string_lossy()
+        .into_owned();
+    config.sessions.auto_resume_orphaned = true;
+    config.sessions.stop_grace_secs = 0;
+    config.auth.token_env = "WARDEX_LIFECYCLE_TEST_TOKEN".into();
+    for attempt in 0..2 {
+        if attempt == 1 {
+            // Repair alone must not enable automatic resume on a new daemon.
+            std::fs::write(h.dir.path().join("repaired"), "").unwrap();
+        }
+        let received = h.received.clone();
+        let daemon = tokio::spawn(daemon::run_with(
+            Source {
+                config_path: Some(h.dir.path().join("unused.toml")),
+                socket: None,
+            },
+            config.clone(),
+            Env::with(BTreeMap::from([(
+                config.auth.token_env.clone(),
+                String::new(),
+            )])),
+            move |_| vec![Arc::new(Agent(received.clone())) as Arc<dyn Driver>],
+            Launcher::with_scope_command(controller.clone()),
+        ));
+        let client = Client::new(config.socket_path());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(!daemon.is_finished(), "failed scope stopped daemon startup");
+                if let Ok(response) = client.request(&Request::Ping).await {
+                    assert!(response.ok, "{response:?}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = client
+            .request(&Request::Status {
+                id: blocked.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(status.ok, "{status:?}");
+        let status = status.data.unwrap();
+        assert_eq!(status["cleanup_failed"], true);
+        assert_eq!(status["unit"], "unverifiable.scope");
+        assert_eq!(status["live"], false);
+        assert!(
+            status["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("wardex resume")
+        );
+        let status = client
+            .request(&Request::Status {
+                id: healthy.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(status.data.unwrap()["live"], true);
+        let received = h.received.lock().unwrap().clone();
+        let send = client
+            .request(&Request::Send {
+                id: blocked.to_string(),
+                message: "implicit resume must stay blocked".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!send.ok, "send bypassed the cleanup quarantine");
+        assert!(send.error.unwrap().contains("wardex resume <id>"));
+        assert_eq!(*h.received.lock().unwrap(), received);
+        let resume = client
+            .request(&Request::Resume {
+                id: blocked.to_string(),
+                message: None,
+            })
+            .await
+            .unwrap();
+        if attempt == 0 {
+            assert!(!resume.ok, "an unverifiable scope allowed a new spawn");
+            assert!(resume.error.unwrap().contains("cleanup_failed"));
+        } else {
+            assert!(resume.ok, "{resume:?}");
+            assert_eq!(resume.data.unwrap()["cleanup_failed"], false);
+        }
+        let response = client
+            .request(&Request::Shutdown {
+                drain_secs: None,
+                restart: false,
+                force: false,
+            })
+            .await
+            .unwrap();
+        assert!(response.ok, "{response:?}");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), daemon)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Exit::Stopped
+        );
+    }
+}

@@ -38,11 +38,12 @@ pub enum ManagerError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
-    #[error("{message}: {}; no turns were interrupted. {}", join_ids(.sessions), DRAIN_NEXT_STEPS.join(" "))]
+    #[error("{message}: {}; no turns were interrupted. {}", join_ids(.sessions), drain_next_steps(.sessions, .cleanup_failed).join(" "))]
     DrainBlocked {
         message: String,
         sessions: Vec<SessionId>,
         closed_sessions: Vec<SessionId>,
+        cleanup_failed: Vec<SessionId>,
     },
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -82,6 +83,22 @@ pub const DRAIN_NEXT_STEPS: [&str; 3] = [
     "2) Retry wardex daemon restart --drain N.",
     "3) Or use wardex daemon restart --drain N --force to interrupt them explicitly.",
 ];
+
+pub fn drain_next_steps(sessions: &[SessionId], cleanup_failed: &[SessionId]) -> [String; 3] {
+    let mut steps = DRAIN_NEXT_STEPS.map(String::from);
+    if !cleanup_failed.is_empty() {
+        steps[0] = format!(
+            "1) Use wardex resume <id> to retry scope cleanup for cleanup_failed sessions: {}.",
+            join_ids(cleanup_failed)
+        );
+        if sessions.iter().any(|id| !cleanup_failed.contains(id)) {
+            steps[0].push_str(
+                " Use wardex answer <id> or wardex stop <id> only for the other blocked sessions.",
+            );
+        }
+    }
+    steps
+}
 
 fn join_ids(ids: &[SessionId]) -> String {
     ids.iter()
@@ -200,6 +217,8 @@ pub struct EndedSession {
     /// Truncated; `summary` has the full text.
     pub last_result: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub cleanup_failed: bool,
 }
 
 /// One-line form of an event.
@@ -296,6 +315,9 @@ struct Live {
     stop_requested: bool,
     idle_exit: bool,
     drain_exit: bool,
+    /// EOF cannot be undone when a drain is refused. Keep this separate
+    /// from the exit classification flags, which the reservation resets.
+    stdin_closed: bool,
     interrupt_requested: bool,
     cpu_sample: Option<(u64, i64)>,
     cpu_percent: Option<f64>,
@@ -337,7 +359,10 @@ impl Drop for DrainReservation<'_> {
             .unwrap_or_else(|e| e.into_inner())
             .values_mut()
         {
-            entry.drain_exit = false;
+            if entry.drain_exit {
+                entry.drain_exit = false;
+                entry.idle_exit = false;
+            }
         }
         self.0.draining.store(false, Ordering::SeqCst);
     }
@@ -611,10 +636,7 @@ impl Manager {
         let stale = self.inner.store.sessions_in_states(&LIVE_STATES).await?;
         let mut ids = Vec::new();
         for mut record in stale {
-            if let Some(unit) = &record.unit {
-                self.clean_scope(&record.id, unit).await?;
-                record.unit = None;
-            }
+            let cleanup_error = self.clean_record_scope(&mut record).await.err();
             record.last_seq = record
                 .last_seq
                 .max(self.inner.store.max_seq(&record.id).await?);
@@ -623,14 +645,13 @@ impl Manager {
             record.state = SessionState::Orphaned;
             record.ended_ms = Some(now_ms());
             record.pid = None;
-            record.last_error =
-                Some("orphaned: the daemon stopped while the session was live".into());
-            self.emit_record(
-                &mut record,
-                EventKind::Error {
-                    message: "orphaned: the daemon stopped while the session was live".into(),
-                },
-            )?;
+            let message = cleanup_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| {
+                    "orphaned: the daemon stopped while the session was live".into()
+                });
+            record.last_error = Some(message.clone());
+            self.emit_record(&mut record, EventKind::Error { message })?;
             self.emit_record(
                 &mut record,
                 EventKind::Ended {
@@ -644,9 +665,26 @@ impl Manager {
             if ids.contains(&record.id) {
                 continue;
             }
-            if let Some(unit) = &record.unit {
-                self.clean_scope(&record.id, unit).await?;
-                record.unit = None;
+            // A previous failure requires an explicit operator retry, even
+            // if the scope happens to become available on this daemon start.
+            if record.cleanup_failed {
+                let message = record.last_error.clone().unwrap_or_else(|| format!(
+                    "cleanup_failed for session {}; use wardex resume <id> to retry scope cleanup",
+                    record.id
+                ));
+                self.inner
+                    .cleanup_failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(record.id.clone(), message);
+                self.cache(&record);
+                tracing::warn!(session = %record.id, "cleanup_failed session requires explicit resume; continuing recovery");
+                continue;
+            }
+            if record.unit.is_some() {
+                if let Err(error) = self.clean_record_scope(&mut record).await {
+                    tracing::warn!(session = %record.id, %error, "scope cleanup deferred; continuing recovery");
+                }
                 self.inner.store.update_session(&record).await?;
                 self.cache(&record);
             }
@@ -764,6 +802,7 @@ impl Manager {
             spawn_count: 0,
             resume_pending: false,
             resume_with_prompt: false,
+            cleanup_failed: false,
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
@@ -842,6 +881,7 @@ impl Manager {
             stop_requested: false,
             idle_exit: false,
             drain_exit: false,
+            stdin_closed: false,
             interrupt_requested: false,
             cpu_sample: None,
             cpu_percent: None,
@@ -888,7 +928,7 @@ impl Manager {
         let entry = live
             .get_mut(id)
             .ok_or_else(|| ManagerError::Conflict(format!("session {id} is not live")))?;
-        if entry.stop_requested || entry.idle_exit || entry.drain_exit {
+        if entry.stop_requested || entry.idle_exit || entry.drain_exit || entry.stdin_closed {
             return Err(ManagerError::Conflict(format!(
                 "session {id} is shutting down; retry after it exits"
             )));
@@ -1088,12 +1128,43 @@ impl Manager {
             }
             Err(error) => {
                 let message = format!(
-                    "scope cleanup failed for session {id}: {error}; stop the old scope before resuming"
+                    "cleanup_failed for session {id}: {error}; inspect the user systemd manager and old scope, then use wardex resume <id> to retry cleanup; no new process was started"
                 );
                 failed.insert(id.clone(), message.clone());
+                tracing::warn!(session = %id, %error, "scope cleanup failed; automatic resume is blocked");
                 Err(ManagerError::Conflict(message))
             }
         }
+    }
+
+    /// Update the snapshot even on failure so callers can persist the
+    /// quarantine without losing the unit needed for an explicit retry.
+    async fn clean_record_scope(&self, record: &mut SessionRecord) -> Result<()> {
+        let Some(unit) = &record.unit else {
+            if record.cleanup_failed {
+                return Err(ManagerError::Conflict(format!(
+                    "cleanup_failed for session {} has no recorded scope; inspect its stored unit before resuming",
+                    record.id
+                )));
+            }
+            return Ok(());
+        };
+        let result = self.clean_scope(&record.id, unit).await;
+        record.updated_ms = now_ms();
+        match &result {
+            Ok(()) => {
+                record.unit = None;
+                if record.cleanup_failed {
+                    record.last_error = None;
+                }
+                record.cleanup_failed = false;
+            }
+            Err(error) => {
+                record.cleanup_failed = true;
+                record.last_error = Some(error.to_string());
+            }
+        }
+        result
     }
 
     async fn on_exit(
@@ -1168,8 +1239,10 @@ impl Manager {
             if let Some(error) = &cleanup_error {
                 record.state = SessionState::Orphaned;
                 record.resume_pending = true;
+                record.cleanup_failed = true;
                 record.last_error = Some(error.to_string());
             } else {
+                record.cleanup_failed = false;
                 record.unit = None;
             }
             let ended_state = record.state;
@@ -1378,6 +1451,7 @@ impl Manager {
                 last_seq: r.last_seq,
                 last_result: r.last_result.map(|t| truncate(&t, OVERVIEW_TEXT_LIMIT)),
                 last_error: r.last_error,
+                cleanup_failed: r.cleanup_failed,
             })
             .collect();
         Ok(Overview {
@@ -1551,7 +1625,7 @@ impl Manager {
             let entry = live
                 .get_mut(id)
                 .ok_or_else(|| ManagerError::Conflict(format!("session {id} is not live")))?;
-            if entry.stop_requested || entry.idle_exit || entry.drain_exit {
+            if entry.stop_requested || entry.idle_exit || entry.drain_exit || entry.stdin_closed {
                 return Err(ManagerError::Conflict(format!(
                     "session {id} is shutting down"
                 )));
@@ -1613,6 +1687,11 @@ impl Manager {
             self.finish_action().await;
             Ok(false)
         } else {
+            if self.record(id).await?.cleanup_failed {
+                return Err(ManagerError::Conflict(format!(
+                    "cleanup_failed for session {id}; use wardex resume <id> explicitly to retry scope cleanup before sending; no message was sent"
+                )));
+            }
             self.resume(id, Some(text)).await?;
             Ok(true)
         }
@@ -1624,8 +1703,17 @@ impl Manager {
         self.inner.store.check_admission(Some(id))?;
         self.inner.store.flush_session(id).await?;
         let mut record = self.record(id).await?;
-        if let Some(unit) = &record.unit {
-            self.clean_scope(id, unit).await?;
+        if record.unit.is_some() || record.cleanup_failed {
+            let cleanup = self.clean_record_scope(&mut record).await;
+            if cleanup.is_err() {
+                record.state = SessionState::Orphaned;
+                record.resume_pending = true;
+                record.pid = None;
+                record.ended_ms.get_or_insert_with(now_ms);
+            }
+            self.inner.store.update_session(&record).await?;
+            self.cache(&record);
+            cleanup?;
         }
         let resume_id = record.driver_session_id.clone().ok_or_else(|| {
             ManagerError::Conflict(format!(
@@ -1701,6 +1789,9 @@ impl Manager {
         let pending = self.inner.store.pending_resumes().await?;
         let mut resumed = Vec::new();
         for mut record in pending {
+            if record.cleanup_failed {
+                continue;
+            }
             let enabled = self.inner.config.sessions.auto_resume_orphaned;
             if !enabled || record.driver_session_id.is_none() {
                 record.resume_pending = false;
@@ -1717,6 +1808,10 @@ impl Manager {
                 Err(e @ ManagerError::Store(_)) => return Err(e),
                 Err(e) => {
                     tracing::error!(session = %record.id, error = %e, "automatic resume failed");
+                    record = self.record(&record.id).await?;
+                    if record.cleanup_failed {
+                        continue;
+                    }
                     record.resume_pending = false;
                     self.inner.store.update_session(&record).await?;
                     self.cache(&record);
@@ -1754,6 +1849,32 @@ impl Manager {
         self.live().keys().cloned().collect()
     }
 
+    fn drain_blocked(
+        &self,
+        message: &str,
+        mut sessions: Vec<SessionId>,
+        closed_sessions: Vec<SessionId>,
+    ) -> ManagerError {
+        let mut cleanup_failed: Vec<_> = self
+            .inner
+            .cleanup_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        cleanup_failed.sort();
+        sessions.extend(cleanup_failed.iter().cloned());
+        sessions.sort();
+        sessions.dedup();
+        ManagerError::DrainBlocked {
+            message: message.into(),
+            sessions,
+            closed_sessions,
+            cleanup_failed,
+        }
+    }
+
     /// Default drain preserves live turns/questions on timeout. Once the
     /// leader exits, its scope must also be empty before drain succeeds.
     pub async fn drain(&self, timeout: Duration, grace: Duration) -> Result<DrainReport> {
@@ -1789,13 +1910,26 @@ impl Manager {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ManagerError::DrainBlocked {
-                    message: "drain timed out waiting for starts, turns or answers".into(),
-                    sessions: busy,
-                    closed_sessions: Vec::new(),
-                });
+                return Err(self.drain_blocked(
+                    "drain timed out waiting for starts, turns or answers",
+                    busy,
+                    Vec::new(),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !self
+            .inner
+            .cleanup_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return Err(self.drain_blocked(
+                "drain refused: cleanup_failed scopes remain unverified",
+                Vec::new(),
+                Vec::new(),
+            ));
         }
         // Never close a safely resumable idle leader before its id/state is
         // durable. --force is the explicit escape if SQLite is unavailable.
@@ -1814,15 +1948,16 @@ impl Manager {
                 .collect();
             if !blocked.is_empty() {
                 blocked.sort();
-                return Err(ManagerError::DrainBlocked {
-                    message: "a session has no resume id or is no longer idle; use wardex stop <id> if it never reports a resume id".into(),
-                    sessions: blocked, closed_sessions: Vec::new(),
-                });
+                return Err(self.drain_blocked(
+                    "a session has no resume id or is no longer idle; use wardex stop <id> if it never reports a resume id",
+                    blocked, Vec::new(),
+                ));
             }
             let ids: Vec<_> = live.keys().cloned().collect();
             for entry in live.values_mut() {
                 entry.drain_exit = true;
                 entry.idle_exit = true;
+                entry.stdin_closed = true;
                 let _ = entry.commands.send(DriverCommand::Drain);
             }
             ids
@@ -1850,10 +1985,10 @@ impl Manager {
                     .cloned()
                     .collect();
                 closed_sessions.sort();
-                return Err(ManagerError::DrainBlocked {
-                    message: "drain refused: a leader did not exit after EOF or its descendants could not be reaped; stdin is closed for these sessions".into(),
-                    sessions: remaining, closed_sessions,
-                });
+                return Err(self.drain_blocked(
+                    "drain refused: a leader with closed stdin has not exited or cleanup_failed scopes remain unverified",
+                    remaining, closed_sessions,
+                ));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -2182,6 +2317,86 @@ pub fn absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_drain_resets_both_exit_flags_without_clearing_idle_shutdown() {
+        struct PassiveDriver;
+        impl Driver for PassiveDriver {
+            fn kind(&self) -> DriverKind {
+                DriverKind::Claude
+            }
+            fn spawn(
+                &self,
+                _: SpawnSpec,
+                _: &Launcher,
+            ) -> std::result::Result<crate::driver::DriverHandle, DriverError> {
+                let (commands, mut rx) = mpsc::unbounded_channel();
+                let (tx, events) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while rx.recv().await.is_some() {}
+                    drop(tx);
+                });
+                Ok(crate::driver::DriverHandle {
+                    pid: None,
+                    unit: None,
+                    commands,
+                    events,
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        let manager = Manager::new(
+            Config::default(),
+            store,
+            vec![Arc::new(PassiveDriver)],
+            Launcher::direct(),
+        );
+        let spec = RunSpec {
+            driver: Some(DriverKind::Claude),
+            prompt: "hello".into(),
+            cwd: dir.path().into(),
+            ..Default::default()
+        };
+        let drained = manager.run(spec.clone()).await.unwrap().session.id;
+        let idle = manager.run(spec).await.unwrap().session.id;
+        {
+            let mut live = manager.live();
+            let entry = live.get_mut(&drained).unwrap();
+            entry.drain_exit = true;
+            entry.idle_exit = true;
+            entry.stdin_closed = true;
+            live.get_mut(&idle).unwrap().idle_exit = true;
+        }
+        manager.inner.draining.store(true, Ordering::SeqCst);
+        drop(DrainReservation(&manager.inner));
+        let live = manager.live();
+        assert!(!live[&drained].drain_exit);
+        assert!(
+            !live[&drained].idle_exit,
+            "refused drain left idle_exit set"
+        );
+        assert!(
+            live[&drained].stdin_closed,
+            "closed stdin became writable after a refused drain"
+        );
+        assert!(
+            live[&idle].idle_exit,
+            "drain cleared an independent idle shutdown"
+        );
+        assert!(!manager.inner.draining.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mixed_drain_blockers_get_distinct_cleanup_and_live_instructions() {
+        let cleanup = SessionId("cleanup".into());
+        let live = SessionId("live".into());
+        let steps = drain_next_steps(&[cleanup.clone(), live], &[cleanup]);
+        assert!(steps[0].contains("resume <id>"));
+        assert!(steps[0].contains("cleanup_failed sessions: cleanup"));
+        assert!(steps[0].contains("stop <id> only for the other blocked sessions"));
+        assert!(steps[2].contains("--force"));
+    }
 
     #[tokio::test]
     async fn drain_waits_for_existing_start_reservations_until_deadline() {

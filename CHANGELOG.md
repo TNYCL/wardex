@@ -81,6 +81,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Isolate unverifiable old scopes during recovery so one session cannot
+  prevent daemon startup. Persist `cleanup_failed`, keep its scope recorded,
+  skip automatic/implicit resume and expose the warning in status/list/overview.
+  Explicit `resume` retries cleanup before allowing a new process; drain
+  errors recommend `resume` or `--force` for these orphans.
+- Reset both drain exit flags after a refused/cancelled drain, retaining the
+  closed-stdin guard and any independent idle shutdown.
 - Retain accepted SQLite writes in a bounded queue and retry with exponential
   background backoff. Split constraint failures to quarantine the offending
   session while other sessions continue; clear errors after recovery.

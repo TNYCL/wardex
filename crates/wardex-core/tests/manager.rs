@@ -687,6 +687,14 @@ async fn partial_drain_reports_closed_sessions_and_resets_remaining_flags() {
     for step in ["answer <id>", "stop <id>", "restart --drain N", "--force"] {
         assert!(text.contains(step), "{text}");
     }
+    let received = h.received.lock().unwrap().clone();
+    assert!(
+        h.manager
+            .send(&stubborn, "cannot write after EOF".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(*h.received.lock().unwrap(), received);
     // A late, natural exit must become Done, proving that the failed drain
     // no longer leaves drain_exit set and cannot orphan-mark this process.
     std::fs::write(h.dir.path().join("release-eof"), "").unwrap();
@@ -959,7 +967,8 @@ async fn unverifiable_old_scope_prevents_a_new_spawn() {
     h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
     let mut record = h.manager.store().get_session(&id).await.unwrap().unwrap();
     record.unit = Some("unverifiable.scope".into());
-    record.resume_pending = true;
+    record.state = SessionState::Stopped;
+    record.resume_pending = false;
     h.manager.store().update_session(&record).await.unwrap();
     h.manager.store().close().await.unwrap();
     let controller = h.dir.path().join("unavailable-controller.sh");
@@ -975,9 +984,175 @@ async fn unverifiable_old_scope_prevents_a_new_spawn() {
         Launcher::with_scope_command(controller),
     );
     let error = manager.resume(&id, None).await.unwrap_err();
-    assert!(error.to_string().contains("stop the old scope"));
+    assert!(error.to_string().contains("cleanup_failed"));
+    assert!(error.to_string().contains("wardex resume <id>"));
     assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
     assert!(manager.live_ids().is_empty());
+    assert!(manager.auto_resume().await.unwrap().is_empty());
+    let record = manager.store().get_session(&id).await.unwrap().unwrap();
+    assert_eq!(record.state, SessionState::Orphaned);
+    assert!(record.resume_pending);
+    assert!(record.cleanup_failed);
+    assert_eq!(record.unit.as_deref(), Some("unverifiable.scope"));
+}
+
+async fn recover_with_unverifiable_scope(was_live: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = harness().await;
+    let blocked = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let healthy = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    for id in [&blocked, &healthy] {
+        wait_state(&h.manager, id, SessionState::Idle).await;
+    }
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+    for (id, unit) in [(&blocked, "unverifiable.scope"), (&healthy, "empty.scope")] {
+        let mut record = h.manager.store().get_session(id).await.unwrap().unwrap();
+        record.unit = Some(unit.into());
+        record.resume_pending = true;
+        if was_live {
+            record.state = SessionState::Idle;
+        }
+        h.manager.store().update_session(&record).await.unwrap();
+    }
+    h.manager.store().close().await.unwrap();
+    let controller = h.dir.path().join("scope-controller.sh");
+    std::fs::write(
+        &controller,
+        r##"#!/bin/sh
+cd "$(dirname "$0")"
+if [ "$2" = show ]; then
+    if [ "$4" = unverifiable.scope ] && [ ! -e repaired ]; then exit 1; fi
+    printf 'LoadState=loaded\nActiveState=inactive\nTasksCurrent=0\n'
+fi
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    config.sessions.auto_resume_orphaned = true;
+    let manager = Manager::new(
+        config,
+        Store::open(h.manager.store().path()).await.unwrap(),
+        vec![Arc::new(FakeDriver {
+            spawns: h.spawns.clone(),
+            received: h.received.clone(),
+        })],
+        Launcher::with_scope_command(controller),
+    );
+    let recovery = manager.recover().await;
+    assert!(
+        recovery.is_ok(),
+        "one failed scope prevented startup: {recovery:?}"
+    );
+    let recovered = recovery.unwrap();
+    assert_eq!(recovered.len(), if was_live { 2 } else { 0 });
+    let stored = manager
+        .store()
+        .get_session(&blocked)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, SessionState::Orphaned);
+    assert_eq!(stored.unit.as_deref(), Some("unverifiable.scope"));
+    assert_eq!(
+        serde_json::to_value(&stored).unwrap()["cleanup_failed"],
+        true
+    );
+    assert!(
+        stored
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("cleanup_failed")
+    );
+    assert_eq!(manager.auto_resume().await.unwrap(), vec![healthy.clone()]);
+    wait_state(&manager, &healthy, SessionState::Idle).await;
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
+    let status = manager.status(&blocked).await.unwrap();
+    assert!(!status.live);
+    assert_eq!(
+        serde_json::to_value(status).unwrap()["cleanup_failed"],
+        true
+    );
+    let listed = manager
+        .list(true)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.session.id == blocked)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(listed).unwrap()["cleanup_failed"],
+        true
+    );
+    let ended = manager
+        .overview(0)
+        .await
+        .unwrap()
+        .recently_ended
+        .into_iter()
+        .find(|entry| entry.id == blocked)
+        .unwrap();
+    assert_eq!(serde_json::to_value(ended).unwrap()["cleanup_failed"], true);
+    let error = manager
+        .resume(&blocked, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cleanup_failed"), "{error}");
+    assert!(error.contains("wardex resume"), "{error}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
+    assert!(
+        manager
+            .store()
+            .get_session(&blocked)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_pending
+    );
+
+    // Only an explicit retry after the scope becomes verifiable may spawn.
+    std::fs::write(h.dir.path().join("repaired"), "").unwrap();
+    let error = manager
+        .send(&blocked, "implicit resume must stay blocked".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("wardex resume <id>"), "{error}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
+    manager
+        .resume(&blocked, Some("hello".into()))
+        .await
+        .unwrap();
+    wait_state(&manager, &blocked, SessionState::Idle).await;
+    manager.store().flush().await.unwrap();
+    let repaired = manager
+        .store()
+        .get_session(&blocked)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&repaired).unwrap()["cleanup_failed"],
+        false
+    );
+    assert!(repaired.last_error.is_none());
+    assert!(repaired.unit.is_none());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 4);
+    manager.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn recover_isolates_live_scope_failure_and_allows_manual_cleanup_retry() {
+    recover_with_unverifiable_scope(true).await;
+}
+
+#[tokio::test]
+async fn recover_isolates_pending_scope_failure_and_allows_manual_cleanup_retry() {
+    recover_with_unverifiable_scope(false).await;
 }
 
 struct ScopedProcessDriver;

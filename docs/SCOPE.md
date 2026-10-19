@@ -142,6 +142,18 @@ transparently.
   sessions. On start, sessions whose process is gone are marked
   `error: orphaned` and can be continued with `wardex resume` (driver resume
   id). `auto_resume_orphaned` (default off) resumes them automatically.
+- Scope cleanup failure is isolated to its session, so an unavailable user
+  systemd manager, a timed-out query or an unreapable process does not prevent
+  daemon startup or recovery of other sessions. The orphan retains its old
+  `unit`, `resume_pending` and a persisted `cleanup_failed: true` marker;
+  `last_error` describes the failure. `status` warns, `list --all` labels it
+  `cleanup_failed`, and JSON status/list/overview expose the marker. Automatic
+  resume skips it, including after another daemon restart; `send` also refuses
+  its implicit resume until an explicit cleanup retry succeeds. Inspect the old
+  scope and restore access to the user systemd manager, then run
+  `wardex resume <id>`: it retries SIGTERM/SIGKILL cleanup and verifies the
+  scope is empty before clearing the marker and starting a new process.
+  A failed retry preserves the unit and marker and starts no process.
 - **Ordinary shutdown** (`daemon stop` / `restart` without `--drain`, or a
   termination signal): close session stdin, wait for the shutdown grace
   period, then force-kill remaining processes/scopes. Sessions become
@@ -154,8 +166,13 @@ transparently.
   CLI errors and JSON `blocked_sessions`; every live session and pending
   request remains available. No turns are interrupted (`interrupted_sessions`
   is empty). Errors include `closed_sessions`, `blocked_sessions` and three
-  `next_steps`: (1) `answer` or `stop <id>`, (2) retry `--drain`, (3) explicitly
-  use `--force`. A session that never reports a resume id requires `stop`.
+  `next_steps`: (1) `answer` or `stop <id>` for live blockers, or `resume <id>`
+  to retry cleanup for `cleanup_failed` orphans, (2) retry `--drain`, (3)
+  explicitly use `--force`. JSON errors also identify `cleanup_failed` session
+  ids. An orphan with failed scope cleanup cannot be stopped as a live session;
+  use `resume <id>` after repairing the cause, or explicitly `--force` to exit
+  with a warning and retain the marker for the next daemon. A session that
+  never reports a resume id requires `stop`.
   Once all sessions are idle, flush state and resume ids, close
   stdin, and wait up to `sessions.stop_grace_secs + 5` seconds for exit.
   Drain never force-kills an idle leader that refuses EOF, including after
@@ -165,8 +182,10 @@ transparently.
   recorded on an orphan awaiting resume; cleanup failure prevents a new spawn.
   If a process refuses EOF, refuse shutdown and report its id. Other sessions
   may already have closed; the remaining process has closed stdin and rejects
-  new messages. Clear its drain flag so a later natural exit is classified
-  normally. Wait for it to exit or explicitly `stop` it before retrying.
+  new messages. Clear both its `drain_exit` and `idle_exit` flags so a later
+  natural exit is classified normally, while retaining the closed-stdin
+  guard. Independent idle shutdowns keep their exit flag. Wait for it to exit
+  or explicitly `stop` it before retrying.
   Closed sessions are orphaned and can be resumed manually or through
   `auto_resume_orphaned`, without an extra continuation prompt. A successful
   JSON response lists `closed_sessions`; it is sent only after persistence

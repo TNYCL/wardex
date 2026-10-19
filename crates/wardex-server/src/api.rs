@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use wardex_core::manager::{AnswerInput, DRAIN_NEXT_STEPS, Manager, ManagerError};
+use wardex_core::manager::{AnswerInput, Manager, ManagerError, drain_next_steps};
 use wardex_core::{Event, EventKind, RunSpec};
 
 /// Default number of events `tail` shows.
@@ -177,6 +177,7 @@ impl From<ManagerError> for Response {
         if let ManagerError::DrainBlocked {
             ref sessions,
             ref closed_sessions,
+            ref cleanup_failed,
             ..
         } = e
         {
@@ -186,7 +187,8 @@ impl From<ManagerError> for Response {
                 "blocked_sessions": sessions,
                 "closed_sessions": closed_sessions,
                 "interrupted_sessions": [],
-                "next_steps": DRAIN_NEXT_STEPS,
+                "cleanup_failed": cleanup_failed,
+                "next_steps": drain_next_steps(sessions, cleanup_failed),
             }));
             response.applied = Some(!closed_sessions.is_empty());
             return response;

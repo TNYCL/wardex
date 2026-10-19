@@ -144,4 +144,8 @@ pub struct SessionRecord {
     /// Orphaned mid-turn: an automatic resume sends `sessions.resume_prompt`.
     #[serde(default)]
     pub resume_with_prompt: bool,
+    /// The old scope could not be verified empty. Only an explicit resume
+    /// may retry cleanup; automatic resume must leave this session alone.
+    #[serde(default)]
+    pub cleanup_failed: bool,
 }
