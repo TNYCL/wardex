@@ -61,6 +61,9 @@ pub enum DriverEvent {
 pub struct DriverHandle {
     pub pid: Option<u32>,
     pub unit: Option<String>,
+    /// The driver's session id when it is chosen before the process starts
+    /// (Claude `--session-id`), so it is recorded before the first event.
+    pub driver_session_id: Option<String>,
     pub commands: mpsc::UnboundedSender<DriverCommand>,
     pub events: mpsc::UnboundedReceiver<DriverEvent>,
 }

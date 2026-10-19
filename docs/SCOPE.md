@@ -39,7 +39,8 @@ Protocol details and verified behavior: [`drivers.md`](drivers.md).
 stream-json --include-partial-messages --verbose --permission-prompt-tool stdio`
 
 - `--permission-mode bypassPermissions`; model via `--model`.
-- Wardex picks the Claude session id up front with `--session-id <uuid>`.
+- Wardex picks the Claude session id up front with `--session-id <uuid>` and
+  records it before the first event.
 - Questions: with `--permission-prompt-tool stdio`, `AskUserQuestion` arrives
   as a `can_use_tool` control request and the CLI blocks until Wardex answers
   with a `control_response` (verified in M1). Without that flag the tool is not

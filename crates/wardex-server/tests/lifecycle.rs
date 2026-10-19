@@ -76,6 +76,7 @@ impl Driver for Agent {
         Ok(DriverHandle {
             pid: None,
             unit: None,
+            driver_session_id: None,
             commands,
             events,
         })

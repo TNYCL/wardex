@@ -99,6 +99,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The Claude session id Wardex chooses with `--session-id` is recorded when
+  the process starts, not only when `system/init` arrives, so a session whose
+  process dies before its first event can still be resumed or inspected.
 - Isolate unverifiable old scopes during recovery so one session cannot
   prevent daemon startup. Persist `cleanup_failed`, keep its scope recorded,
   skip automatic/implicit resume and expose the warning in status/list/overview.

@@ -202,16 +202,17 @@ fn args_for_new_resume_and_readonly() {
         slice: None,
         unit: "wardex-abcd1234-1".into(),
     };
-    let a = d.args(&spec);
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let a = d.args(&spec, &new_id);
     let joined = a.join(" ");
     assert!(joined.contains("--permission-prompt-tool stdio"));
     assert!(joined.contains("--permission-mode bypassPermissions"));
     assert!(joined.contains("--model haiku --effort low"));
     let sid = &a[a.iter().position(|x| x == "--session-id").unwrap() + 1];
-    assert!(uuid::Uuid::parse_str(sid).is_ok());
+    assert_eq!(sid, &new_id);
     spec.resume = Some("prev".into());
     spec.readonly = true;
-    let joined = d.args(&spec).join(" ");
+    let joined = d.args(&spec, &new_id).join(" ");
     assert!(joined.contains("--resume prev"));
     assert!(!joined.contains("--session-id"));
     assert!(joined.contains("--permission-mode plan"));
@@ -279,6 +280,52 @@ async fn end_to_end_question_through_a_mock_process() {
             "prompt", "started", "question", "answered", "message", "done", "ended"
         ]
     );
+}
+
+#[tokio::test]
+async fn the_chosen_session_id_is_recorded_before_the_first_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_file = dir.path().join("args");
+    // Records its arguments and never answers, like a CLI that hangs
+    // before `system/init`.
+    let script = dir.path().join("silent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile IFS= read -r _; do :; done\n",
+            args_file.display()
+        ),
+    )
+    .unwrap();
+    let m = manager_for(&script, &dir.path().join("w.db")).await;
+    let id = m
+        .run(RunSpec {
+            driver: Some(DriverKind::Claude),
+            prompt: "hello".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut args = String::new();
+    for _ in 0..200 {
+        args = std::fs::read_to_string(&args_file).unwrap_or_default();
+        if args.contains("--session-id") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let args: Vec<&str> = args.lines().collect();
+    let sid = args[args.iter().position(|a| *a == "--session-id").unwrap() + 1];
+    let status = m.status(&id).await.unwrap();
+    assert_eq!(status.session.state, SessionState::Running);
+    assert_eq!(status.session.driver_session_id.as_deref(), Some(sid));
+    m.stop(&id).await.unwrap();
+    wait_state(&m, &id, SessionState::Stopped).await;
+    let stored = m.store().get_session(&id).await.unwrap().unwrap();
+    assert_eq!(stored.driver_session_id.as_deref(), Some(sid));
 }
 
 #[tokio::test]

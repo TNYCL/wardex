@@ -43,7 +43,9 @@ impl ClaudeDriver {
         }
     }
 
-    pub fn args(&self, spec: &SpawnSpec) -> Vec<String> {
+    /// Arguments for `spec`. A new session gets `new_id` as its
+    /// `--session-id`.
+    pub fn args(&self, spec: &SpawnSpec, new_id: &str) -> Vec<String> {
         let mut a: Vec<String> = self.prefix_args.clone();
         a.extend(
             [
@@ -75,7 +77,7 @@ impl ClaudeDriver {
             }
             None => {
                 a.push("--session-id".into());
-                a.push(uuid::Uuid::new_v4().to_string());
+                a.push(new_id.to_string());
             }
         }
         if let Some(m) = &spec.model {
@@ -97,7 +99,8 @@ impl Driver for ClaudeDriver {
     }
 
     fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError> {
-        let args = self.args(&spec);
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let args = self.args(&spec, &new_id);
         let req = LaunchRequest {
             unit: &spec.unit,
             slice: spec.slice.as_deref(),
@@ -105,7 +108,11 @@ impl Driver for ClaudeDriver {
             args: &args,
             cwd: &spec.cwd,
         };
-        spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))
+        let mut handle = spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))?;
+        if spec.resume.is_none() {
+            handle.driver_session_id = Some(new_id);
+        }
+        Ok(handle)
     }
 }
 

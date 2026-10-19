@@ -58,7 +58,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   `AskUserQuestion` is not in the tool list at all in `-p` mode
   (`--permission-prompts host`, `--tools` and `--allowedTools` do not add it).
 - **`--session-id <uuid>`** lets Wardex choose the Claude session id up front,
-  so the resume id is known before the first event.
+  so the resume id is known before the first event. The driver reports it in
+  its spawn handle and the manager records it at once; `system/init` later
+  confirms the same id.
 - The process stays alive between turns as long as stdin is open. Each new
   turn re-emits `system/init`. Closing stdin after a `result` ends it cleanly
   (exit 0).

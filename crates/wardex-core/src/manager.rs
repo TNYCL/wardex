@@ -915,6 +915,9 @@ impl Manager {
             unit: format!("wardex-{}-{}", record.id, record.spawn_count),
         };
         let handle = driver.spawn(spec, &self.inner.launcher)?;
+        if handle.driver_session_id.is_some() {
+            record.driver_session_id = handle.driver_session_id.clone();
+        }
         record.pid = handle.pid;
         record.unit = handle.unit.clone();
         record.state = SessionState::Starting;
@@ -2498,6 +2501,7 @@ mod tests {
                 Ok(crate::driver::DriverHandle {
                     pid: None,
                     unit: None,
+                    driver_session_id: None,
                     commands,
                     events,
                 })
