@@ -10,6 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Only what is needed to build; tests and fixtures stay in the repository.
+include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
 wardex-core.workspace = true

@@ -1,12 +1,15 @@
 [package]
 name = "wardex-drivers"
 description = "Claude Code and Codex drivers for Wardex"
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+# Only what is needed to build; tests and fixtures stay in the repository.
+include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
 wardex-core.workspace = true
