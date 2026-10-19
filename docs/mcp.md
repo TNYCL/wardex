@@ -144,6 +144,18 @@ items:
   session is `idle`: the process is alive and waits for the next message. It
   is set once the session stops, errors, or closes after
   `sessions.idle_shutdown_secs`.
+- `ended_reason` says why the process ended (also `reason` on the `ended`
+  event): `done` (the agent exited by itself), `stopped`, `idle_shutdown`
+  (idle for `sessions.idle_shutdown_secs`), `idle_evicted` (more than
+  `sessions.max_idle_live` idle sessions), `memory_pressure` (available memory
+  below `sessions.min_mem_available_mb`), `error`, `drain`, `shutdown` (daemon
+  stop or restart) or `daemon_lost` (the daemon died while it ran). It is
+  empty while the session is live and for sessions that ended before it was
+  recorded. After `idle_shutdown`, `idle_evicted` and `memory_pressure` the
+  work is unfinished: `send` continues it, and a `remove_worktree` worktree is
+  kept until the session is stopped or ends by itself.
+- `send` and `resume` fail with `conflict` if the session's working directory
+  no longer exists (for example a removed worktree); nothing is started.
 
 ### Tool output
 

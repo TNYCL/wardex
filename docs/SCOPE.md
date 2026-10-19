@@ -78,7 +78,10 @@ Session states: `starting`, `running`, `idle` (turn done, process waiting for
 the next message), `waiting_input`, and the resumable end states `done`,
 `error`, `stopped`, `orphaned`. An idle process is closed after
 `sessions.idle_shutdown_secs` (default 12 h); `send` to an ended session
-resumes it transparently.
+resumes it transparently. Each ended session records an `ended_reason`
+(`done`, `stopped`, `idle_shutdown`, `idle_evicted`, `memory_pressure`,
+`error`, `drain`, `shutdown`, `daemon_lost`), also sent as `reason` on the
+`ended` event.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.
@@ -96,7 +99,9 @@ resumes it transparently.
 
 - Default: the main checkout. `--cwd` runs directly in the given directory.
 - Optional `--worktree <name>`: a git worktree under `.worktree/<name>`,
-  optional branch name, optional cleanup on close.
+  optional branch name, optional cleanup on close (on stop or when the agent
+  exits by itself; a worktree closed for idleness or memory is kept so the
+  session can be continued).
 - `--readonly`: the driver's plan / read-only mode plus a prompt prefix as a
   fallback.
 - Concurrent sessions in the same cwd are allowed with a warning (no repo

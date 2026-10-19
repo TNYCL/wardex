@@ -16,4 +16,4 @@ pub use event::{
     Answer, DriverKind, Event, EventKind, GitState, QuestionItem, QuestionOption, StuckReason,
     ToolStatus,
 };
-pub use session::{RunSpec, SessionId, SessionRecord, SessionState};
+pub use session::{EndReason, RunSpec, SessionId, SessionRecord, SessionState};

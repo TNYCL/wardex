@@ -3,10 +3,10 @@
 use std::fmt::Write as _;
 
 use serde_json::Value;
-use wardex_core::Event;
 use wardex_core::manager::{Overview, SessionStatus, SessionSummary, SessionView};
 use wardex_core::store::QuestionRow;
 use wardex_core::time::{clock, human_duration, now_ms};
+use wardex_core::{EndReason, Event, SessionState};
 
 fn short_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
@@ -18,6 +18,14 @@ fn short_path(p: &std::path::Path) -> String {
 
 fn opt(s: &Option<String>) -> &str {
     s.as_deref().unwrap_or("-")
+}
+
+/// `done (idle_shutdown)`: the state, plus why it ended when that says more.
+fn state_with_reason(state: SessionState, reason: Option<EndReason>) -> String {
+    match reason.filter(|r| r.as_str() != state.as_str()) {
+        Some(r) => format!("{} ({})", state.as_str(), r.as_str()),
+        None => state.as_str().to_string(),
+    }
 }
 
 pub fn list(views: &[SessionView]) -> String {
@@ -70,7 +78,7 @@ pub fn status(st: &SessionStatus) -> String {
     let _ = writeln!(
         out,
         "state     {}{}",
-        s.state.as_str(),
+        state_with_reason(s.state, s.ended_reason),
         if st.live { " (live)" } else { "" }
     );
     let _ = writeln!(
@@ -297,7 +305,7 @@ pub fn overview(o: &Overview) -> String {
                 out,
                 "{} {} {} agent={} task={} {} ago: {}",
                 s.id,
-                s.state.as_str(),
+                state_with_reason(s.state, s.ended_reason),
                 s.driver.as_str(),
                 opt(&s.agent),
                 opt(&s.task),

@@ -12,7 +12,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::{DriverKind, Event, EventKind, SessionId, SessionRecord, SessionState};
+use crate::{DriverKind, EndReason, Event, EventKind, SessionId, SessionRecord, SessionState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -400,8 +400,8 @@ impl Store {
             "INSERT INTO sessions (id, driver, driver_session_id, state, agent, task, model,
                 reasoning, cwd, origin_cwd, worktree, branch, remove_worktree, readonly, slice,
                 unit, pid, created_ms, updated_ms, ended_ms, last_seq, last_result, last_error,
-                spawn_count, resume_pending, resume_with_prompt, cleanup_failed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                spawn_count, resume_pending, resume_with_prompt, cleanup_failed, ended_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id.as_str())
         .bind(s.driver.as_str())
@@ -434,6 +434,7 @@ impl Store {
         .bind(s.resume_pending)
         .bind(s.resume_with_prompt)
         .bind(s.cleanup_failed)
+        .bind(s.ended_reason.map(EndReason::as_str))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1069,7 +1070,8 @@ fn update_session_query(
     sqlx::query(
         "UPDATE sessions SET driver_session_id = ?, state = ?, model = ?, unit = ?, pid = ?,
             updated_ms = ?, ended_ms = ?, last_seq = ?, last_result = ?, last_error = ?,
-            spawn_count = ?, resume_pending = ?, resume_with_prompt = ?, cleanup_failed = ?
+            spawn_count = ?, resume_pending = ?, resume_with_prompt = ?, cleanup_failed = ?,
+            ended_reason = ?
          WHERE id = ?",
     )
     .bind(&s.driver_session_id)
@@ -1086,6 +1088,7 @@ fn update_session_query(
     .bind(s.resume_pending)
     .bind(s.resume_with_prompt)
     .bind(s.cleanup_failed)
+    .bind(s.ended_reason.map(EndReason::as_str))
     .bind(s.id.as_str())
 }
 
@@ -1131,6 +1134,10 @@ fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
         resume_pending: r.get("resume_pending"),
         resume_with_prompt: r.get("resume_with_prompt"),
         cleanup_failed: r.get("cleanup_failed"),
+        // Unknown values (from a newer binary) read as unknown, not corrupt.
+        ended_reason: r
+            .get::<Option<String>, _>("ended_reason")
+            .and_then(|v| EndReason::parse(&v)),
     })
 }
 
@@ -1186,6 +1193,7 @@ mod tests {
             resume_pending: false,
             resume_with_prompt: false,
             cleanup_failed: false,
+            ended_reason: None,
         }
     }
 
@@ -1230,6 +1238,7 @@ mod tests {
                 .unwrap();
             s.state = SessionState::Done;
             s.last_seq = 2;
+            s.ended_reason = Some(EndReason::IdleShutdown);
             store.update_session(&s).await.unwrap();
             store.close().await.unwrap();
         }
@@ -1241,6 +1250,21 @@ mod tests {
             .unwrap();
         assert_eq!(s.state, SessionState::Done);
         assert_eq!(s.last_seq, 2);
+        assert_eq!(s.ended_reason, Some(EndReason::IdleShutdown));
+        // A reason written by a newer binary reads as unknown, not corrupt.
+        sqlx::query("UPDATE sessions SET ended_reason = 'future_reason'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_session(&s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended_reason,
+            None
+        );
         let events = store.events(&s.id, 0, 100).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind.name(), "done");

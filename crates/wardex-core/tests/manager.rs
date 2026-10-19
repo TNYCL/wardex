@@ -14,8 +14,8 @@ use wardex_core::process::Launcher;
 use wardex_core::store::Store;
 use wardex_core::time::now_ms;
 use wardex_core::{
-    Answer, Config, DriverKind, EventKind, QuestionItem, RunSpec, SessionId, SessionState,
-    StuckReason, ToolStatus,
+    Answer, Config, DriverKind, EndReason, EventKind, QuestionItem, RunSpec, SessionId,
+    SessionState, StuckReason, ToolStatus,
 };
 
 /// Scripted agent. Behavior depends on the message text:
@@ -1405,9 +1405,153 @@ async fn idle_shutdown_ends_as_done() {
         last_of(&h.manager, &id, "ended").await,
         Some(EventKind::Ended {
             state: SessionState::Done,
+            reason: Some(EndReason::IdleShutdown),
             ..
         })
     ));
+    let st = h.manager.status(&id).await.unwrap().session;
+    assert_eq!(st.ended_reason, Some(EndReason::IdleShutdown));
+    // `send` continues it; a live session has no end reason.
+    assert!(h.manager.send(&id, "again".into()).await.unwrap());
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.ended_reason,
+        None
+    );
+}
+
+async fn ended_reason(m: &Manager, id: &SessionId) -> Option<EndReason> {
+    let from_event = match last_of(m, id, "ended").await {
+        Some(EventKind::Ended { reason, .. }) => reason,
+        _ => None,
+    };
+    assert_eq!(from_event, m.status(id).await.unwrap().session.ended_reason);
+    from_event
+}
+
+#[tokio::test]
+async fn ended_reason_records_why_a_process_ended() {
+    let h = harness().await;
+    let stopped = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let crashed = h.manager.run(spec(&h, "crash")).await.unwrap().session.id;
+    let mut s = spec(&h, "idle-ignore-eof");
+    s.cwd = h.dir.path().join("self-exit");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let exited = h.manager.run(s).await.unwrap().session.id;
+    let orphaned = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+
+    wait_state(&h.manager, &stopped, SessionState::Idle).await;
+    h.manager.stop(&stopped).await.unwrap();
+    wait_state(&h.manager, &stopped, SessionState::Stopped).await;
+    assert_eq!(
+        ended_reason(&h.manager, &stopped).await,
+        Some(EndReason::Stopped)
+    );
+
+    wait_state(&h.manager, &crashed, SessionState::Error).await;
+    assert_eq!(
+        ended_reason(&h.manager, &crashed).await,
+        Some(EndReason::Error)
+    );
+
+    // The agent exits by itself between turns.
+    wait_state(&h.manager, &exited, SessionState::Idle).await;
+    std::fs::write(h.dir.path().join("self-exit/release-eof"), "").unwrap();
+    wait_state(&h.manager, &exited, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &exited).await,
+        Some(EndReason::Done)
+    );
+
+    wait_state(&h.manager, &orphaned, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(
+        h.manager.status(&orphaned).await.unwrap().session.state,
+        SessionState::Orphaned
+    );
+    assert_eq!(
+        ended_reason(&h.manager, &orphaned).await,
+        Some(EndReason::Shutdown)
+    );
+}
+
+#[tokio::test]
+async fn drained_sessions_end_with_drain_reason() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager
+        .drain(Duration::ZERO, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Orphaned
+    );
+    assert_eq!(ended_reason(&h.manager, &id).await, Some(EndReason::Drain));
+}
+
+#[tokio::test]
+async fn idle_closed_worktree_is_kept_and_resumable() {
+    let mut config = Config::default();
+    config.sessions.idle_shutdown_secs = 1;
+    let h = harness_with(config).await;
+    let repo = git_repo(h.dir.path());
+    let mut s = spec(&h, "hello");
+    s.cwd = repo.clone();
+    s.worktree = Some("w2".into());
+    s.remove_worktree = true;
+    let id = h.manager.run(s).await.unwrap().session.id;
+    let wt = repo.join(".worktree/w2");
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.tick(now_ms() + 1_500);
+    wait_state(&h.manager, &id, SessionState::Done).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(wt.exists(), "an idle-closed session keeps its worktree");
+
+    assert!(h.manager.send(&id, "again".into()).await.unwrap());
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    // An explicit stop still removes it.
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    for _ in 0..100 {
+        if !wt.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!wt.exists(), "a stopped session's worktree is removed");
+}
+
+#[tokio::test]
+async fn resume_without_working_directory_fails_clearly() {
+    let h = harness().await;
+    let mut s = spec(&h, "hello");
+    s.cwd = h.dir.path().join("gone");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let id = h.manager.run(s.clone()).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    std::fs::remove_dir(&s.cwd).unwrap();
+
+    for result in [
+        h.manager.send(&id, "again".into()).await.map(|_| ()),
+        h.manager.resume(&id, None).await.map(|_| ()),
+    ] {
+        match result {
+            Err(ManagerError::Conflict(message)) => {
+                assert!(message.contains("cannot be resumed"), "{message}");
+                assert!(message.contains("no longer exists"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Stopped
+    );
 }
 
 #[tokio::test]
@@ -1559,6 +1703,7 @@ async fn recover_marks_live_sessions_orphaned() {
     assert_eq!(m.recover().await.unwrap(), vec![id.clone()]);
     let st = m.status(&id).await.unwrap();
     assert_eq!(st.session.state, SessionState::Orphaned);
+    assert_eq!(ended_reason(&m, &id).await, Some(EndReason::DaemonLost));
     let list = m.list(true).await.unwrap();
     assert_eq!(list.len(), 1);
     // History is intact and resumable.
@@ -1570,10 +1715,9 @@ async fn recover_marks_live_sessions_orphaned() {
     wait_state(&m, &id, SessionState::Idle).await;
 }
 
-#[tokio::test]
-async fn worktree_session_is_created_and_cleaned_up() {
-    let h = harness().await;
-    let repo = h.dir.path().join("repo");
+/// A git repository with one empty commit under `dir/repo`.
+fn git_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
         vec!["init", "-q", "-b", "main"],
@@ -1599,6 +1743,13 @@ async fn worktree_session_is_created_and_cleaned_up() {
                 .success()
         );
     }
+    repo
+}
+
+#[tokio::test]
+async fn worktree_session_is_created_and_cleaned_up() {
+    let h = harness().await;
+    let repo = git_repo(h.dir.path());
     let mut s = spec(&h, "hello");
     s.cwd = repo.clone();
     s.worktree = Some("w1".into());

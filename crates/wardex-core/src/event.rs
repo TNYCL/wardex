@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionId, SessionState};
+use crate::{EndReason, SessionId, SessionState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +125,9 @@ pub enum EventKind {
     Ended {
         state: SessionState,
         exit_code: Option<i32>,
+        /// Why it ended. Absent in events recorded by older versions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<EndReason>,
     },
 }
 
@@ -319,10 +322,20 @@ impl EventKind {
             Self::Stuck { reason, idle_secs } => {
                 format!("stuck ({reason:?}) for {idle_secs}s")
             }
-            Self::Ended { state, exit_code } => match exit_code {
-                Some(code) => format!("ended: {} (exit {code})", state.as_str()),
-                None => format!("ended: {}", state.as_str()),
-            },
+            Self::Ended {
+                state,
+                exit_code,
+                reason,
+            } => {
+                let mut text = format!("ended: {}", state.as_str());
+                if let Some(reason) = reason.filter(|r| r.as_str() != state.as_str()) {
+                    text.push_str(&format!(" ({})", reason.as_str()));
+                }
+                if let Some(code) = exit_code {
+                    text.push_str(&format!(" (exit {code})"));
+                }
+                text
+            }
         }
     }
 }
@@ -385,6 +398,31 @@ mod tests {
         });
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn ended_reason_is_optional_on_the_wire() {
+        let ev = event(EventKind::Ended {
+            state: SessionState::Done,
+            exit_code: Some(0),
+            reason: Some(EndReason::IdleShutdown),
+        });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["payload"]["reason"], "idle_shutdown");
+        assert_eq!(ev.kind.describe(), "ended: done (idle_shutdown) (exit 0)");
+        assert_eq!(serde_json::from_value::<Event>(json).unwrap(), ev);
+
+        // Events stored by older versions have no reason.
+        let old = serde_json::json!({
+            "session_id": "s1", "seq": 3, "ts_ms": 1, "agent": null, "task": null,
+            "driver": "codex", "type": "ended",
+            "payload": {"state": "stopped", "exit_code": null},
+        });
+        let ev: Event = serde_json::from_value(old).unwrap();
+        assert!(matches!(ev.kind, EventKind::Ended { reason: None, .. }));
+        assert_eq!(ev.kind.describe(), "ended: stopped");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json["payload"].get("reason").is_none());
     }
 
     #[test]

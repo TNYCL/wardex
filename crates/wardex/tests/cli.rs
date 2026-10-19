@@ -855,11 +855,34 @@ fn drain_restart_closes_idle_processes_gracefully_and_keeps_resume_ids() {
         .find(|e| e["type"] == "ended")
         .unwrap();
     assert_eq!(ended["payload"]["exit_code"], 0);
+    assert_eq!(ended["payload"]["reason"], "drain");
+    assert_eq!(after["ended_reason"], "drain");
     env.json(&["resume", id]);
     env.wait_state(id, "idle");
     env.json(&["send", id, "next"]);
     env.wait_state(id, "idle");
     assert_eq!(env.json(&["status", id])["spawn_count"], 2);
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn idle_shutdown_is_reported_with_its_reason_and_send_continues() {
+    let env = Env::with_config("resume", "[sessions]\nidle_shutdown_secs = 1\n");
+    lifecycle_agent(&env, "idle");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "done");
+    assert_eq!(env.json(&["status", id])["ended_reason"], "idle_shutdown");
+    let human = env.run(&["status", id]);
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("state     done (idle_shutdown)"), "{human}");
+    let sent = env.json(&["send", id, "next"]);
+    assert_eq!(sent["resumed"], true);
+    wait_until(
+        || env.json(&["status", id])["spawn_count"] == 2,
+        "second process",
+    );
     env.stop_daemon(daemon);
 }
 

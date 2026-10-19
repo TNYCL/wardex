@@ -16,8 +16,8 @@ use crate::process::{self, Launcher};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
-    Answer, Config, DriverKind, Event, EventKind, GitState, RunSpec, SessionId, SessionRecord,
-    SessionState, StuckReason, ToolStatus, git,
+    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, RunSpec, SessionId,
+    SessionRecord, SessionState, StuckReason, ToolStatus, git,
 };
 
 const BROADCAST_CAPACITY: usize = 8192;
@@ -219,6 +219,8 @@ pub struct EndedSession {
     pub last_error: Option<String>,
     #[serde(default)]
     pub cleanup_failed: bool,
+    #[serde(default)]
+    pub ended_reason: Option<EndReason>,
 }
 
 /// One-line form of an event.
@@ -319,6 +321,8 @@ struct Live {
     stuck_flagged: bool,
     stop_requested: bool,
     idle_exit: bool,
+    /// Why supervision closed this idle process (with `idle_exit`).
+    idle_reason: Option<EndReason>,
     drain_exit: bool,
     /// EOF cannot be undone when a drain is refused. Keep this separate
     /// from the exit classification flags, which the reservation resets.
@@ -649,6 +653,7 @@ impl Manager {
             record.resume_with_prompt = record.state != SessionState::Idle;
             record.state = SessionState::Orphaned;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(EndReason::DaemonLost);
             record.pid = None;
             let message = cleanup_error
                 .map(|error| error.to_string())
@@ -662,6 +667,7 @@ impl Manager {
                 EventKind::Ended {
                     state: SessionState::Orphaned,
                     exit_code: None,
+                    reason: Some(EndReason::DaemonLost),
                 },
             )?;
             ids.push(record.id.clone());
@@ -808,12 +814,14 @@ impl Manager {
             resume_pending: false,
             resume_with_prompt: false,
             cleanup_failed: false,
+            ended_reason: None,
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
         if let Err(e) = self.spawn_process(&mut record, None) {
             record.state = SessionState::Error;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(EndReason::Error);
             record.last_error = Some(e.to_string());
             let event = make_event(
                 &mut record,
@@ -865,6 +873,7 @@ impl Manager {
         record.unit = handle.unit.clone();
         record.state = SessionState::Starting;
         record.ended_ms = None;
+        record.ended_reason = None;
         record.updated_ms = now_ms();
         self.cache(record);
         self.inner
@@ -885,6 +894,7 @@ impl Manager {
             stuck_flagged: false,
             stop_requested: false,
             idle_exit: false,
+            idle_reason: None,
             drain_exit: false,
             stdin_closed: false,
             interrupt_requested: false,
@@ -1206,17 +1216,23 @@ impl Manager {
             };
             let mut record = entry.record.clone();
             let shutting_down = self.inner.shutting_down.load(Ordering::SeqCst);
-            let state = if entry.stop_requested && !shutting_down {
-                SessionState::Stopped
+            let (state, reason) = if entry.stop_requested && !shutting_down {
+                (SessionState::Stopped, EndReason::Stopped)
             } else if entry.drain_exit || shutting_down {
                 record.resume_pending = true;
                 record.resume_with_prompt =
                     record.resume_with_prompt || entry.turn_active || !entry.pending.is_empty();
-                SessionState::Orphaned
+                let reason = if entry.drain_exit {
+                    EndReason::Drain
+                } else {
+                    EndReason::Shutdown
+                };
+                (SessionState::Orphaned, reason)
             } else if entry.idle_exit || (code == Some(0) && !entry.turn_active) {
-                SessionState::Done
+                let reason = entry.idle_reason.unwrap_or(EndReason::Done);
+                (SessionState::Done, reason)
             } else {
-                SessionState::Error
+                (SessionState::Error, EndReason::Error)
             };
             if state == SessionState::Error {
                 let mut message = match code {
@@ -1240,6 +1256,7 @@ impl Manager {
             }
             record.state = state;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(reason);
             record.pid = None;
             if let Some(error) = &cleanup_error {
                 record.state = SessionState::Orphaned;
@@ -1256,6 +1273,7 @@ impl Manager {
                 EventKind::Ended {
                     state: ended_state,
                     exit_code: code,
+                    reason: Some(reason),
                 },
             );
             self.cache(&record);
@@ -1269,10 +1287,13 @@ impl Manager {
             live.remove(id);
             record
         };
-        tracing::info!(session = %id, state = record.state.as_str(), ?code, "session process ended and scope reaped");
+        let reason = record.ended_reason;
+        tracing::info!(session = %id, state = record.state.as_str(), reason = reason.map(EndReason::as_str), ?code, "session process ended and scope reaped");
+        // An idle session closed to save resources is unfinished work: keep
+        // its worktree so `send` can continue it.
         if cleanup_error.is_none()
             && record.remove_worktree
-            && matches!(record.state, SessionState::Done | SessionState::Stopped)
+            && matches!(reason, Some(EndReason::Done | EndReason::Stopped))
             && let Some(origin) = &record.origin_cwd
             && let Some(root) = git::repo_root(origin).await
             && let Err(e) = git::remove_worktree(&root, &record.cwd).await
@@ -1457,6 +1478,7 @@ impl Manager {
                 last_result: r.last_result.map(|t| truncate(&t, OVERVIEW_TEXT_LIMIT)),
                 last_error: r.last_error,
                 cleanup_failed: r.cleanup_failed,
+                ended_reason: r.ended_reason,
             })
             .collect();
         Ok(Overview {
@@ -1719,6 +1741,17 @@ impl Manager {
             self.inner.store.update_session(&record).await?;
             self.cache(&record);
             cleanup?;
+        }
+        if !record.cwd.is_dir() {
+            let hint = if record.worktree.is_some() {
+                " (its worktree was removed)"
+            } else {
+                ""
+            };
+            return Err(ManagerError::Conflict(format!(
+                "session {id} cannot be resumed: its working directory {} no longer exists{hint}",
+                record.cwd.display()
+            )));
         }
         let resume_id = record.driver_session_id.clone().ok_or_else(|| {
             ManagerError::Conflict(format!(
@@ -2223,6 +2256,7 @@ impl Manager {
                     && (now - since).max(0) as u64 / 1000 >= s.idle_shutdown_secs
                 {
                     l.idle_exit = true;
+                    l.idle_reason = Some(EndReason::IdleShutdown);
                     let _ = l.commands.send(DriverCommand::Shutdown);
                 }
             }

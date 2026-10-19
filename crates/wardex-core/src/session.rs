@@ -87,6 +87,72 @@ impl SessionState {
     }
 }
 
+/// Why a session's process ended. Set when it ends, cleared on resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    /// The agent process exited by itself between turns.
+    Done,
+    /// Stopped on request.
+    Stopped,
+    /// Idle for `sessions.idle_shutdown_secs`.
+    IdleShutdown,
+    /// Closed because more than `sessions.max_idle_live` sessions were idle.
+    IdleEvicted,
+    /// Closed because available memory fell below
+    /// `sessions.min_mem_available_mb`.
+    MemoryPressure,
+    /// The process failed or could not be started.
+    Error,
+    /// Closed by `daemon stop/restart --drain`.
+    Drain,
+    /// Closed by a daemon stop or restart without drain.
+    Shutdown,
+    /// Found live after the daemon stopped unexpectedly (crash or kill).
+    DaemonLost,
+}
+
+impl EndReason {
+    pub const ALL: [EndReason; 9] = [
+        Self::Done,
+        Self::Stopped,
+        Self::IdleShutdown,
+        Self::IdleEvicted,
+        Self::MemoryPressure,
+        Self::Error,
+        Self::Drain,
+        Self::Shutdown,
+        Self::DaemonLost,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Stopped => "stopped",
+            Self::IdleShutdown => "idle_shutdown",
+            Self::IdleEvicted => "idle_evicted",
+            Self::MemoryPressure => "memory_pressure",
+            Self::Error => "error",
+            Self::Drain => "drain",
+            Self::Shutdown => "shutdown",
+            Self::DaemonLost => "daemon_lost",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// Wardex closed an idle process to save resources; the session is
+    /// unfinished work and `send` continues it.
+    pub fn is_idle_close(self) -> bool {
+        matches!(
+            self,
+            Self::IdleShutdown | Self::IdleEvicted | Self::MemoryPressure
+        )
+    }
+}
+
 /// Everything needed to start a new session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunSpec {
@@ -148,4 +214,8 @@ pub struct SessionRecord {
     /// may retry cleanup; automatic resume must leave this session alone.
     #[serde(default)]
     pub cleanup_failed: bool,
+    /// Why the process ended (`None` while live and for sessions that
+    /// ended before this was recorded).
+    #[serde(default)]
+    pub ended_reason: Option<EndReason>,
 }
