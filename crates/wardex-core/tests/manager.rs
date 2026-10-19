@@ -14,8 +14,8 @@ use wardex_core::process::Launcher;
 use wardex_core::store::Store;
 use wardex_core::time::now_ms;
 use wardex_core::{
-    Answer, Config, DriverKind, EventKind, QuestionItem, RunSpec, SessionId, SessionState,
-    StuckReason, ToolStatus,
+    Answer, Config, DriverKind, EndReason, EventKind, ListFilter, QuestionItem, RunSpec, SessionId,
+    SessionState, StuckReason, ToolStatus,
 };
 
 /// Scripted agent. Behavior depends on the message text:
@@ -926,6 +926,8 @@ async fn resume_reaps_pending_scope(recover_first: bool) {
     let mut config = Config::default();
     config.sessions.stop_grace_secs = 0;
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let manager = Manager::new(
         config,
         Store::open(h.manager.store().path()).await.unwrap(),
@@ -1032,6 +1034,8 @@ fi
     let mut config = Config::default();
     config.sessions.stop_grace_secs = 0;
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let manager = Manager::new(
         config,
         Store::open(h.manager.store().path()).await.unwrap(),
@@ -1301,6 +1305,8 @@ async fn drain_timeout_preserves_active_idle_questions_and_approvals() {
     h.manager.store().close().await.unwrap();
     let mut config = Config::default();
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let next = Manager::new(
         config,
         Store::open(&path).await.unwrap(),
@@ -1405,9 +1411,473 @@ async fn idle_shutdown_ends_as_done() {
         last_of(&h.manager, &id, "ended").await,
         Some(EventKind::Ended {
             state: SessionState::Done,
+            reason: Some(EndReason::IdleShutdown),
             ..
         })
     ));
+    let st = h.manager.status(&id).await.unwrap().session;
+    assert_eq!(st.ended_reason, Some(EndReason::IdleShutdown));
+    // `send` continues it; a live session has no end reason.
+    assert!(h.manager.send(&id, "again".into()).await.unwrap());
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.ended_reason,
+        None
+    );
+}
+
+async fn ended_reason(m: &Manager, id: &SessionId) -> Option<EndReason> {
+    let from_event = match last_of(m, id, "ended").await {
+        Some(EventKind::Ended { reason, .. }) => reason,
+        _ => None,
+    };
+    assert_eq!(from_event, m.status(id).await.unwrap().session.ended_reason);
+    from_event
+}
+
+#[tokio::test]
+async fn ended_reason_records_why_a_process_ended() {
+    let h = harness().await;
+    let stopped = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let crashed = h.manager.run(spec(&h, "crash")).await.unwrap().session.id;
+    let mut s = spec(&h, "idle-ignore-eof");
+    s.cwd = h.dir.path().join("self-exit");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let exited = h.manager.run(s).await.unwrap().session.id;
+    let orphaned = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+
+    wait_state(&h.manager, &stopped, SessionState::Idle).await;
+    h.manager.stop(&stopped).await.unwrap();
+    wait_state(&h.manager, &stopped, SessionState::Stopped).await;
+    assert_eq!(
+        ended_reason(&h.manager, &stopped).await,
+        Some(EndReason::Stopped)
+    );
+
+    wait_state(&h.manager, &crashed, SessionState::Error).await;
+    assert_eq!(
+        ended_reason(&h.manager, &crashed).await,
+        Some(EndReason::Error)
+    );
+
+    // The agent exits by itself between turns.
+    wait_state(&h.manager, &exited, SessionState::Idle).await;
+    std::fs::write(h.dir.path().join("self-exit/release-eof"), "").unwrap();
+    wait_state(&h.manager, &exited, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &exited).await,
+        Some(EndReason::Done)
+    );
+
+    wait_state(&h.manager, &orphaned, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(
+        h.manager.status(&orphaned).await.unwrap().session.state,
+        SessionState::Orphaned
+    );
+    assert_eq!(
+        ended_reason(&h.manager, &orphaned).await,
+        Some(EndReason::Shutdown)
+    );
+}
+
+#[tokio::test]
+async fn drained_sessions_end_with_drain_reason() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager
+        .drain(Duration::ZERO, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Orphaned
+    );
+    assert_eq!(ended_reason(&h.manager, &id).await, Some(EndReason::Drain));
+}
+
+#[tokio::test]
+async fn idle_closed_worktree_is_kept_and_resumable() {
+    let mut config = Config::default();
+    config.sessions.idle_shutdown_secs = 1;
+    let h = harness_with(config).await;
+    let repo = git_repo(h.dir.path());
+    let mut s = spec(&h, "hello");
+    s.cwd = repo.clone();
+    s.worktree = Some("w2".into());
+    s.remove_worktree = true;
+    let id = h.manager.run(s).await.unwrap().session.id;
+    let wt = repo.join(".worktree/w2");
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.tick(now_ms() + 1_500);
+    wait_state(&h.manager, &id, SessionState::Done).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(wt.exists(), "an idle-closed session keeps its worktree");
+
+    assert!(h.manager.send(&id, "again".into()).await.unwrap());
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    // An explicit stop still removes it.
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    for _ in 0..100 {
+        if !wt.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!wt.exists(), "a stopped session's worktree is removed");
+}
+
+#[tokio::test]
+async fn resume_without_working_directory_fails_clearly() {
+    let h = harness().await;
+    let mut s = spec(&h, "hello");
+    s.cwd = h.dir.path().join("gone");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let id = h.manager.run(s.clone()).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    std::fs::remove_dir(&s.cwd).unwrap();
+
+    for result in [
+        h.manager.send(&id, "again".into()).await.map(|_| ()),
+        h.manager.resume(&id, None).await.map(|_| ()),
+    ] {
+        match result {
+            Err(ManagerError::Conflict(message)) => {
+                assert!(message.contains("cannot be resumed"), "{message}");
+                assert!(message.contains("no longer exists"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn default_config_keeps_idle_sessions_for_twelve_hours() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    let left = h.manager.overview(0).await.unwrap().live[0]
+        .shutdown_in_ms
+        .unwrap();
+    assert!((43_190_000..=43_200_000).contains(&left), "{left}");
+    // The old default (15 minutes) no longer closes it.
+    h.manager.tick_with_memory(now_ms() + 901_000, None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Idle
+    );
+    h.manager.tick_with_memory(now_ms() + 43_201_000, None);
+    wait_state(&h.manager, &id, SessionState::Done).await;
+}
+
+async fn state_of(m: &Manager, id: &SessionId) -> SessionState {
+    m.status(id).await.unwrap().session.state
+}
+
+#[tokio::test]
+async fn idle_limit_closes_the_longest_idle_session_but_never_busy_ones() {
+    let mut config = Config::default();
+    config.sessions.max_idle_live = 2;
+    let h = harness_with(config).await;
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let asking = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    wait_state(&h.manager, &busy, SessionState::Running).await;
+    wait_state(&h.manager, &asking, SessionState::WaitingInput).await;
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+        wait_state(&h.manager, &id, SessionState::Idle).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        idle.push(id);
+    }
+    h.manager.tick_with_memory(now_ms(), None);
+    wait_state(&h.manager, &idle[0], SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &idle[0]).await,
+        Some(EndReason::IdleEvicted)
+    );
+    h.manager.tick_with_memory(now_ms(), None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state_of(&h.manager, &idle[1]).await, SessionState::Idle);
+    assert_eq!(state_of(&h.manager, &idle[2]).await, SessionState::Idle);
+    assert_eq!(state_of(&h.manager, &busy).await, SessionState::Running);
+    assert_eq!(
+        state_of(&h.manager, &asking).await,
+        SessionState::WaitingInput
+    );
+    // The evicted session continues on `send`; then the longest idle of the
+    // others goes.
+    assert!(h.manager.send(&idle[0], "again".into()).await.unwrap());
+    wait_state(&h.manager, &idle[0], SessionState::Idle).await;
+    h.manager.tick_with_memory(now_ms(), None);
+    wait_state(&h.manager, &idle[1], SessionState::Done).await;
+    assert_eq!(state_of(&h.manager, &idle[0]).await, SessionState::Idle);
+}
+
+#[tokio::test]
+async fn memory_pressure_closes_idle_sessions_one_at_a_time() {
+    let h = harness().await;
+    assert_eq!(h.manager.config().sessions.min_mem_available_mb, 1024);
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let asking = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    // The longest idle session ignores EOF, so its close stays in progress.
+    let mut s = spec(&h, "idle-ignore-eof");
+    s.cwd = h.dir.path().join("stubborn");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let stubborn = h.manager.run(s).await.unwrap().session.id;
+    wait_state(&h.manager, &stubborn, SessionState::Idle).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let other = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &other, SessionState::Idle).await;
+    wait_state(&h.manager, &busy, SessionState::Running).await;
+    wait_state(&h.manager, &asking, SessionState::WaitingInput).await;
+
+    // Enough memory: nothing happens.
+    h.manager.tick_with_memory(now_ms(), Some(4096));
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(h.manager.status(&stubborn).await.unwrap().live);
+    assert_eq!(
+        state_of(&h.manager, &other).await,
+        SessionState::Idle,
+        "a second session was closed before the first one exited"
+    );
+    std::fs::write(h.dir.path().join("stubborn/release-eof"), "").unwrap();
+    wait_state(&h.manager, &stubborn, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &stubborn).await,
+        Some(EndReason::MemoryPressure)
+    );
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    wait_state(&h.manager, &other, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &other).await,
+        Some(EndReason::MemoryPressure)
+    );
+    // Running turns and open questions are never closed.
+    for _ in 0..3 {
+        h.manager.tick_with_memory(now_ms(), Some(1));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state_of(&h.manager, &busy).await, SessionState::Running);
+    assert_eq!(
+        state_of(&h.manager, &asking).await,
+        SessionState::WaitingInput
+    );
+}
+
+#[tokio::test]
+async fn stuck_detection_and_idle_shutdown_are_independent() {
+    let h = harness_with(fast_config()).await;
+    let hang = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &hang, SessionState::Running).await;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    // Far past both limits: the running turn is stuck, never shut down; the
+    // idle session is shut down, never reported stuck.
+    h.manager.tick(now_ms() + 43_300_000);
+    wait_state(&h.manager, &idle, SessionState::Done).await;
+    assert!(matches!(
+        last_of(&h.manager, &hang, "stuck").await,
+        Some(EventKind::Stuck {
+            reason: StuckReason::NoOutput,
+            ..
+        })
+    ));
+    assert_eq!(
+        h.manager.status(&hang).await.unwrap().session.state,
+        SessionState::Running
+    );
+    assert!(last_of(&h.manager, &idle, "stuck").await.is_none());
+}
+
+#[tokio::test]
+async fn zero_idle_stuck_secs_disables_no_output_detection() {
+    let mut config = fast_config();
+    config.timeouts.idle_stuck_secs = 0;
+    let h = harness_with(config).await;
+    let id = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Running).await;
+    h.manager.tick(now_ms());
+    h.manager.tick(now_ms() + 86_400_000);
+    assert!(last_of(&h.manager, &id, "stuck").await.is_none());
+}
+
+fn labelled(h: &Harness, prompt: &str, agent: &str, task: &str, dir: &str) -> RunSpec {
+    let mut s = spec(h, prompt);
+    s.agent = Some(agent.into());
+    s.task = Some(task.into());
+    s.cwd = h.dir.path().join(dir);
+    std::fs::create_dir_all(&s.cwd).unwrap();
+    s
+}
+
+async fn listed(m: &Manager, filter: ListFilter) -> Vec<SessionId> {
+    m.list_filtered(&filter)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.session.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn list_filters_and_latest_find_sessions_to_continue() {
+    let h = harness().await;
+    let run = |s: RunSpec| {
+        let m = h.manager.clone();
+        async move { m.run(s).await.unwrap().session.id }
+    };
+    let live = run(labelled(&h, "hello", "agent-a", "fix-1", "a1")).await;
+    let stopped = run(labelled(&h, "hello", "agent-a", "fix-2", "a2")).await;
+    let crashed = run(labelled(&h, "crash", "agent-b", "docs", "b1")).await;
+    let no_resume_id = labelled(&h, "hello", "agent-a", "fix-3", "a3");
+    std::fs::write(no_resume_id.cwd.join("omit-resume-id"), "").unwrap();
+    let no_resume_id = run(no_resume_id).await;
+    let gone = labelled(&h, "hello", "agent-a", "fix-4", "a4");
+    let gone_dir = gone.cwd.clone();
+    let gone = run(gone).await;
+    wait_state(&h.manager, &live, SessionState::Idle).await;
+    wait_state(&h.manager, &crashed, SessionState::Error).await;
+    for id in [&stopped, &no_resume_id, &gone] {
+        wait_state(&h.manager, id, SessionState::Idle).await;
+        h.manager.stop(id).await.unwrap();
+        wait_state(&h.manager, id, SessionState::Stopped).await;
+    }
+    std::fs::remove_dir_all(&gone_dir).unwrap();
+
+    let by = |agent: Option<&str>, task: Option<&str>| ListFilter {
+        agent: agent.map(String::from),
+        task: task.map(String::from),
+        ..Default::default()
+    };
+    assert_eq!(
+        listed(&h.manager, by(Some("agent-a"), None)).await,
+        std::slice::from_ref(&live)
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                ended: true,
+                ..by(Some("agent-a"), None)
+            }
+        )
+        .await,
+        [gone.clone(), no_resume_id.clone(), stopped.clone()]
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                resumable: true,
+                ..Default::default()
+            }
+        )
+        .await,
+        [crashed.clone(), stopped.clone()]
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                all: true,
+                ..by(Some("agent-?"), Some("fix-*"))
+            }
+        )
+        .await,
+        [
+            gone.clone(),
+            no_resume_id.clone(),
+            stopped.clone(),
+            live.clone()
+        ]
+    );
+    assert!(
+        listed(&h.manager, by(Some("agent-c"), None))
+            .await
+            .is_empty()
+    );
+
+    // `latest` picks the newest match, live or ended; `send` continues it.
+    let latest = |agent: Option<&str>, task: Option<&str>| {
+        h.manager
+            .latest(agent.map(String::from), task.map(String::from))
+    };
+    assert_eq!(latest(Some("agent-a"), None).await.unwrap(), gone);
+    assert_eq!(latest(None, Some("fix-1")).await.unwrap(), live);
+    let target = latest(Some("agent-a"), Some("fix-2")).await.unwrap();
+    assert_eq!(target, stopped);
+    assert!(h.manager.send(&target, "again".into()).await.unwrap());
+    wait_state(&h.manager, &stopped, SessionState::Idle).await;
+    assert!(matches!(
+        latest(Some("agent-c"), None).await,
+        Err(ManagerError::NotFound(_))
+    ));
+    assert!(matches!(
+        latest(None, None).await,
+        Err(ManagerError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn sessions_created_in_the_same_millisecond_list_and_resolve_deterministically() {
+    let h = harness().await;
+    // One real session in the manager's cache, plus stored sessions that
+    // share one creation time; their ids sort neither with nor against
+    // insertion order.
+    let real = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &real, SessionState::Idle).await;
+    h.manager.stop(&real).await.unwrap();
+    wait_state(&h.manager, &real, SessionState::Stopped).await;
+    let template = h.manager.status(&real).await.unwrap().session;
+    let tied = ["f3", "f1", "f4", "f2"];
+    for id in tied {
+        let mut r = template.clone();
+        r.id = SessionId(id.into());
+        r.created_ms = template.created_ms - 60_000;
+        h.manager.store().insert_session(&r).await.unwrap();
+    }
+    let mut expected = vec![real.clone()];
+    expected.extend(tied.iter().rev().map(|id| SessionId((*id).into())));
+    for _ in 0..20 {
+        let filter = ListFilter {
+            ended: true,
+            agent: Some("agent-*".into()),
+            ..Default::default()
+        };
+        assert_eq!(listed(&h.manager, filter).await, expected);
+        assert_eq!(
+            h.manager.latest(None, Some("task-?".into())).await.unwrap(),
+            real
+        );
+    }
+    // Among the tied ones, the last inserted is the newest.
+    let mut only_tied = template.clone();
+    only_tied.id = SessionId("f0".into());
+    only_tied.task = Some("other".into());
+    only_tied.created_ms = template.created_ms - 60_000;
+    h.manager.store().insert_session(&only_tied).await.unwrap();
+    let mut again = only_tied.clone();
+    again.id = SessionId("f9".into());
+    h.manager.store().insert_session(&again).await.unwrap();
+    for _ in 0..20 {
+        assert_eq!(
+            h.manager.latest(None, Some("other".into())).await.unwrap(),
+            again.id
+        );
+    }
 }
 
 #[tokio::test]
@@ -1502,6 +1972,7 @@ async fn recover_marks_live_sessions_orphaned() {
     assert_eq!(m.recover().await.unwrap(), vec![id.clone()]);
     let st = m.status(&id).await.unwrap();
     assert_eq!(st.session.state, SessionState::Orphaned);
+    assert_eq!(ended_reason(&m, &id).await, Some(EndReason::DaemonLost));
     let list = m.list(true).await.unwrap();
     assert_eq!(list.len(), 1);
     // History is intact and resumable.
@@ -1513,10 +1984,9 @@ async fn recover_marks_live_sessions_orphaned() {
     wait_state(&m, &id, SessionState::Idle).await;
 }
 
-#[tokio::test]
-async fn worktree_session_is_created_and_cleaned_up() {
-    let h = harness().await;
-    let repo = h.dir.path().join("repo");
+/// A git repository with one empty commit under `dir/repo`.
+fn git_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
         vec!["init", "-q", "-b", "main"],
@@ -1542,6 +2012,13 @@ async fn worktree_session_is_created_and_cleaned_up() {
                 .success()
         );
     }
+    repo
+}
+
+#[tokio::test]
+async fn worktree_session_is_created_and_cleaned_up() {
+    let h = harness().await;
+    let repo = git_repo(h.dir.path());
     let mut s = spec(&h, "hello");
     s.cwd = repo.clone();
     s.worktree = Some("w1".into());
@@ -1583,6 +2060,15 @@ async fn worktree_session_is_created_and_cleaned_up() {
 
 #[tokio::test]
 async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
+    auto_resume_after_shutdown(false).await;
+}
+
+#[tokio::test]
+async fn auto_resume_idle_also_restarts_idle_sessions() {
+    auto_resume_after_shutdown(true).await;
+}
+
+async fn auto_resume_after_shutdown(auto_resume_idle: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("w.db");
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1621,14 +2107,28 @@ async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
     }
     let mut config = Config::default();
     config.sessions.auto_resume_orphaned = true;
+    config.sessions.auto_resume_idle = auto_resume_idle;
     let m = make(config.clone(), Store::open(&db).await.unwrap());
     assert!(m.recover().await.unwrap().is_empty());
     let mut resumed = m.auto_resume().await.unwrap();
     resumed.sort();
-    let mut expected = vec![busy.clone(), idle.clone()];
+    let mut expected = vec![busy.clone()];
+    if auto_resume_idle {
+        expected.push(idle.clone());
+    }
     expected.sort();
     assert_eq!(resumed, expected);
-    wait_state(&m, &idle, SessionState::Idle).await;
+    if auto_resume_idle {
+        wait_state(&m, &idle, SessionState::Idle).await;
+    } else {
+        // The idle session waits for `send`.
+        let st = m.status(&idle).await.unwrap();
+        assert!(!st.live);
+        assert_eq!(st.session.state, SessionState::Orphaned);
+        assert!(!st.session.resume_pending);
+        assert!(m.send(&idle, "hello".into()).await.unwrap());
+        wait_state(&m, &idle, SessionState::Idle).await;
+    }
     // Only the busy session is told to continue.
     let prompts: Vec<String> = received
         .lock()

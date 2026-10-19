@@ -33,17 +33,22 @@ wardex run --driver claude|codex --prompt "..." [--prompt-file F|-]
            [--model M] [--reasoning R] [--cwd DIR] [--readonly]
            [--worktree NAME [--branch B] [--rm-worktree]]
            [--agent A] [--task T] [--slice S]
-wardex list [-a] | status <id> | summary <id> | pending
+wardex list [-a] [--agent GLOB] [--task GLOB] [--ended] [--resumable]
+wardex status <id> | summary <id> | pending
 wardex tail <id> [-f] [-n N] [--since-seq N [--wait SECS]] [--deltas] [--full]
 wardex tool-output <id> <seq>      # full input/output of one tool call
 wardex answer <id> <text> | answer <id> --item ID=TEXT ... [--question Q]
 wardex send <id> <message> | interrupt <id> | stop <id> | resume <id> [message]
+wardex send --latest --agent GLOB [--task GLOB] <message>   # newest matching session
 wardex overview [-n EVENTS]        # live sessions, questions, resources at a glance
 wardex mcp --stdio                 # MCP server on stdin/stdout (e.g. over ssh)
 ```
 
 Session ids can be shortened to any unique prefix. Every command accepts
-`--json`. The CLI talks to the daemon over a Unix socket (mode 0600).
+`--json`. An idle session closes after 12 h by default (or earlier when too
+many are idle or memory runs low, see `[sessions]` in
+`deploy/wardex.example.toml`); find it again with
+`wardex list --resumable --agent A` and continue it with `send`. The CLI talks to the daemon over a Unix socket (mode 0600).
 
 ## MCP
 

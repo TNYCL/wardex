@@ -12,7 +12,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::{DriverKind, Event, EventKind, SessionId, SessionRecord, SessionState};
+use crate::{
+    DriverKind, EndReason, Event, EventKind, ListFilter, SessionId, SessionRecord, SessionState,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -400,8 +402,8 @@ impl Store {
             "INSERT INTO sessions (id, driver, driver_session_id, state, agent, task, model,
                 reasoning, cwd, origin_cwd, worktree, branch, remove_worktree, readonly, slice,
                 unit, pid, created_ms, updated_ms, ended_ms, last_seq, last_result, last_error,
-                spawn_count, resume_pending, resume_with_prompt, cleanup_failed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                spawn_count, resume_pending, resume_with_prompt, cleanup_failed, ended_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id.as_str())
         .bind(s.driver.as_str())
@@ -434,6 +436,7 @@ impl Store {
         .bind(s.resume_pending)
         .bind(s.resume_with_prompt)
         .bind(s.cleanup_failed)
+        .bind(s.ended_reason.map(EndReason::as_str))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -500,13 +503,44 @@ impl Store {
 
     /// Sessions, newest first. Without `all`, only non-terminal ones.
     pub async fn list_sessions(&self, all: bool, limit: i64) -> Result<Vec<SessionRecord>> {
-        let sql = if all {
-            "SELECT * FROM sessions ORDER BY created_ms DESC LIMIT ?"
-        } else {
-            "SELECT * FROM sessions WHERE state IN ('starting','running','idle','waiting_input')
-             ORDER BY created_ms DESC LIMIT ?"
+        let filter = ListFilter {
+            all,
+            ..Default::default()
         };
-        let rows = sqlx::query(sql).bind(limit).fetch_all(&self.pool).await?;
+        self.list_sessions_matching(&filter, limit).await
+    }
+
+    /// Sessions passing `filter` (see [`ListFilter::matches`]; the working
+    /// directory of `resumable` is not checked here), newest first; sessions
+    /// created in the same millisecond newest-inserted first.
+    pub async fn list_sessions_matching(
+        &self,
+        filter: &ListFilter,
+        limit: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT * FROM sessions WHERE ");
+        if filter.ended || filter.resumable {
+            q.push("state IN ('done','error','stopped','orphaned')");
+        } else if filter.all {
+            q.push("1");
+        } else {
+            q.push("state IN ('starting','running','idle','waiting_input')");
+        }
+        if filter.resumable {
+            q.push(" AND driver_session_id IS NOT NULL AND cleanup_failed = 0");
+        }
+        if let Some(pattern) = &filter.agent {
+            q.push(" AND agent GLOB ")
+                .push_bind(crate::glob::to_sqlite(pattern));
+        }
+        if let Some(pattern) = &filter.task {
+            q.push(" AND task GLOB ")
+                .push_bind(crate::glob::to_sqlite(pattern));
+        }
+        // rowid breaks ties between sessions created in the same millisecond.
+        q.push(" ORDER BY created_ms DESC, rowid DESC LIMIT ")
+            .push_bind(limit);
+        let rows = q.build().fetch_all(&self.pool).await?;
         rows.iter().map(session_from_row).collect()
     }
 
@@ -1069,7 +1103,8 @@ fn update_session_query(
     sqlx::query(
         "UPDATE sessions SET driver_session_id = ?, state = ?, model = ?, unit = ?, pid = ?,
             updated_ms = ?, ended_ms = ?, last_seq = ?, last_result = ?, last_error = ?,
-            spawn_count = ?, resume_pending = ?, resume_with_prompt = ?, cleanup_failed = ?
+            spawn_count = ?, resume_pending = ?, resume_with_prompt = ?, cleanup_failed = ?,
+            ended_reason = ?
          WHERE id = ?",
     )
     .bind(&s.driver_session_id)
@@ -1086,6 +1121,7 @@ fn update_session_query(
     .bind(s.resume_pending)
     .bind(s.resume_with_prompt)
     .bind(s.cleanup_failed)
+    .bind(s.ended_reason.map(EndReason::as_str))
     .bind(s.id.as_str())
 }
 
@@ -1131,6 +1167,10 @@ fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
         resume_pending: r.get("resume_pending"),
         resume_with_prompt: r.get("resume_with_prompt"),
         cleanup_failed: r.get("cleanup_failed"),
+        // Unknown values (from a newer binary) read as unknown, not corrupt.
+        ended_reason: r
+            .get::<Option<String>, _>("ended_reason")
+            .and_then(|v| EndReason::parse(&v)),
     })
 }
 
@@ -1186,6 +1226,7 @@ mod tests {
             resume_pending: false,
             resume_with_prompt: false,
             cleanup_failed: false,
+            ended_reason: None,
         }
     }
 
@@ -1230,6 +1271,7 @@ mod tests {
                 .unwrap();
             s.state = SessionState::Done;
             s.last_seq = 2;
+            s.ended_reason = Some(EndReason::IdleShutdown);
             store.update_session(&s).await.unwrap();
             store.close().await.unwrap();
         }
@@ -1241,6 +1283,21 @@ mod tests {
             .unwrap();
         assert_eq!(s.state, SessionState::Done);
         assert_eq!(s.last_seq, 2);
+        assert_eq!(s.ended_reason, Some(EndReason::IdleShutdown));
+        // A reason written by a newer binary reads as unknown, not corrupt.
+        sqlx::query("UPDATE sessions SET ended_reason = 'future_reason'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_session(&s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended_reason,
+            None
+        );
         let events = store.events(&s.id, 0, 100).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind.name(), "done");
@@ -1251,6 +1308,156 @@ mod tests {
         assert_eq!(store.list_sessions(true, 10).await.unwrap().len(), 1);
         let counts = store.event_counts(&s.id).await.unwrap();
         assert_eq!(counts, vec![("done".into(), 1), ("prompt".into(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn list_filters_run_in_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        let rows = [
+            (
+                "s1",
+                SessionState::Idle,
+                Some("agent-a"),
+                Some("fix-1"),
+                true,
+                false,
+            ),
+            (
+                "s2",
+                SessionState::Done,
+                Some("agent-a"),
+                Some("fix-2"),
+                true,
+                false,
+            ),
+            (
+                "s3",
+                SessionState::Stopped,
+                Some("agent-b"),
+                Some("[x]-3"),
+                true,
+                false,
+            ),
+            (
+                "s4",
+                SessionState::Error,
+                Some("agent-a"),
+                None,
+                false,
+                false,
+            ),
+            (
+                "s5",
+                SessionState::Orphaned,
+                None,
+                Some("fix-5"),
+                true,
+                true,
+            ),
+        ];
+        for (i, (id, state, agent, task, resume_id, cleanup_failed)) in rows.iter().enumerate() {
+            let mut r = record(id, *state);
+            r.agent = agent.map(String::from);
+            r.task = task.map(String::from);
+            r.driver_session_id = resume_id.then(|| format!("d-{id}"));
+            r.cleanup_failed = *cleanup_failed;
+            r.created_ms = i as i64;
+            store.insert_session(&r).await.unwrap();
+        }
+        let ids = |filter: ListFilter| {
+            let store = store.clone();
+            async move {
+                store
+                    .list_sessions_matching(&filter, 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let f = |agent: Option<&str>, task: Option<&str>, all, ended, resumable| ListFilter {
+            all,
+            agent: agent.map(String::from),
+            task: task.map(String::from),
+            ended,
+            resumable,
+        };
+        assert_eq!(ids(f(None, None, false, false, false)).await, ["s1"]);
+        assert_eq!(
+            ids(f(None, None, true, false, false)).await,
+            ["s5", "s4", "s3", "s2", "s1"]
+        );
+        assert_eq!(
+            ids(f(None, None, false, true, false)).await,
+            ["s5", "s4", "s3", "s2"]
+        );
+        assert_eq!(ids(f(None, None, false, false, true)).await, ["s3", "s2"]);
+        assert_eq!(
+            ids(f(Some("agent-a"), None, true, false, false)).await,
+            ["s4", "s2", "s1"]
+        );
+        assert_eq!(ids(f(Some("*-b"), None, true, false, false)).await, ["s3"]);
+        assert_eq!(
+            ids(f(None, Some("fix-?"), true, false, false)).await,
+            ["s5", "s2", "s1"]
+        );
+        assert_eq!(
+            ids(f(Some("agent-a"), Some("fix-*"), false, true, false)).await,
+            ["s2"]
+        );
+        // `[` is literal, as in webhook globs; a pattern never matches NULL.
+        assert_eq!(
+            ids(f(None, Some("[x]-*"), true, false, false)).await,
+            ["s3"]
+        );
+        assert_eq!(
+            ids(f(Some("*"), None, true, false, false)).await,
+            ["s4", "s3", "s2", "s1"]
+        );
+        assert_eq!(
+            store
+                .list_sessions_matching(&f(None, None, true, false, false), 2)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_created_in_the_same_millisecond_list_newest_inserted_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        // Ids sort neither with nor against insertion order.
+        let inserted = ["s3", "s1", "s4", "s2", "s5"];
+        for id in inserted {
+            let mut r = record(id, SessionState::Done);
+            r.created_ms = 7;
+            store.insert_session(&r).await.unwrap();
+        }
+        let expected: Vec<_> = inserted.iter().rev().map(|id| id.to_string()).collect();
+        for filter in [
+            ListFilter {
+                all: true,
+                ..Default::default()
+            },
+            ListFilter {
+                ended: true,
+                agent: Some("a".into()),
+                ..Default::default()
+            },
+        ] {
+            let ids: Vec<_> = store
+                .list_sessions_matching(&filter, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id.0)
+                .collect();
+            assert_eq!(ids, expected);
+        }
     }
 
     #[tokio::test]

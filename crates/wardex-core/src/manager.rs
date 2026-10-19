@@ -11,13 +11,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::config::SessionsConfig;
 use crate::driver::{Driver, DriverCommand, DriverError, DriverEvent, READONLY_PREFIX, SpawnSpec};
 use crate::process::{self, Launcher};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
-    Answer, Config, DriverKind, Event, EventKind, GitState, RunSpec, SessionId, SessionRecord,
-    SessionState, StuckReason, ToolStatus, git,
+    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter, RunSpec,
+    SessionId, SessionRecord, SessionState, StuckReason, ToolStatus, git,
 };
 
 const BROADCAST_CAPACITY: usize = 8192;
@@ -219,6 +220,8 @@ pub struct EndedSession {
     pub last_error: Option<String>,
     #[serde(default)]
     pub cleanup_failed: bool,
+    #[serde(default)]
+    pub ended_reason: Option<EndReason>,
 }
 
 /// One-line form of an event.
@@ -252,6 +255,56 @@ fn idle_since(l: &Live) -> Option<i64> {
     (l.record.state == SessionState::Idle && !l.turn_active && l.pending.is_empty())
         .then_some(l.idle_since_ms)
         .flatten()
+}
+
+/// A live session that is idle (no turn, no open question) and not closing.
+#[derive(Debug, Clone)]
+struct IdleCandidate {
+    id: SessionId,
+    idle_since_ms: i64,
+}
+
+/// Which idle sessions supervision closes now, and why. Longest idle first:
+/// those idle for `idle_shutdown_secs`, then those beyond `max_idle_live`,
+/// then, while available memory is below `min_mem_available_mb`, one more,
+/// unless another idle close is happening now or a memory close is still
+/// waiting for its process to exit.
+fn idle_closures(
+    mut idle: Vec<IdleCandidate>,
+    now: i64,
+    s: &SessionsConfig,
+    mem_available_mb: Option<u64>,
+    memory_close_pending: bool,
+) -> Vec<(SessionId, EndReason)> {
+    idle.sort_by(|a, b| (a.idle_since_ms, &a.id).cmp(&(b.idle_since_ms, &b.id)));
+    let shutdown_ms = secs_to_ms(s.idle_shutdown_secs);
+    let (expired, mut kept): (Vec<_>, Vec<_>) = idle
+        .into_iter()
+        .partition(|c| shutdown_ms > 0 && now - c.idle_since_ms >= shutdown_ms);
+    let mut out: Vec<_> = expired
+        .into_iter()
+        .map(|c| (c.id, EndReason::IdleShutdown))
+        .collect();
+    let max = s.max_idle_live as usize;
+    if max > 0 && kept.len() > max {
+        let excess = kept.len() - max;
+        out.extend(kept.drain(..excess).map(|c| (c.id, EndReason::IdleEvicted)));
+    }
+    let low_memory = s.min_mem_available_mb > 0
+        && mem_available_mb.is_some_and(|mb| mb < s.min_mem_available_mb);
+    if low_memory
+        && out.is_empty()
+        && !memory_close_pending
+        && let Some(oldest) = kept.into_iter().next()
+    {
+        out.push((oldest.id, EndReason::MemoryPressure));
+    }
+    out
+}
+
+/// Seconds from the config as milliseconds, saturating instead of wrapping.
+fn secs_to_ms(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -314,6 +367,8 @@ struct Live {
     stuck_flagged: bool,
     stop_requested: bool,
     idle_exit: bool,
+    /// Why supervision closed this idle process (with `idle_exit`).
+    idle_reason: Option<EndReason>,
     drain_exit: bool,
     /// EOF cannot be undone when a drain is refused. Keep this separate
     /// from the exit classification flags, which the reservation resets.
@@ -644,6 +699,7 @@ impl Manager {
             record.resume_with_prompt = record.state != SessionState::Idle;
             record.state = SessionState::Orphaned;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(EndReason::DaemonLost);
             record.pid = None;
             let message = cleanup_error
                 .map(|error| error.to_string())
@@ -657,6 +713,7 @@ impl Manager {
                 EventKind::Ended {
                     state: SessionState::Orphaned,
                     exit_code: None,
+                    reason: Some(EndReason::DaemonLost),
                 },
             )?;
             ids.push(record.id.clone());
@@ -803,12 +860,14 @@ impl Manager {
             resume_pending: false,
             resume_with_prompt: false,
             cleanup_failed: false,
+            ended_reason: None,
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
         if let Err(e) = self.spawn_process(&mut record, None) {
             record.state = SessionState::Error;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(EndReason::Error);
             record.last_error = Some(e.to_string());
             let event = make_event(
                 &mut record,
@@ -860,6 +919,7 @@ impl Manager {
         record.unit = handle.unit.clone();
         record.state = SessionState::Starting;
         record.ended_ms = None;
+        record.ended_reason = None;
         record.updated_ms = now_ms();
         self.cache(record);
         self.inner
@@ -880,6 +940,7 @@ impl Manager {
             stuck_flagged: false,
             stop_requested: false,
             idle_exit: false,
+            idle_reason: None,
             drain_exit: false,
             stdin_closed: false,
             interrupt_requested: false,
@@ -1201,17 +1262,23 @@ impl Manager {
             };
             let mut record = entry.record.clone();
             let shutting_down = self.inner.shutting_down.load(Ordering::SeqCst);
-            let state = if entry.stop_requested && !shutting_down {
-                SessionState::Stopped
+            let (state, reason) = if entry.stop_requested && !shutting_down {
+                (SessionState::Stopped, EndReason::Stopped)
             } else if entry.drain_exit || shutting_down {
                 record.resume_pending = true;
                 record.resume_with_prompt =
                     record.resume_with_prompt || entry.turn_active || !entry.pending.is_empty();
-                SessionState::Orphaned
+                let reason = if entry.drain_exit {
+                    EndReason::Drain
+                } else {
+                    EndReason::Shutdown
+                };
+                (SessionState::Orphaned, reason)
             } else if entry.idle_exit || (code == Some(0) && !entry.turn_active) {
-                SessionState::Done
+                let reason = entry.idle_reason.unwrap_or(EndReason::Done);
+                (SessionState::Done, reason)
             } else {
-                SessionState::Error
+                (SessionState::Error, EndReason::Error)
             };
             if state == SessionState::Error {
                 let mut message = match code {
@@ -1235,6 +1302,7 @@ impl Manager {
             }
             record.state = state;
             record.ended_ms = Some(now_ms());
+            record.ended_reason = Some(reason);
             record.pid = None;
             if let Some(error) = &cleanup_error {
                 record.state = SessionState::Orphaned;
@@ -1251,6 +1319,7 @@ impl Manager {
                 EventKind::Ended {
                     state: ended_state,
                     exit_code: code,
+                    reason: Some(reason),
                 },
             );
             self.cache(&record);
@@ -1264,10 +1333,13 @@ impl Manager {
             live.remove(id);
             record
         };
-        tracing::info!(session = %id, state = record.state.as_str(), ?code, "session process ended and scope reaped");
+        let reason = record.ended_reason;
+        tracing::info!(session = %id, state = record.state.as_str(), reason = reason.map(EndReason::as_str), ?code, "session process ended and scope reaped");
+        // An idle session closed to save resources is unfinished work: keep
+        // its worktree so `send` can continue it.
         if cleanup_error.is_none()
             && record.remove_worktree
-            && matches!(record.state, SessionState::Done | SessionState::Stopped)
+            && matches!(reason, Some(EndReason::Done | EndReason::Stopped))
             && let Some(origin) = &record.origin_cwd
             && let Some(root) = git::repo_root(origin).await
             && let Err(e) = git::remove_worktree(&root, &record.cwd).await
@@ -1277,7 +1349,16 @@ impl Manager {
     }
 
     pub async fn list(&self, all: bool) -> Result<Vec<SessionView>> {
-        let records = match self.inner.store.list_sessions(all, 500).await {
+        self.list_filtered(&ListFilter {
+            all,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Sessions passing `filter`, newest first (at most 500).
+    pub async fn list_filtered(&self, filter: &ListFilter) -> Result<Vec<SessionView>> {
+        let records = match self.inner.store.list_sessions_matching(filter, 500).await {
             Ok(records) => {
                 *self
                     .inner
@@ -1298,20 +1379,22 @@ impl Manager {
                 Vec::new()
             }
         };
-        let mut records: HashMap<_, _> = records
+        // Keep the database order (newest first, ties in insertion order) and
+        // overlay the cached state; cached-only sessions follow by id, so the
+        // result never depends on hash map order.
+        let mut cached = self
+            .inner
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut records: Vec<SessionRecord> = records
             .into_iter()
-            .map(|record| (record.id.clone(), record))
+            .map(|record| cached.remove(&record.id).unwrap_or(record))
             .collect();
-        records.extend(
-            self.inner
-                .records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        );
-        let records = records
-            .into_values()
-            .filter(|r| all || !r.state.is_terminal());
+        let mut cached_only: Vec<_> = cached.into_values().collect();
+        cached_only.sort_by(|a, b| b.id.cmp(&a.id));
+        records.extend(cached_only);
         let live = self.live();
         let mut out: Vec<SessionView> = records
             .into_iter()
@@ -1329,17 +1412,56 @@ impl Manager {
             })
             .collect();
         // Sessions started after the list query.
-        for (id, l) in live.iter() {
-            if !out.iter().any(|v| &v.session.id == id) {
-                out.push(SessionView {
-                    session: l.record.clone(),
-                    live: true,
-                    pending_questions: l.pending.len(),
-                });
-            }
-        }
+        let mut started: Vec<_> = live
+            .iter()
+            .filter(|(id, _)| !out.iter().any(|v| &v.session.id == *id))
+            .map(|(_, l)| SessionView {
+                session: l.record.clone(),
+                live: true,
+                pending_questions: l.pending.len(),
+            })
+            .collect();
+        drop(live);
+        started.sort_by(|a, b| b.session.id.cmp(&a.session.id));
+        out.extend(started);
+        out.retain(|v| {
+            filter.matches(&v.session) && (!filter.resumable || (!v.live && v.session.cwd.is_dir()))
+        });
+        // Stable: sessions created in the same millisecond keep the order above.
         out.sort_by_key(|v| std::cmp::Reverse(v.session.created_ms));
+        out.truncate(500);
         Ok(out)
+    }
+
+    /// The newest session whose labels match the `agent`/`task` globs, live
+    /// or ended. At least one pattern is required.
+    pub async fn latest(&self, agent: Option<String>, task: Option<String>) -> Result<SessionId> {
+        if agent.is_none() && task.is_none() {
+            return Err(ManagerError::Invalid(
+                "latest needs an agent or task pattern".into(),
+            ));
+        }
+        let filter = ListFilter {
+            all: true,
+            agent,
+            task,
+            ..Default::default()
+        };
+        self.list_filtered(&filter)
+            .await?
+            .into_iter()
+            .next()
+            .map(|v| v.session.id)
+            .ok_or_else(|| {
+                let mut wanted = Vec::new();
+                if let Some(a) = &filter.agent {
+                    wanted.push(format!("agent {a}"));
+                }
+                if let Some(t) = &filter.task {
+                    wanted.push(format!("task {t}"));
+                }
+                ManagerError::NotFound(wanted.join(", "))
+            })
     }
 
     pub async fn status(&self, id: &SessionId) -> Result<SessionStatus> {
@@ -1379,7 +1501,7 @@ impl Manager {
     /// that ended in the last 24 hours.
     pub async fn overview(&self, events: i64) -> Result<Overview> {
         let now = now_ms();
-        let idle_shutdown_ms = self.inner.config.sessions.idle_shutdown_secs as i64 * 1000;
+        let idle_shutdown_ms = secs_to_ms(self.inner.config.sessions.idle_shutdown_secs);
         let snapshot: Vec<OverviewSession> = self
             .live()
             .values()
@@ -1452,6 +1574,7 @@ impl Manager {
                 last_result: r.last_result.map(|t| truncate(&t, OVERVIEW_TEXT_LIMIT)),
                 last_error: r.last_error,
                 cleanup_failed: r.cleanup_failed,
+                ended_reason: r.ended_reason,
             })
             .collect();
         Ok(Overview {
@@ -1715,6 +1838,17 @@ impl Manager {
             self.cache(&record);
             cleanup?;
         }
+        if !record.cwd.is_dir() {
+            let hint = if record.worktree.is_some() {
+                " (its worktree was removed)"
+            } else {
+                ""
+            };
+            return Err(ManagerError::Conflict(format!(
+                "session {id} cannot be resumed: its working directory {} no longer exists{hint}",
+                record.cwd.display()
+            )));
+        }
         let resume_id = record.driver_session_id.clone().ok_or_else(|| {
             ManagerError::Conflict(format!(
                 "session {id} cannot be resumed: the agent never reported a session id"
@@ -1784,7 +1918,8 @@ impl Manager {
     /// Resume sessions orphaned by the previous daemon when
     /// `sessions.auto_resume_orphaned` is on; otherwise just clear their
     /// pending flag. Sessions that were mid-turn get `sessions.resume_prompt`.
-    /// Returns the resumed ids.
+    /// Sessions that were idle are left for `send` to resume unless
+    /// `sessions.auto_resume_idle` is on. Returns the resumed ids.
     pub async fn auto_resume(&self) -> Result<Vec<SessionId>> {
         let pending = self.inner.store.pending_resumes().await?;
         let mut resumed = Vec::new();
@@ -1792,8 +1927,11 @@ impl Manager {
             if record.cleanup_failed {
                 continue;
             }
-            let enabled = self.inner.config.sessions.auto_resume_orphaned;
-            if !enabled || record.driver_session_id.is_none() {
+            let sessions = &self.inner.config.sessions;
+            // Idle sessions come back on demand (`send`) unless configured.
+            let wanted = sessions.auto_resume_orphaned
+                && (record.resume_with_prompt || sessions.auto_resume_idle);
+            if !wanted || record.driver_session_id.is_none() {
                 record.resume_pending = false;
                 record.resume_with_prompt = false;
                 self.inner.store.update_session(&record).await?;
@@ -2136,6 +2274,15 @@ impl Manager {
 
     /// One supervision step.
     pub fn tick(&self, now: i64) {
+        let mem_available_mb = (self.inner.config.sessions.min_mem_available_mb > 0)
+            .then(process::mem_available_mb)
+            .flatten();
+        self.tick_with_memory(now, mem_available_mb);
+    }
+
+    /// One supervision step with the system's available memory (MiB) given
+    /// by the caller instead of read from `/proc/meminfo`.
+    pub fn tick_with_memory(&self, now: i64, mem_available_mb: Option<u64>) {
         let t = &self.inner.config.timeouts;
         let s = &self.inner.config.sessions;
         let pids: Vec<(SessionId, u32)> = self
@@ -2192,7 +2339,8 @@ impl Manager {
                     }
                 }
                 let silent = (now - l.last_activity_ms).max(0) as u64 / 1000;
-                if l.turn_active
+                if t.idle_stuck_secs > 0
+                    && l.turn_active
                     && l.pending.is_empty()
                     && l.running_tools.is_empty()
                     && !l.stuck_flagged
@@ -2207,18 +2355,29 @@ impl Manager {
                         },
                     ));
                 }
-                if s.idle_shutdown_secs > 0
-                    && !l.turn_active
-                    && !l.idle_exit
-                    && !l.stop_requested
-                    && l.pending.is_empty()
-                    && l.record.state == SessionState::Idle
-                    && let Some(since) = l.idle_since_ms
-                    && (now - since).max(0) as u64 / 1000 >= s.idle_shutdown_secs
-                {
-                    l.idle_exit = true;
-                    let _ = l.commands.send(DriverCommand::Shutdown);
+            }
+            let idle: Vec<IdleCandidate> = live
+                .values()
+                .filter(|l| !l.idle_exit && !l.stop_requested && !l.drain_exit && !l.stdin_closed)
+                .filter_map(|l| {
+                    idle_since(l).map(|since| IdleCandidate {
+                        id: l.record.id.clone(),
+                        idle_since_ms: since,
+                    })
+                })
+                .collect();
+            let memory_close_pending = live
+                .values()
+                .any(|l| l.idle_exit && l.idle_reason == Some(EndReason::MemoryPressure));
+            for (id, reason) in idle_closures(idle, now, s, mem_available_mb, memory_close_pending)
+            {
+                let Some(l) = live.get_mut(&id) else { continue };
+                if reason != EndReason::IdleShutdown {
+                    tracing::info!(session = %id, reason = reason.as_str(), ?mem_available_mb, "closing idle session");
                 }
+                l.idle_exit = true;
+                l.idle_reason = Some(reason);
+                let _ = l.commands.send(DriverCommand::Shutdown);
             }
         }
         for (id, kind) in to_emit {
@@ -2385,6 +2544,106 @@ mod tests {
             "drain cleared an independent idle shutdown"
         );
         assert!(!manager.inner.draining.load(Ordering::SeqCst));
+    }
+
+    fn candidates(idle_since: &[(&str, i64)]) -> Vec<IdleCandidate> {
+        idle_since
+            .iter()
+            .map(|(id, since)| IdleCandidate {
+                id: SessionId((*id).into()),
+                idle_since_ms: *since,
+            })
+            .collect()
+    }
+
+    fn closures(
+        idle_since: &[(&str, i64)],
+        s: &SessionsConfig,
+        mem: Option<u64>,
+        pending: bool,
+    ) -> Vec<(String, EndReason)> {
+        idle_closures(candidates(idle_since), 100_000, s, mem, pending)
+            .into_iter()
+            .map(|(id, reason)| (id.0, reason))
+            .collect()
+    }
+
+    fn limits(shutdown: u64, max: u32, min_mem: u64) -> SessionsConfig {
+        SessionsConfig {
+            idle_shutdown_secs: shutdown,
+            max_idle_live: max,
+            min_mem_available_mb: min_mem,
+            ..SessionsConfig::default()
+        }
+    }
+
+    #[test]
+    fn idle_shutdown_closes_sessions_idle_long_enough() {
+        let s = limits(10, 0, 0);
+        assert_eq!(
+            closures(
+                &[("new", 95_000), ("old", 90_000), ("older", 1)],
+                &s,
+                None,
+                false
+            ),
+            [
+                ("older".into(), EndReason::IdleShutdown),
+                ("old".into(), EndReason::IdleShutdown)
+            ]
+        );
+        assert!(closures(&[("old", 1)], &limits(0, 0, 0), None, false).is_empty());
+    }
+
+    #[test]
+    fn idle_limit_closes_the_longest_idle_beyond_it() {
+        let idle = [("c", 30), ("a", 10), ("d", 40), ("b", 20)];
+        assert_eq!(
+            closures(&idle, &limits(0, 2, 0), None, false),
+            [
+                ("a".into(), EndReason::IdleEvicted),
+                ("b".into(), EndReason::IdleEvicted)
+            ]
+        );
+        assert!(closures(&idle, &limits(0, 4, 0), None, false).is_empty());
+        assert!(closures(&idle, &limits(0, 0, 0), None, false).is_empty());
+        // Sessions closed for idleness do not count against the limit.
+        assert_eq!(
+            closures(
+                &[("a", 1), ("b", 99_000), ("c", 99_500)],
+                &limits(10, 2, 0),
+                None,
+                false
+            ),
+            [("a".into(), EndReason::IdleShutdown)]
+        );
+    }
+
+    #[test]
+    fn low_memory_closes_one_idle_session_at_a_time() {
+        let s = limits(0, 0, 1024);
+        let idle = [("b", 20), ("a", 10)];
+        assert_eq!(
+            closures(&idle, &s, Some(512), false),
+            [("a".into(), EndReason::MemoryPressure)]
+        );
+        // Not while the previous one is still exiting, not with enough or
+        // unknown memory, not when disabled, and never without idle sessions.
+        assert!(closures(&idle, &s, Some(512), true).is_empty());
+        assert!(closures(&idle, &s, Some(1024), false).is_empty());
+        assert!(closures(&idle, &s, None, false).is_empty());
+        assert!(closures(&idle, &limits(0, 0, 0), Some(1), false).is_empty());
+        assert!(closures(&[], &s, Some(1), false).is_empty());
+        // Other closes this tick free memory first.
+        assert_eq!(
+            closures(
+                &[("a", 10), ("b", 20), ("c", 30)],
+                &limits(0, 2, 1024),
+                Some(1),
+                false
+            ),
+            [("a".into(), EndReason::IdleEvicted)]
+        );
     }
 
     #[test]

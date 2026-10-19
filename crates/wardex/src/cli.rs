@@ -27,11 +27,23 @@ pub enum Command {
     Daemon(DaemonArgs),
     /// Start a new agent session.
     Run(RunArgs),
-    /// List sessions.
+    /// List sessions (live ones unless filtered otherwise), newest first.
     List {
         /// Include ended sessions.
         #[arg(short, long)]
         all: bool,
+        /// Only sessions whose agent label matches this glob (`*`, `?`).
+        #[arg(long, value_name = "GLOB")]
+        agent: Option<String>,
+        /// Only sessions whose task label matches this glob (`*`, `?`).
+        #[arg(long, value_name = "GLOB")]
+        task: Option<String>,
+        /// Only ended sessions.
+        #[arg(long)]
+        ended: bool,
+        /// Only ended sessions that `send` can continue.
+        #[arg(long)]
+        resumable: bool,
     },
     /// Show a session's state, pending questions and resource usage.
     Status { id: String },
@@ -79,8 +91,24 @@ pub enum Command {
         #[arg(long = "item", value_name = "ID=TEXT")]
         items: Vec<String>,
     },
-    /// Send a follow-up message (resumes an ended session).
-    Send { id: String, message: String },
+    /// Send a follow-up message (resumes an ended session):
+    /// `send <ID> <MESSAGE>` or `send --latest --agent GLOB [--task GLOB] <MESSAGE>`.
+    Send {
+        /// Session id or unique prefix (omit with --latest).
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        message: Option<String>,
+        /// Send to the newest session (live or ended) whose labels match
+        /// --agent and/or --task.
+        #[arg(long)]
+        latest: bool,
+        /// With --latest: glob for the session's agent label.
+        #[arg(long, value_name = "GLOB", requires = "latest")]
+        agent: Option<String>,
+        /// With --latest: glob for the session's task label.
+        #[arg(long, value_name = "GLOB", requires = "latest")]
+        task: Option<String>,
+    },
     /// Stop a session.
     Stop { id: String },
     /// Interrupt the running turn of a session.
@@ -227,6 +255,55 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["wardex", "daemon", "stop"]).is_ok());
         assert!(Cli::try_parse_from(["wardex", "--json", "list", "-a"]).is_ok());
+    }
+
+    #[test]
+    fn list_filters_and_send_latest() {
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "list",
+            "--agent",
+            "agent-*",
+            "--task",
+            "t?",
+            "--ended",
+            "--resumable",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::List {
+                agent,
+                task,
+                ended,
+                resumable,
+                all,
+            } => {
+                assert_eq!(agent.as_deref(), Some("agent-*"));
+                assert_eq!(task.as_deref(), Some("t?"));
+                assert!(ended && resumable && !all);
+            }
+            c => panic!("{c:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["wardex", "send", "--latest", "--agent", "a*", "next"]).unwrap();
+        match cli.command {
+            Command::Send {
+                id,
+                message,
+                latest,
+                agent,
+                task,
+            } => {
+                // The single positional is the message; main.rs sorts it out.
+                assert_eq!(id.as_deref(), Some("next"));
+                assert!(message.is_none() && latest && task.is_none());
+                assert_eq!(agent.as_deref(), Some("a*"));
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(Cli::try_parse_from(["wardex", "send", "ab12", "next"]).is_ok());
+        // Label patterns select a session only with --latest.
+        assert!(Cli::try_parse_from(["wardex", "send", "--agent", "a", "ab12", "next"]).is_err());
     }
 
     #[test]

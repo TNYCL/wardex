@@ -855,11 +855,107 @@ fn drain_restart_closes_idle_processes_gracefully_and_keeps_resume_ids() {
         .find(|e| e["type"] == "ended")
         .unwrap();
     assert_eq!(ended["payload"]["exit_code"], 0);
+    assert_eq!(ended["payload"]["reason"], "drain");
+    assert_eq!(after["ended_reason"], "drain");
     env.json(&["resume", id]);
     env.wait_state(id, "idle");
     env.json(&["send", id, "next"]);
     env.wait_state(id, "idle");
     assert_eq!(env.json(&["status", id])["spawn_count"], 2);
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn idle_shutdown_is_reported_with_its_reason_and_send_continues() {
+    let env = Env::with_config("resume", "[sessions]\nidle_shutdown_secs = 1\n");
+    lifecycle_agent(&env, "idle");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "done");
+    assert_eq!(env.json(&["status", id])["ended_reason"], "idle_shutdown");
+    let human = env.run(&["status", id]);
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("state     done (idle_shutdown)"), "{human}");
+    let sent = env.json(&["send", id, "next"]);
+    assert_eq!(sent["resumed"], true);
+    wait_until(
+        || env.json(&["status", id])["spawn_count"] == 2,
+        "second process",
+    );
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn list_filters_and_send_latest() {
+    let env = Env::new("tool");
+    let daemon = env.start_daemon();
+    let cwd = env.dir.path().to_string_lossy().into_owned();
+    let run = |agent: &str, task: &str| {
+        let out = env.run(&[
+            "run", "--driver", "claude", "--cwd", &cwd, "--agent", agent, "--task", task,
+            "--prompt", "go",
+        ]);
+        let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        // The recorded agent exits after its turn: ended by itself, resumable.
+        env.wait_state(&id, "done");
+        id
+    };
+    let first = run("agent-a", "fix-1");
+    let second = run("agent-a", "fix-2");
+    let other = run("agent-b", "docs");
+    let ids = |args: &[&str]| -> Vec<String> {
+        let mut all = vec!["list"];
+        all.extend_from_slice(args);
+        env.json(&all)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(ids(&[]).is_empty(), "plain list shows live sessions only");
+    assert_eq!(
+        ids(&["--ended"]),
+        [other.as_str(), second.as_str(), first.as_str()]
+    );
+    assert_eq!(
+        ids(&["--ended", "--agent", "agent-a"]),
+        [second.as_str(), first.as_str()]
+    );
+    assert_eq!(
+        ids(&["-a", "--task", "fix-?"]),
+        [second.as_str(), first.as_str()]
+    );
+    assert_eq!(ids(&["--resumable", "--agent", "*-b"]), [other.as_str()]);
+    let listed = env.json(&["list", "--ended", "--task", "docs"]);
+    assert_eq!(listed[0]["ended_reason"], "done");
+    let human = env.run(&["list", "--ended", "--agent", "agent-b"]);
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("ENDED") && human.contains(&other), "{human}");
+
+    let sent = env.json(&["send", "--latest", "--agent", "agent-a", "next"]);
+    assert_eq!(sent["session_id"], second.as_str());
+    assert_eq!(sent["resumed"], true);
+    let out = env.run(&[
+        "send", "--latest", "--agent", "agent-a", "--task", "fix-1", "next",
+    ]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with(&format!("sent to {first}")),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = env.run(&["--json", "send", "--latest", "--agent", "nobody", "next"]);
+    assert!(!out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["code"], "not_found");
+    let out = env.run(&["send", "--latest", "next"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("agent or task"));
+    let out = env.run(&["send", "--latest", "--agent", "agent-a", &first, "next"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only the message"));
     env.stop_daemon(daemon);
 }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wardex_core::manager::{AnswerInput, Manager, ManagerError, drain_next_steps};
-use wardex_core::{Event, EventKind, RunSpec};
+use wardex_core::{Event, EventKind, ListFilter, RunSpec};
 
 /// Default number of events `tail` shows.
 pub const DEFAULT_TAIL: i64 = 20;
@@ -22,9 +22,18 @@ const MAX_OVERVIEW_EVENTS: i64 = 50;
 pub enum Request {
     Ping,
     Run(RunSpec),
+    /// Without filters, live sessions; see [`ListFilter`].
     List {
         #[serde(default)]
         all: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        ended: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        resumable: bool,
     },
     Status {
         id: String,
@@ -64,9 +73,18 @@ pub enum Request {
         question_id: Option<String>,
         input: AnswerInput,
     },
+    /// To session `id`, or with `latest` to the newest session whose labels
+    /// match the `agent`/`task` globs. Resumes an ended session.
     Send {
-        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         message: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        latest: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
     },
     Stop {
         id: String,
@@ -101,6 +119,30 @@ pub enum Request {
     },
     /// Re-read the config and env files and apply the webhook settings.
     Reload,
+}
+
+impl Request {
+    /// `list` without filters: live sessions, or all with `all`.
+    pub fn list(all: bool) -> Self {
+        Self::List {
+            all,
+            agent: None,
+            task: None,
+            ended: false,
+            resumable: false,
+        }
+    }
+
+    /// `send` to a session id or prefix.
+    pub fn send(id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Send {
+            id: Some(id.into()),
+            message: message.into(),
+            latest: false,
+            agent: None,
+            task: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,6 +253,10 @@ pub struct StreamItem {
     pub event: Event,
 }
 
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
@@ -251,7 +297,22 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             "started_ms": m.started_ms(),
         }),
         Request::Run(spec) => to_value(&m.run(spec).await?),
-        Request::List { all } => to_value(&m.list(all).await?),
+        Request::List {
+            all,
+            agent,
+            task,
+            ended,
+            resumable,
+        } => to_value(
+            &m.list_filtered(&ListFilter {
+                all,
+                agent,
+                task,
+                ended,
+                resumable,
+            })
+            .await?,
+        ),
         Request::Status { id } => {
             let id = m.resolve(&id).await?;
             to_value(&m.status(&id).await?)
@@ -292,8 +353,32 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             let qid = m.answer(&id, question_id.as_deref(), input).await?;
             json!({"session_id": id, "question_id": qid})
         }
-        Request::Send { id, message } => {
-            let id = m.resolve(&id).await?;
+        Request::Send {
+            id,
+            message,
+            latest,
+            agent,
+            task,
+        } => {
+            let id = match (id, latest) {
+                (Some(_), true) => {
+                    return Err(ManagerError::Invalid(
+                        "give either a session id or latest, not both".into(),
+                    ));
+                }
+                (Some(id), false) if agent.is_none() && task.is_none() => m.resolve(&id).await?,
+                (None, true) => m.latest(agent, task).await?,
+                (Some(_), false) => {
+                    return Err(ManagerError::Invalid(
+                        "agent and task select a session only with latest".into(),
+                    ));
+                }
+                (None, false) => {
+                    return Err(ManagerError::Invalid(
+                        "a session id is required (or latest with an agent or task pattern)".into(),
+                    ));
+                }
+            };
             let resumed = m.send(&id, message).await?;
             json!({"session_id": id, "resumed": resumed})
         }
@@ -355,4 +440,40 @@ pub async fn initial_events(
 /// Whether a followed stream should end after this event.
 pub fn ends_stream(event: &Event) -> bool {
     matches!(event.kind, EventKind::Ended { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_and_send_keep_their_wire_format() {
+        // Requests from older clients still parse.
+        let send: Request =
+            serde_json::from_value(json!({"op": "send", "id": "ab12", "message": "next"})).unwrap();
+        assert!(matches!(
+            send,
+            Request::Send { id: Some(ref id), latest: false, agent: None, task: None, .. }
+                if id == "ab12"
+        ));
+        let list: Request = serde_json::from_value(json!({"op": "list", "all": true})).unwrap();
+        assert!(matches!(
+            list,
+            Request::List {
+                all: true,
+                ended: false,
+                resumable: false,
+                ..
+            }
+        ));
+        // Unfiltered requests look exactly as before to older daemons.
+        assert_eq!(
+            serde_json::to_value(Request::list(true)).unwrap(),
+            json!({"op": "list", "all": true})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::send("ab12", "next")).unwrap(),
+            json!({"op": "send", "id": "ab12", "message": "next"})
+        );
+    }
 }

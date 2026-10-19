@@ -95,6 +95,19 @@ pub struct ListParams {
     /// Include ended sessions (up to 500, newest first).
     #[serde(default)]
     pub all: bool,
+    /// Only sessions whose `agent` label matches this glob (`*`, `?`).
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Only sessions whose `task` label matches this glob (`*`, `?`).
+    #[serde(default)]
+    pub task: Option<String>,
+    /// Only ended sessions (implies `all`).
+    #[serde(default)]
+    pub ended: bool,
+    /// Only ended sessions that `send` can continue (resume id known, no
+    /// pending scope cleanup, working directory still there).
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -150,11 +163,22 @@ pub struct AnswerParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendParams {
-    /// Session id or unique prefix.
-    pub id: String,
+    /// Session id or unique prefix. Omit it with `latest`.
+    #[serde(default)]
+    pub id: Option<String>,
     /// The next instruction. Queued if a turn is running; resumes an ended
     /// session.
     pub message: String,
+    /// Send to the newest session (live or ended) whose labels match `agent`
+    /// and/or `task` instead of `id`.
+    #[serde(default)]
+    pub latest: bool,
+    /// With `latest`: glob (`*`, `?`) for the session's `agent` label.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// With `latest`: glob (`*`, `?`) for the session's `task` label.
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -271,11 +295,20 @@ impl WardexMcp {
     }
 
     #[tool(
-        description = "List live sessions (or all with `all`), newest first.",
+        description = "List live sessions (or all with `all`), newest first. Filter by \
+                       `agent`/`task` glob; `ended` for ended sessions only, `resumable` \
+                       for ended ones `send` can continue (see `ended_reason`).",
         annotations(read_only_hint = true)
     )]
     async fn list(&self, Parameters(p): Parameters<ListParams>) -> CallToolResult {
-        self.call(Request::List { all: p.all }).await
+        self.call(Request::List {
+            all: p.all,
+            agent: p.agent,
+            task: p.task,
+            ended: p.ended,
+            resumable: p.resumable,
+        })
+        .await
     }
 
     #[tool(
@@ -366,13 +399,17 @@ impl WardexMcp {
     }
 
     #[tool(
-        description = "Send the next message to a session. Queued while a turn runs; \
-                          an ended session is resumed first."
+        description = "Send the next message to a session (`id`), or with `latest` to the \
+                          newest session matching `agent`/`task` globs. Queued while a turn \
+                          runs; an ended session is resumed first."
     )]
     async fn send(&self, Parameters(p): Parameters<SendParams>) -> CallToolResult {
         self.call(Request::Send {
             id: p.id,
             message: p.message,
+            latest: p.latest,
+            agent: p.agent,
+            task: p.task,
         })
         .await
     }

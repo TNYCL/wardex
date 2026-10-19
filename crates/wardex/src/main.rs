@@ -179,8 +179,22 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             })
         }
-        Command::List { all } => {
-            let resp = client.request(&Request::List { all }).await?;
+        Command::List {
+            all,
+            agent,
+            task,
+            ended,
+            resumable,
+        } => {
+            let resp = client
+                .request(&Request::List {
+                    all,
+                    agent,
+                    task,
+                    ended,
+                    resumable,
+                })
+                .await?;
             finish(json, resp, |v| {
                 let views: Vec<SessionView> = serde_json::from_value(v.clone()).unwrap_or_default();
                 output::list(&views)
@@ -279,13 +293,42 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 format!("answered {}\n", v["question_id"].as_str().unwrap_or("-"))
             })
         }
-        Command::Send { id, message } => {
-            let resp = client.request(&Request::Send { id, message }).await?;
+        Command::Send {
+            id,
+            message,
+            latest,
+            agent,
+            task,
+        } => {
+            let (id, message) = match (latest, id, message) {
+                (false, Some(id), Some(message)) => (Some(id), message),
+                (true, Some(message), None) => (None, message),
+                (true, Some(_), Some(_)) => {
+                    bail!("with --latest, give only the message, not a session id")
+                }
+                _ => bail!(
+                    "usage: wardex send <ID> <MESSAGE> | wardex send --latest --agent GLOB [--task GLOB] <MESSAGE>"
+                ),
+            };
+            let resp = client
+                .request(&Request::Send {
+                    id,
+                    message,
+                    latest,
+                    agent,
+                    task,
+                })
+                .await?;
             finish(json, resp, |v| {
-                if v["resumed"].as_bool() == Some(true) {
-                    "sent (session resumed)\n".into()
+                let target = if latest {
+                    format!(" to {}", v["session_id"].as_str().unwrap_or("-"))
                 } else {
-                    "sent\n".into()
+                    String::new()
+                };
+                if v["resumed"].as_bool() == Some(true) {
+                    format!("sent{target} (session resumed)\n")
+                } else {
+                    format!("sent{target}\n")
                 }
             })
         }

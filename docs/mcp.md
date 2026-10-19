@@ -94,14 +94,14 @@ Session ids can be shortened to any unique prefix.
 |---|---|---|
 | `run` | `driver` (`claude`/`codex`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
 | `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration, `idle_since_ms`, `shutdown_in_ms` and latest events; counts per state; sessions ended in the last 24h |
-| `list` | optional `all` | session records, newest first |
+| `list` | optional `all`; filters `agent`, `task` (globs with `*`, `?`), `ended` (ended sessions only), `resumable` (ended sessions `send` can continue) | session records (with `ended_reason`), newest first, at most 500 |
 | `status` | `id` | record, pending questions, running tools, RSS/CPU |
 | `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60), `full` | events, oldest first |
 | `tool_output` | `id`, `seq` (of either `tool_call` event of the call) | the call's full `input` and `output` |
 | `summary` | `id` | final text, git state, durations, turn/event/tool counts |
 | `pending_questions` | – | open questions and approvals of all sessions |
 | `answer` | `id`; `text` **or** `answers` (item id → answer); optional `question_id` | `{session_id, question_id}` |
-| `send` | `id`, `message` | `{session_id, resumed}` |
+| `send` | `message`; `id`, **or** `latest` with `agent` and/or `task` globs (the newest matching session, live or ended) | `{session_id, resumed}` |
 | `interrupt` | `id` | `{session_id}` |
 | `stop` | `id` | `{session_id}` |
 | `resume` | `id`; optional `message` | session record |
@@ -144,6 +144,18 @@ items:
   session is `idle`: the process is alive and waits for the next message. It
   is set once the session stops, errors, or closes after
   `sessions.idle_shutdown_secs`.
+- `ended_reason` says why the process ended (also `reason` on the `ended`
+  event): `done` (the agent exited by itself), `stopped`, `idle_shutdown`
+  (idle for `sessions.idle_shutdown_secs`), `idle_evicted` (more than
+  `sessions.max_idle_live` idle sessions), `memory_pressure` (available memory
+  below `sessions.min_mem_available_mb`), `error`, `drain`, `shutdown` (daemon
+  stop or restart) or `daemon_lost` (the daemon died while it ran). It is
+  empty while the session is live and for sessions that ended before it was
+  recorded. After `idle_shutdown`, `idle_evicted` and `memory_pressure` the
+  work is unfinished: `send` continues it, and a `remove_worktree` worktree is
+  kept until the session is stopped or ends by itself.
+- `send` and `resume` fail with `conflict` if the session's working directory
+  no longer exists (for example a removed worktree); nothing is started.
 
 ### Tool output
 
@@ -171,10 +183,14 @@ Message deltas are never returned; full messages are.
 4. On `done`: read `summary` (result text, changed files, branch). Either
    `send` the next instruction or leave the session alone.
 5. **Do not `stop` a session because its work is done.** An idle session
-   closes itself after `sessions.idle_shutdown_secs` (default 900 s;
-   `overview` shows `shutdown_in_ms`), and `send` resumes it with its context
-   later. Use `stop` only to abort work.
+   closes itself after `sessions.idle_shutdown_secs` (default 43200 s = 12 h;
+   `overview` shows `shutdown_in_ms`), or earlier when more than
+   `sessions.max_idle_live` sessions are idle or memory runs low, and `send`
+   resumes it with its context later. Use `stop` only to abort work.
 6. Use `overview` to see everything at once, e.g. after a bot restart.
+7. To pick up earlier work without its id, `list` with `resumable: true` and
+   your `agent`/`task` labels, or `send` with `latest: true` and the same
+   labels.
 
 Without webhooks, poll `overview` or follow one session with `tail` +
 `since_seq` + `wait_secs`.

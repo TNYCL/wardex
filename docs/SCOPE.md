@@ -77,8 +77,15 @@ Events: `started`, `prompt`, `message` (delta and full text), `tool_call`
 Session states: `starting`, `running`, `idle` (turn done, process waiting for
 the next message), `waiting_input`, and the resumable end states `done`,
 `error`, `stopped`, `orphaned`. An idle process is closed after
-`sessions.idle_shutdown_secs`; `send` to an ended session resumes it
-transparently.
+`sessions.idle_shutdown_secs` (default 12 h); `send` to an ended session
+resumes it transparently. Idle processes keep their memory, so supervision
+also closes the longest idle ones above `sessions.max_idle_live` (default 8)
+and, one at a time, while `MemAvailable` is below
+`sessions.min_mem_available_mb` (default 1024 MiB). Sessions with a running
+turn or an open question are never closed. Each ended session records an `ended_reason`
+(`done`, `stopped`, `idle_shutdown`, `idle_evicted`, `memory_pressure`,
+`error`, `drain`, `shutdown`, `daemon_lost`), also sent as `reason` on the
+`ended` event.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.
@@ -90,13 +97,15 @@ transparently.
   3 min and `stuck` at 8 min. A session with no output gets `stuck` at 8 min,
   but **only while no tool is running** (a long build is not stuck);
   optionally the scope's CPU usage is checked too. All timings are
-  configurable.
+  configurable; `idle_stuck_secs = 0` turns the no-output check off.
 
 ### 1.3 Sessions and workspace
 
 - Default: the main checkout. `--cwd` runs directly in the given directory.
 - Optional `--worktree <name>`: a git worktree under `.worktree/<name>`,
-  optional branch name, optional cleanup on close.
+  optional branch name, optional cleanup on close (on stop or when the agent
+  exits by itself; a worktree closed for idleness or memory is kept so the
+  session can be continued).
 - `--readonly`: the driver's plan / read-only mode plus a prompt prefix as a
   fallback.
 - Concurrent sessions in the same cwd are allowed with a warning (no repo
@@ -141,7 +150,9 @@ transparently.
 - Agent stdio pipes are owned by the daemon, so a daemon restart loses live
   sessions. On start, sessions whose process is gone are marked
   `error: orphaned` and can be continued with `wardex resume` (driver resume
-  id). `auto_resume_orphaned` (default off) resumes them automatically.
+  id). `auto_resume_orphaned` (default off) resumes those that were mid-turn
+  or waiting for an answer automatically; idle ones only with
+  `auto_resume_idle` (default off), otherwise `send` resumes them on demand.
 - Scope cleanup failure is isolated to its session, so an unavailable user
   systemd manager, a timed-out query or an unreapable process does not prevent
   daemon startup or recovery of other sessions. The orphan retains its old
@@ -186,8 +197,9 @@ transparently.
   natural exit is classified normally, while retaining the closed-stdin
   guard. Independent idle shutdowns keep their exit flag. Wait for it to exit
   or explicitly `stop` it before retrying.
-  Closed sessions are orphaned and can be resumed manually or through
-  `auto_resume_orphaned`, without an extra continuation prompt. A successful
+  Closed sessions are orphaned and can be resumed manually (`send` or
+  `resume`), or through `auto_resume_orphaned` with `auto_resume_idle`,
+  without an extra continuation prompt. A successful
   JSON response lists `closed_sessions`; it is sent only after persistence
   and graceful process exit complete.
 - **Forced drain** (`daemon restart --drain SECS --force`, also supported on
@@ -220,6 +232,11 @@ transparently.
 `daemon` (+ `daemon stop`), `run`, `list`, `status <id>`, `tail <id> [-f]`,
 `summary <id>`, `answer <id> <text>`, `send <id> <message>`, `stop <id>`,
 `interrupt <id>`, `resume <id>`, `pending`.
+
+- `list`: `-a` (include ended), `--agent GLOB`, `--task GLOB`, `--ended`,
+  `--resumable` (ended sessions `send` can continue).
+- `send --latest --agent GLOB [--task GLOB] <message>`: the newest session
+  with matching labels, live or ended.
 
 - All accept `--json`. The CLI talks to the daemon over a local Unix socket.
 - `run`: `--driver claude|codex`, `--model`, `--reasoning`, `--cwd`,

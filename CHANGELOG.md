@@ -8,6 +8,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
+  filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
+  find a closed session again. `list` shows when and why a session ended.
+- `wardex send --latest --agent GLOB [--task GLOB] <message>` and `latest`
+  with `agent`/`task` on the MCP `send` tool (`id` is now optional): send to
+  the newest session with matching labels, resuming it if it ended.
+- Memory protection for idle sessions: `sessions.max_idle_live` (default 8)
+  closes the longest idle agent process above that many idle ones, and
+  `sessions.min_mem_available_mb` (default 1024) closes idle processes, longest
+  idle first and one at a time, while the system's `MemAvailable` is below
+  it. Running turns and open questions are never closed; `send` resumes a
+  closed session. 0 turns either check off.
+- `sessions.auto_resume_idle` (default false): with `auto_resume_orphaned`,
+  also restart sessions that were idle when the daemon stopped.
+- `ended_reason` on session records (`list`, `status`, `overview`) and
+  `reason` on `ended` events: `done`, `stopped`, `idle_shutdown`,
+  `idle_evicted`, `memory_pressure`, `error`, `drain`, `shutdown`,
+  `daemon_lost`. The field is optional, so older events still parse.
 - Webhook routing: `agents` and `tasks` glob filters per `[[webhooks]]`
   table, `escalate` event types that go to a target for every session (e.g.
   errors and stuck sessions to an on-call bot), and `name` for logs. Unknown
@@ -122,6 +140,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed (breaking)
 
+- Migration 0004 adds `sessions.ended_reason`; after it is applied, older
+  binaries can no longer open the database. Back up `wardex.db` first.
 - After migration 0003 is applied, older binaries can no longer open this
   database; back up `wardex.db` before installing.
 - `daemon stop/restart --drain SECS` refuses shutdown when turns, answers or
@@ -135,6 +155,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `sessions.idle_shutdown_secs` now defaults to 43200 (12 h) instead of 900,
+  so a follow-up `send` usually reaches a process that still has its context
+  loaded. Each idle agent process keeps its memory meanwhile (roughly
+  100–300 MB per session, partly swapped out over time); set
+  `idle_shutdown_secs = 900` to keep the old behaviour. Values above 30 days
+  are rejected (0 still keeps idle sessions forever).
+- `timeouts.idle_stuck_secs = 0` disables `stuck` (`no_output`) detection
+  instead of flagging every turn at once.
+- With `auto_resume_orphaned`, only sessions that were mid-turn or waiting
+  for an answer are restarted when the daemon starts; idle ones (all of them
+  after `daemon restart --drain`) stay orphaned until `send` resumes them.
+  Set `sessions.auto_resume_idle = true` for the old behaviour.
+- `--rm-worktree` / `remove_worktree` no longer removes the worktree when an
+  idle session is closed for idleness or memory; the worktree is removed on
+  `stop` or when the agent exits by itself, so `send` can continue the work.
+- `send`/`resume` of a session whose working directory is gone fail with a
+  clear `conflict` instead of a spawn error.
 - Event model: `tool_call` has a `call_id` and start/finish status,
   `question` carries question items with options, `approval` has a kind,
   `done` reports interrupts.

@@ -437,7 +437,7 @@ mod tests {
             assert!(error.contains("persistence writer is retrying"), "{error}");
             assert!(error.contains("daemon stop without --drain"), "{error}");
         }
-        let list = client.request(&Request::List { all: true }).await.unwrap();
+        let list = client.request(&Request::list(true)).await.unwrap();
         assert!(list.ok);
         assert_eq!(list.persisted, Some(false));
         assert!(!list.warnings.is_empty());
