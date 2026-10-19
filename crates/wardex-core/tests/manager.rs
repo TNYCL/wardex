@@ -926,6 +926,8 @@ async fn resume_reaps_pending_scope(recover_first: bool) {
     let mut config = Config::default();
     config.sessions.stop_grace_secs = 0;
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let manager = Manager::new(
         config,
         Store::open(h.manager.store().path()).await.unwrap(),
@@ -1032,6 +1034,8 @@ fi
     let mut config = Config::default();
     config.sessions.stop_grace_secs = 0;
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let manager = Manager::new(
         config,
         Store::open(h.manager.store().path()).await.unwrap(),
@@ -1301,6 +1305,8 @@ async fn drain_timeout_preserves_active_idle_questions_and_approvals() {
     h.manager.store().close().await.unwrap();
     let mut config = Config::default();
     config.sessions.auto_resume_orphaned = true;
+    // These sessions were idle; bring them back at start.
+    config.sessions.auto_resume_idle = true;
     let next = Manager::new(
         config,
         Store::open(&path).await.unwrap(),
@@ -1564,14 +1570,111 @@ async fn default_config_keeps_idle_sessions_for_twelve_hours() {
         .unwrap();
     assert!((43_190_000..=43_200_000).contains(&left), "{left}");
     // The old default (15 minutes) no longer closes it.
-    h.manager.tick(now_ms() + 901_000);
+    h.manager.tick_with_memory(now_ms() + 901_000, None);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         h.manager.status(&id).await.unwrap().session.state,
         SessionState::Idle
     );
-    h.manager.tick(now_ms() + 43_201_000);
+    h.manager.tick_with_memory(now_ms() + 43_201_000, None);
     wait_state(&h.manager, &id, SessionState::Done).await;
+}
+
+async fn state_of(m: &Manager, id: &SessionId) -> SessionState {
+    m.status(id).await.unwrap().session.state
+}
+
+#[tokio::test]
+async fn idle_limit_closes_the_longest_idle_session_but_never_busy_ones() {
+    let mut config = Config::default();
+    config.sessions.max_idle_live = 2;
+    let h = harness_with(config).await;
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let asking = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    wait_state(&h.manager, &busy, SessionState::Running).await;
+    wait_state(&h.manager, &asking, SessionState::WaitingInput).await;
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+        wait_state(&h.manager, &id, SessionState::Idle).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        idle.push(id);
+    }
+    h.manager.tick_with_memory(now_ms(), None);
+    wait_state(&h.manager, &idle[0], SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &idle[0]).await,
+        Some(EndReason::IdleEvicted)
+    );
+    h.manager.tick_with_memory(now_ms(), None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state_of(&h.manager, &idle[1]).await, SessionState::Idle);
+    assert_eq!(state_of(&h.manager, &idle[2]).await, SessionState::Idle);
+    assert_eq!(state_of(&h.manager, &busy).await, SessionState::Running);
+    assert_eq!(
+        state_of(&h.manager, &asking).await,
+        SessionState::WaitingInput
+    );
+    // The evicted session continues on `send`; then the longest idle of the
+    // others goes.
+    assert!(h.manager.send(&idle[0], "again".into()).await.unwrap());
+    wait_state(&h.manager, &idle[0], SessionState::Idle).await;
+    h.manager.tick_with_memory(now_ms(), None);
+    wait_state(&h.manager, &idle[1], SessionState::Done).await;
+    assert_eq!(state_of(&h.manager, &idle[0]).await, SessionState::Idle);
+}
+
+#[tokio::test]
+async fn memory_pressure_closes_idle_sessions_one_at_a_time() {
+    let h = harness().await;
+    assert_eq!(h.manager.config().sessions.min_mem_available_mb, 1024);
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let asking = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    // The longest idle session ignores EOF, so its close stays in progress.
+    let mut s = spec(&h, "idle-ignore-eof");
+    s.cwd = h.dir.path().join("stubborn");
+    std::fs::create_dir(&s.cwd).unwrap();
+    let stubborn = h.manager.run(s).await.unwrap().session.id;
+    wait_state(&h.manager, &stubborn, SessionState::Idle).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let other = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &other, SessionState::Idle).await;
+    wait_state(&h.manager, &busy, SessionState::Running).await;
+    wait_state(&h.manager, &asking, SessionState::WaitingInput).await;
+
+    // Enough memory: nothing happens.
+    h.manager.tick_with_memory(now_ms(), Some(4096));
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(h.manager.status(&stubborn).await.unwrap().live);
+    assert_eq!(
+        state_of(&h.manager, &other).await,
+        SessionState::Idle,
+        "a second session was closed before the first one exited"
+    );
+    std::fs::write(h.dir.path().join("stubborn/release-eof"), "").unwrap();
+    wait_state(&h.manager, &stubborn, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &stubborn).await,
+        Some(EndReason::MemoryPressure)
+    );
+    h.manager.tick_with_memory(now_ms(), Some(512));
+    wait_state(&h.manager, &other, SessionState::Done).await;
+    assert_eq!(
+        ended_reason(&h.manager, &other).await,
+        Some(EndReason::MemoryPressure)
+    );
+    // Running turns and open questions are never closed.
+    for _ in 0..3 {
+        h.manager.tick_with_memory(now_ms(), Some(1));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state_of(&h.manager, &busy).await, SessionState::Running);
+    assert_eq!(
+        state_of(&h.manager, &asking).await,
+        SessionState::WaitingInput
+    );
 }
 
 #[tokio::test]
@@ -1791,6 +1894,15 @@ async fn worktree_session_is_created_and_cleaned_up() {
 
 #[tokio::test]
 async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
+    auto_resume_after_shutdown(false).await;
+}
+
+#[tokio::test]
+async fn auto_resume_idle_also_restarts_idle_sessions() {
+    auto_resume_after_shutdown(true).await;
+}
+
+async fn auto_resume_after_shutdown(auto_resume_idle: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("w.db");
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1829,14 +1941,28 @@ async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
     }
     let mut config = Config::default();
     config.sessions.auto_resume_orphaned = true;
+    config.sessions.auto_resume_idle = auto_resume_idle;
     let m = make(config.clone(), Store::open(&db).await.unwrap());
     assert!(m.recover().await.unwrap().is_empty());
     let mut resumed = m.auto_resume().await.unwrap();
     resumed.sort();
-    let mut expected = vec![busy.clone(), idle.clone()];
+    let mut expected = vec![busy.clone()];
+    if auto_resume_idle {
+        expected.push(idle.clone());
+    }
     expected.sort();
     assert_eq!(resumed, expected);
-    wait_state(&m, &idle, SessionState::Idle).await;
+    if auto_resume_idle {
+        wait_state(&m, &idle, SessionState::Idle).await;
+    } else {
+        // The idle session waits for `send`.
+        let st = m.status(&idle).await.unwrap();
+        assert!(!st.live);
+        assert_eq!(st.session.state, SessionState::Orphaned);
+        assert!(!st.session.resume_pending);
+        assert!(m.send(&idle, "hello".into()).await.unwrap());
+        wait_state(&m, &idle, SessionState::Idle).await;
+    }
     // Only the busy session is told to continue.
     let prompts: Vec<String> = received
         .lock()

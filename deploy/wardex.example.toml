@@ -24,13 +24,24 @@ allowed_hosts = []
 auth_failures_per_minute = 30
 
 [sessions]
-# Resume orphaned sessions automatically when the daemon starts.
+# Resume orphaned sessions automatically when the daemon starts (those that
+# were mid-turn or waiting for an answer).
 auto_resume_orphaned = false
+# With auto_resume_orphaned: also restart sessions that were idle. Off: they
+# stay orphaned until `send` resumes them.
+auto_resume_idle = false
 # Directory (relative to the repo) for --worktree sessions.
 worktree_dir = ".worktree"
 # Close an idle agent process after this long (default 12 h, at most 30 days);
 # `send` resumes it. 0 = never. Each idle process keeps its memory meanwhile.
 idle_shutdown_secs = 43200
+# Keep at most this many idle agent processes; above it the longest idle one
+# is closed (`send` resumes it). 0 = no limit.
+max_idle_live = 8
+# While the system's MemAvailable is below this many MiB, close idle agent
+# processes, longest idle first and one at a time. Running turns and open
+# questions are never closed. 0 = off.
+min_mem_available_mb = 1024
 # Seconds between closing stdin and killing a stopping session.
 stop_grace_secs = 5
 

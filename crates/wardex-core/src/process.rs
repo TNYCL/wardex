@@ -268,6 +268,24 @@ fn sample_proc(pid: u32) -> Option<Usage> {
     })
 }
 
+/// Memory available to new work system-wide (`MemAvailable` in
+/// `/proc/meminfo`), in MiB. `None` if it cannot be read.
+pub fn mem_available_mb() -> Option<u64> {
+    parse_mem_available_mb(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_mem_available_mb(meminfo: &str) -> Option<u64> {
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib / 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +294,17 @@ mod tests {
     fn samples_own_process() {
         let usage = sample(std::process::id()).expect("usage of own process");
         assert!(usage.rss_bytes > 0);
+    }
+
+    #[test]
+    fn parses_mem_available() {
+        let meminfo = "MemTotal:       16303428 kB\nMemFree:          512000 kB\n\
+                       MemAvailable:    2097152 kB\nBuffers:           1024 kB\n";
+        assert_eq!(parse_mem_available_mb(meminfo), Some(2048));
+        assert_eq!(parse_mem_available_mb("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_mem_available_mb("MemAvailable: lots\n"), None);
+        // The running kernel reports it (Linux >= 3.14).
+        assert!(mem_available_mb().is_some_and(|mb| mb > 0));
     }
 
     /// Needs a systemd user manager; run with

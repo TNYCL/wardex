@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Memory protection for idle sessions: `sessions.max_idle_live` (default 8)
+  closes the longest idle agent process above that many idle ones, and
+  `sessions.min_mem_available_mb` (default 1024) closes idle processes, longest
+  idle first and one at a time, while the system's `MemAvailable` is below
+  it. Running turns and open questions are never closed; `send` resumes a
+  closed session. 0 turns either check off.
+- `sessions.auto_resume_idle` (default false): with `auto_resume_orphaned`,
+  also restart sessions that were idle when the daemon stopped.
 - `ended_reason` on session records (`list`, `status`, `overview`) and
   `reason` on `ended` events: `done`, `stopped`, `idle_shutdown`,
   `idle_evicted`, `memory_pressure`, `error`, `drain`, `shutdown`,
@@ -149,6 +157,10 @@ All notable changes to this project are documented here. The format follows
   are rejected (0 still keeps idle sessions forever).
 - `timeouts.idle_stuck_secs = 0` disables `stuck` (`no_output`) detection
   instead of flagging every turn at once.
+- With `auto_resume_orphaned`, only sessions that were mid-turn or waiting
+  for an answer are restarted when the daemon starts; idle ones (all of them
+  after `daemon restart --drain`) stay orphaned until `send` resumes them.
+  Set `sessions.auto_resume_idle = true` for the old behaviour.
 - `--rm-worktree` / `remove_worktree` no longer removes the worktree when an
   idle session is closed for idleness or memory; the worktree is removed on
   `stop` or when the agent exits by itself, so `send` can continue the work.

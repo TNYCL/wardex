@@ -78,7 +78,11 @@ Session states: `starting`, `running`, `idle` (turn done, process waiting for
 the next message), `waiting_input`, and the resumable end states `done`,
 `error`, `stopped`, `orphaned`. An idle process is closed after
 `sessions.idle_shutdown_secs` (default 12 h); `send` to an ended session
-resumes it transparently. Each ended session records an `ended_reason`
+resumes it transparently. Idle processes keep their memory, so supervision
+also closes the longest idle ones above `sessions.max_idle_live` (default 8)
+and, one at a time, while `MemAvailable` is below
+`sessions.min_mem_available_mb` (default 1024 MiB). Sessions with a running
+turn or an open question are never closed. Each ended session records an `ended_reason`
 (`done`, `stopped`, `idle_shutdown`, `idle_evicted`, `memory_pressure`,
 `error`, `drain`, `shutdown`, `daemon_lost`), also sent as `reason` on the
 `ended` event.
@@ -146,7 +150,9 @@ resumes it transparently. Each ended session records an `ended_reason`
 - Agent stdio pipes are owned by the daemon, so a daemon restart loses live
   sessions. On start, sessions whose process is gone are marked
   `error: orphaned` and can be continued with `wardex resume` (driver resume
-  id). `auto_resume_orphaned` (default off) resumes them automatically.
+  id). `auto_resume_orphaned` (default off) resumes those that were mid-turn
+  or waiting for an answer automatically; idle ones only with
+  `auto_resume_idle` (default off), otherwise `send` resumes them on demand.
 - Scope cleanup failure is isolated to its session, so an unavailable user
   systemd manager, a timed-out query or an unreapable process does not prevent
   daemon startup or recovery of other sessions. The orphan retains its old
@@ -191,8 +197,9 @@ resumes it transparently. Each ended session records an `ended_reason`
   natural exit is classified normally, while retaining the closed-stdin
   guard. Independent idle shutdowns keep their exit flag. Wait for it to exit
   or explicitly `stop` it before retrying.
-  Closed sessions are orphaned and can be resumed manually or through
-  `auto_resume_orphaned`, without an extra continuation prompt. A successful
+  Closed sessions are orphaned and can be resumed manually (`send` or
+  `resume`), or through `auto_resume_orphaned` with `auto_resume_idle`,
+  without an extra continuation prompt. A successful
   JSON response lists `closed_sessions`; it is sent only after persistence
   and graceful process exit complete.
 - **Forced drain** (`daemon restart --drain SECS --force`, also supported on

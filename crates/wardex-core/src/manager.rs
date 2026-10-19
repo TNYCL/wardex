@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::config::SessionsConfig;
 use crate::driver::{Driver, DriverCommand, DriverError, DriverEvent, READONLY_PREFIX, SpawnSpec};
 use crate::process::{self, Launcher};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
@@ -254,6 +255,51 @@ fn idle_since(l: &Live) -> Option<i64> {
     (l.record.state == SessionState::Idle && !l.turn_active && l.pending.is_empty())
         .then_some(l.idle_since_ms)
         .flatten()
+}
+
+/// A live session that is idle (no turn, no open question) and not closing.
+#[derive(Debug, Clone)]
+struct IdleCandidate {
+    id: SessionId,
+    idle_since_ms: i64,
+}
+
+/// Which idle sessions supervision closes now, and why. Longest idle first:
+/// those idle for `idle_shutdown_secs`, then those beyond `max_idle_live`,
+/// then, while available memory is below `min_mem_available_mb`, one more,
+/// unless another idle close is happening now or a memory close is still
+/// waiting for its process to exit.
+fn idle_closures(
+    mut idle: Vec<IdleCandidate>,
+    now: i64,
+    s: &SessionsConfig,
+    mem_available_mb: Option<u64>,
+    memory_close_pending: bool,
+) -> Vec<(SessionId, EndReason)> {
+    idle.sort_by(|a, b| (a.idle_since_ms, &a.id).cmp(&(b.idle_since_ms, &b.id)));
+    let shutdown_ms = secs_to_ms(s.idle_shutdown_secs);
+    let (expired, mut kept): (Vec<_>, Vec<_>) = idle
+        .into_iter()
+        .partition(|c| shutdown_ms > 0 && now - c.idle_since_ms >= shutdown_ms);
+    let mut out: Vec<_> = expired
+        .into_iter()
+        .map(|c| (c.id, EndReason::IdleShutdown))
+        .collect();
+    let max = s.max_idle_live as usize;
+    if max > 0 && kept.len() > max {
+        let excess = kept.len() - max;
+        out.extend(kept.drain(..excess).map(|c| (c.id, EndReason::IdleEvicted)));
+    }
+    let low_memory = s.min_mem_available_mb > 0
+        && mem_available_mb.is_some_and(|mb| mb < s.min_mem_available_mb);
+    if low_memory
+        && out.is_empty()
+        && !memory_close_pending
+        && let Some(oldest) = kept.into_iter().next()
+    {
+        out.push((oldest.id, EndReason::MemoryPressure));
+    }
+    out
 }
 
 /// Seconds from the config as milliseconds, saturating instead of wrapping.
@@ -1822,7 +1868,8 @@ impl Manager {
     /// Resume sessions orphaned by the previous daemon when
     /// `sessions.auto_resume_orphaned` is on; otherwise just clear their
     /// pending flag. Sessions that were mid-turn get `sessions.resume_prompt`.
-    /// Returns the resumed ids.
+    /// Sessions that were idle are left for `send` to resume unless
+    /// `sessions.auto_resume_idle` is on. Returns the resumed ids.
     pub async fn auto_resume(&self) -> Result<Vec<SessionId>> {
         let pending = self.inner.store.pending_resumes().await?;
         let mut resumed = Vec::new();
@@ -1830,8 +1877,11 @@ impl Manager {
             if record.cleanup_failed {
                 continue;
             }
-            let enabled = self.inner.config.sessions.auto_resume_orphaned;
-            if !enabled || record.driver_session_id.is_none() {
+            let sessions = &self.inner.config.sessions;
+            // Idle sessions come back on demand (`send`) unless configured.
+            let wanted = sessions.auto_resume_orphaned
+                && (record.resume_with_prompt || sessions.auto_resume_idle);
+            if !wanted || record.driver_session_id.is_none() {
                 record.resume_pending = false;
                 record.resume_with_prompt = false;
                 self.inner.store.update_session(&record).await?;
@@ -2174,6 +2224,15 @@ impl Manager {
 
     /// One supervision step.
     pub fn tick(&self, now: i64) {
+        let mem_available_mb = (self.inner.config.sessions.min_mem_available_mb > 0)
+            .then(process::mem_available_mb)
+            .flatten();
+        self.tick_with_memory(now, mem_available_mb);
+    }
+
+    /// One supervision step with the system's available memory (MiB) given
+    /// by the caller instead of read from `/proc/meminfo`.
+    pub fn tick_with_memory(&self, now: i64, mem_available_mb: Option<u64>) {
         let t = &self.inner.config.timeouts;
         let s = &self.inner.config.sessions;
         let pids: Vec<(SessionId, u32)> = self
@@ -2246,19 +2305,29 @@ impl Manager {
                         },
                     ));
                 }
-                if s.idle_shutdown_secs > 0
-                    && !l.turn_active
-                    && !l.idle_exit
-                    && !l.stop_requested
-                    && l.pending.is_empty()
-                    && l.record.state == SessionState::Idle
-                    && let Some(since) = l.idle_since_ms
-                    && (now - since).max(0) as u64 / 1000 >= s.idle_shutdown_secs
-                {
-                    l.idle_exit = true;
-                    l.idle_reason = Some(EndReason::IdleShutdown);
-                    let _ = l.commands.send(DriverCommand::Shutdown);
+            }
+            let idle: Vec<IdleCandidate> = live
+                .values()
+                .filter(|l| !l.idle_exit && !l.stop_requested && !l.drain_exit && !l.stdin_closed)
+                .filter_map(|l| {
+                    idle_since(l).map(|since| IdleCandidate {
+                        id: l.record.id.clone(),
+                        idle_since_ms: since,
+                    })
+                })
+                .collect();
+            let memory_close_pending = live
+                .values()
+                .any(|l| l.idle_exit && l.idle_reason == Some(EndReason::MemoryPressure));
+            for (id, reason) in idle_closures(idle, now, s, mem_available_mb, memory_close_pending)
+            {
+                let Some(l) = live.get_mut(&id) else { continue };
+                if reason != EndReason::IdleShutdown {
+                    tracing::info!(session = %id, reason = reason.as_str(), ?mem_available_mb, "closing idle session");
                 }
+                l.idle_exit = true;
+                l.idle_reason = Some(reason);
+                let _ = l.commands.send(DriverCommand::Shutdown);
             }
         }
         for (id, kind) in to_emit {
@@ -2425,6 +2494,106 @@ mod tests {
             "drain cleared an independent idle shutdown"
         );
         assert!(!manager.inner.draining.load(Ordering::SeqCst));
+    }
+
+    fn candidates(idle_since: &[(&str, i64)]) -> Vec<IdleCandidate> {
+        idle_since
+            .iter()
+            .map(|(id, since)| IdleCandidate {
+                id: SessionId((*id).into()),
+                idle_since_ms: *since,
+            })
+            .collect()
+    }
+
+    fn closures(
+        idle_since: &[(&str, i64)],
+        s: &SessionsConfig,
+        mem: Option<u64>,
+        pending: bool,
+    ) -> Vec<(String, EndReason)> {
+        idle_closures(candidates(idle_since), 100_000, s, mem, pending)
+            .into_iter()
+            .map(|(id, reason)| (id.0, reason))
+            .collect()
+    }
+
+    fn limits(shutdown: u64, max: u32, min_mem: u64) -> SessionsConfig {
+        SessionsConfig {
+            idle_shutdown_secs: shutdown,
+            max_idle_live: max,
+            min_mem_available_mb: min_mem,
+            ..SessionsConfig::default()
+        }
+    }
+
+    #[test]
+    fn idle_shutdown_closes_sessions_idle_long_enough() {
+        let s = limits(10, 0, 0);
+        assert_eq!(
+            closures(
+                &[("new", 95_000), ("old", 90_000), ("older", 1)],
+                &s,
+                None,
+                false
+            ),
+            [
+                ("older".into(), EndReason::IdleShutdown),
+                ("old".into(), EndReason::IdleShutdown)
+            ]
+        );
+        assert!(closures(&[("old", 1)], &limits(0, 0, 0), None, false).is_empty());
+    }
+
+    #[test]
+    fn idle_limit_closes_the_longest_idle_beyond_it() {
+        let idle = [("c", 30), ("a", 10), ("d", 40), ("b", 20)];
+        assert_eq!(
+            closures(&idle, &limits(0, 2, 0), None, false),
+            [
+                ("a".into(), EndReason::IdleEvicted),
+                ("b".into(), EndReason::IdleEvicted)
+            ]
+        );
+        assert!(closures(&idle, &limits(0, 4, 0), None, false).is_empty());
+        assert!(closures(&idle, &limits(0, 0, 0), None, false).is_empty());
+        // Sessions closed for idleness do not count against the limit.
+        assert_eq!(
+            closures(
+                &[("a", 1), ("b", 99_000), ("c", 99_500)],
+                &limits(10, 2, 0),
+                None,
+                false
+            ),
+            [("a".into(), EndReason::IdleShutdown)]
+        );
+    }
+
+    #[test]
+    fn low_memory_closes_one_idle_session_at_a_time() {
+        let s = limits(0, 0, 1024);
+        let idle = [("b", 20), ("a", 10)];
+        assert_eq!(
+            closures(&idle, &s, Some(512), false),
+            [("a".into(), EndReason::MemoryPressure)]
+        );
+        // Not while the previous one is still exiting, not with enough or
+        // unknown memory, not when disabled, and never without idle sessions.
+        assert!(closures(&idle, &s, Some(512), true).is_empty());
+        assert!(closures(&idle, &s, Some(1024), false).is_empty());
+        assert!(closures(&idle, &s, None, false).is_empty());
+        assert!(closures(&idle, &limits(0, 0, 0), Some(1), false).is_empty());
+        assert!(closures(&[], &s, Some(1), false).is_empty());
+        // Other closes this tick free memory first.
+        assert_eq!(
+            closures(
+                &[("a", 10), ("b", 20), ("c", 30)],
+                &limits(0, 2, 1024),
+                Some(1),
+                false
+            ),
+            [("a".into(), EndReason::IdleEvicted)]
+        );
     }
 
     #[test]

@@ -184,8 +184,9 @@ Message deltas are never returned; full messages are.
    `send` the next instruction or leave the session alone.
 5. **Do not `stop` a session because its work is done.** An idle session
    closes itself after `sessions.idle_shutdown_secs` (default 43200 s = 12 h;
-   `overview` shows `shutdown_in_ms`), and `send` resumes it with its context
-   later. Use `stop` only to abort work.
+   `overview` shows `shutdown_in_ms`), or earlier when more than
+   `sessions.max_idle_live` sessions are idle or memory runs low, and `send`
+   resumes it with its context later. Use `stop` only to abort work.
 6. Use `overview` to see everything at once, e.g. after a bot restart.
 
 Without webhooks, poll `overview` or follow one session with `tail` +

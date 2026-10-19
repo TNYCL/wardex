@@ -109,13 +109,27 @@ impl Default for HttpConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionsConfig {
     /// Resume orphaned sessions automatically when the daemon starts.
+    /// Only sessions that were mid-turn or waiting for an answer, unless
+    /// `auto_resume_idle` is set too.
     pub auto_resume_orphaned: bool,
+    /// With `auto_resume_orphaned`, also restart sessions that were idle when
+    /// the daemon stopped. Off: they stay orphaned until `send` resumes them,
+    /// so a restart does not bring back every idle process at once.
+    pub auto_resume_idle: bool,
     /// Directory (relative to the repo root) for `--worktree` sessions.
     pub worktree_dir: String,
     /// Close an idle agent process after this long. Sending a message to it
     /// later resumes it transparently. 0 keeps it forever. At most
     /// [`MAX_IDLE_SHUTDOWN_SECS`].
     pub idle_shutdown_secs: u64,
+    /// Keep at most this many idle agent processes; above it, the one idle
+    /// the longest is closed (`idle_evicted`). 0 = no limit.
+    pub max_idle_live: u32,
+    /// When the system's available memory (`MemAvailable`) falls below this
+    /// many MiB, close idle agent processes, longest idle first, one per tick
+    /// and only after the previous one has exited (`memory_pressure`).
+    /// Running turns and open questions are never closed. 0 = off.
+    pub min_mem_available_mb: u64,
     /// Grace period between closing stdin and killing a stopping process.
     pub stop_grace_secs: u64,
     /// Message sent when an orphaned session is resumed automatically.
@@ -126,8 +140,11 @@ impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             auto_resume_orphaned: false,
+            auto_resume_idle: false,
             worktree_dir: ".worktree".into(),
             idle_shutdown_secs: 12 * 3600,
+            max_idle_live: 8,
+            min_mem_available_mb: 1024,
             stop_grace_secs: 5,
             resume_prompt: "The previous run was interrupted by a restart of the session \
                             manager. Continue where you left off."
@@ -616,7 +633,19 @@ mod tests {
 
     #[test]
     fn idle_sessions_are_kept_for_twelve_hours_by_default() {
-        assert_eq!(Config::default().sessions.idle_shutdown_secs, 43_200);
+        let s = Config::default().sessions;
+        assert_eq!(s.idle_shutdown_secs, 43_200);
+        assert_eq!(s.max_idle_live, 8);
+        assert_eq!(s.min_mem_available_mb, 1024);
+        assert!(!s.auto_resume_idle);
+        let off = Config::parse(
+            "[sessions]\nmax_idle_live = 0\nmin_mem_available_mb = 0\nauto_resume_idle = true\n",
+        )
+        .unwrap();
+        off.validate().unwrap();
+        assert_eq!(off.sessions.max_idle_live, 0);
+        assert_eq!(off.sessions.min_mem_available_mb, 0);
+        assert!(off.sessions.auto_resume_idle);
     }
 
     #[test]

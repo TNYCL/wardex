@@ -430,6 +430,8 @@ fi
         .to_string_lossy()
         .into_owned();
     config.sessions.auto_resume_orphaned = true;
+    // The healthy session was idle; bring it back at start.
+    config.sessions.auto_resume_idle = true;
     config.sessions.stop_grace_secs = 0;
     config.auth.token_env = "WARDEX_LIFECYCLE_TEST_TOKEN".into();
     for attempt in 0..2 {
