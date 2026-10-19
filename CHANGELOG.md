@@ -122,6 +122,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed (breaking)
 
+- After migration 0003 is applied, older binaries can no longer open this
+  database; back up `wardex.db` before installing.
 - `daemon stop/restart --drain SECS` refuses shutdown when turns, answers or
   graceful leader exit do not finish. Existing questions/approvals stay live;
   idle leaders are not force-killed. Use `answer`/`stop`, retry `--drain`, or
