@@ -33,28 +33,33 @@ pub fn list(views: &[SessionView]) -> String {
         return "no sessions\n".into();
     }
     let mut out = format!(
-        "{:<9} {:<13} {:<7} {:<12} {:<14} {:>6}  {}\n",
-        "ID", "STATE", "DRIVER", "AGENT", "TASK", "AGE", "CWD"
+        "{:<9} {:<29} {:<7} {:<12} {:<14} {:>6} {:>6}  {}\n",
+        "ID", "STATE", "DRIVER", "AGENT", "TASK", "AGE", "ENDED", "CWD"
     );
     let now = now_ms();
     for v in views {
         let s = &v.session;
-        let mut state = s.state.as_str().to_string();
+        let mut state = state_with_reason(s.state, s.ended_reason);
         if v.pending_questions > 0 {
             state = format!("{state}({})", v.pending_questions);
         }
         if s.cleanup_failed {
             state = "cleanup_failed".into();
         }
+        let ended = s
+            .ended_ms
+            .map(|t| human_duration(now - t))
+            .unwrap_or_else(|| "-".into());
         let _ = writeln!(
             out,
-            "{:<9} {:<13} {:<7} {:<12} {:<14} {:>6}  {}",
+            "{:<9} {:<29} {:<7} {:<12} {:<14} {:>6} {:>6}  {}",
             s.id,
             state,
             s.driver.as_str(),
             truncate(opt(&s.agent), 12),
             truncate(opt(&s.task), 14),
             human_duration(now - s.created_ms),
+            ended,
             short_path(&s.cwd)
         );
     }

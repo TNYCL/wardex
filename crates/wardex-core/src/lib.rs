@@ -5,6 +5,7 @@ pub mod config;
 pub mod driver;
 pub mod event;
 pub mod git;
+pub mod glob;
 pub mod manager;
 pub mod process;
 pub mod session;
@@ -16,4 +17,4 @@ pub use event::{
     Answer, DriverKind, Event, EventKind, GitState, QuestionItem, QuestionOption, StuckReason,
     ToolStatus,
 };
-pub use session::{EndReason, RunSpec, SessionId, SessionRecord, SessionState};
+pub use session::{EndReason, ListFilter, RunSpec, SessionId, SessionRecord, SessionState};

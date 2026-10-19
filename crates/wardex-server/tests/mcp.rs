@@ -285,6 +285,52 @@ async fn bot_runs_answers_and_reads_result_over_mcp() {
 
     let listed = data(&call(&client, "list", json!({"all": true})).await);
     assert_eq!(listed.as_array().unwrap().len(), 1);
+    // Find it again by label, among ended and resumable sessions.
+    let found = data(&call(&client, "list", json!({"ended": true, "agent": "b*"})).await);
+    assert_eq!(found[0]["id"], id.as_str());
+    assert_eq!(found[0]["ended_reason"], "done");
+    let found = data(&call(&client, "list", json!({"resumable": true, "task": "t?"})).await);
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    let found = data(&call(&client, "list", json!({"all": true, "agent": "other"})).await);
+    assert!(found.as_array().unwrap().is_empty());
+    let found = data(&call(&client, "list", json!({"agent": "bot"})).await);
+    assert!(
+        found.as_array().unwrap().is_empty(),
+        "ended sessions need all/ended"
+    );
+
+    let send_tool = listed_tools.iter().find(|t| t.name == "send").unwrap();
+    assert_eq!(send_tool.input_schema["required"], json!(["message"]));
+    let err = error_text(&call(&client, "send", json!({"message": "x"})).await);
+    assert!(err.starts_with("invalid:"), "{err}");
+    let err = error_text(
+        &call(
+            &client,
+            "send",
+            json!({"latest": true, "agent": "nobody", "message": "x"}),
+        )
+        .await,
+    );
+    assert!(err.starts_with("not_found:"), "{err}");
+    for args in [
+        json!({"id": id, "latest": true, "agent": "bot", "message": "x"}),
+        json!({"id": id, "agent": "bot", "message": "x"}),
+        json!({"latest": true, "message": "x"}),
+    ] {
+        let err = error_text(&call(&client, "send", args.clone()).await);
+        assert!(err.starts_with("invalid:"), "{args}: {err}");
+    }
+    let sent = data(
+        &call(
+            &client,
+            "send",
+            json!({"latest": true, "agent": "bot", "task": "t1", "message": "again"}),
+        )
+        .await,
+    );
+    assert_eq!(sent["session_id"], id.as_str());
+    assert_eq!(sent["resumed"], true);
+    data(&call(&client, "stop", json!({"id": id})).await);
     let err = error_text(&call(&client, "status", json!({"id": "ffffffff"})).await);
     assert!(err.starts_with("not_found:"), "{err}");
 

@@ -233,6 +233,11 @@ turn or an open question are never closed. Each ended session records an `ended_
 `summary <id>`, `answer <id> <text>`, `send <id> <message>`, `stop <id>`,
 `interrupt <id>`, `resume <id>`, `pending`.
 
+- `list`: `-a` (include ended), `--agent GLOB`, `--task GLOB`, `--ended`,
+  `--resumable` (ended sessions `send` can continue).
+- `send --latest --agent GLOB [--task GLOB] <message>`: the newest session
+  with matching labels, live or ended.
+
 - All accept `--json`. The CLI talks to the daemon over a local Unix socket.
 - `run`: `--driver claude|codex`, `--model`, `--reasoning`, `--cwd`,
   `--worktree`, `--branch`, `--readonly`, `--agent`, `--task`, `--slice`,

@@ -17,8 +17,8 @@ use crate::process::{self, Launcher};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
-    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, RunSpec, SessionId,
-    SessionRecord, SessionState, StuckReason, ToolStatus, git,
+    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter, RunSpec,
+    SessionId, SessionRecord, SessionState, StuckReason, ToolStatus, git,
 };
 
 const BROADCAST_CAPACITY: usize = 8192;
@@ -1349,7 +1349,16 @@ impl Manager {
     }
 
     pub async fn list(&self, all: bool) -> Result<Vec<SessionView>> {
-        let records = match self.inner.store.list_sessions(all, 500).await {
+        self.list_filtered(&ListFilter {
+            all,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Sessions passing `filter`, newest first (at most 500).
+    pub async fn list_filtered(&self, filter: &ListFilter) -> Result<Vec<SessionView>> {
+        let records = match self.inner.store.list_sessions_matching(filter, 500).await {
             Ok(records) => {
                 *self
                     .inner
@@ -1381,9 +1390,7 @@ impl Manager {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         );
-        let records = records
-            .into_values()
-            .filter(|r| all || !r.state.is_terminal());
+        let records = records.into_values();
         let live = self.live();
         let mut out: Vec<SessionView> = records
             .into_iter()
@@ -1410,8 +1417,44 @@ impl Manager {
                 });
             }
         }
+        drop(live);
+        out.retain(|v| {
+            filter.matches(&v.session) && (!filter.resumable || (!v.live && v.session.cwd.is_dir()))
+        });
         out.sort_by_key(|v| std::cmp::Reverse(v.session.created_ms));
+        out.truncate(500);
         Ok(out)
+    }
+
+    /// The newest session whose labels match the `agent`/`task` globs, live
+    /// or ended. At least one pattern is required.
+    pub async fn latest(&self, agent: Option<String>, task: Option<String>) -> Result<SessionId> {
+        if agent.is_none() && task.is_none() {
+            return Err(ManagerError::Invalid(
+                "latest needs an agent or task pattern".into(),
+            ));
+        }
+        let filter = ListFilter {
+            all: true,
+            agent,
+            task,
+            ..Default::default()
+        };
+        self.list_filtered(&filter)
+            .await?
+            .into_iter()
+            .next()
+            .map(|v| v.session.id)
+            .ok_or_else(|| {
+                let mut wanted = Vec::new();
+                if let Some(a) = &filter.agent {
+                    wanted.push(format!("agent {a}"));
+                }
+                if let Some(t) = &filter.task {
+                    wanted.push(format!("task {t}"));
+                }
+                ManagerError::NotFound(wanted.join(", "))
+            })
     }
 
     pub async fn status(&self, id: &SessionId) -> Result<SessionStatus> {

@@ -184,10 +184,7 @@ async fn applied_run_send_and_answer_report_uncommitted_state_without_resending(
             question_id: None,
             input: AnswerInput::Text("blue".into()),
         },
-        Request::Send {
-            id: idle.to_string(),
-            message: "next".into(),
-        },
+        Request::send(idle.to_string(), "next"),
         Request::Run(h.spec("new")),
     ] {
         let response = api::handle(&h.manager, request).await;
@@ -217,17 +214,10 @@ async fn shutdown_signals_daemon_exit_even_when_final_flush_fails() {
     let busy = h.run("hang", SessionState::Running).await;
     let idle = h.run("hello", SessionState::Idle).await;
     h.fail_writes().await;
-    let _ = api::handle(
-        &h.manager,
-        Request::Send {
-            id: idle.to_string(),
-            message: "outage".into(),
-        },
-    )
-    .await;
+    let _ = api::handle(&h.manager, Request::send(idle.to_string(), "outage")).await;
     let (client, control, server) = h.socket().await;
     for request in [
-        Request::List { all: true },
+        Request::list(true),
         Request::Status {
             id: busy.to_string(),
         },
@@ -492,10 +482,10 @@ fi
         assert_eq!(status.data.unwrap()["live"], true);
         let received = h.received.lock().unwrap().clone();
         let send = client
-            .request(&Request::Send {
-                id: blocked.to_string(),
-                message: "implicit resume must stay blocked".into(),
-            })
+            .request(&Request::send(
+                blocked.to_string(),
+                "implicit resume must stay blocked",
+            ))
             .await
             .unwrap();
         assert!(!send.ok, "send bypassed the cleanup quarantine");

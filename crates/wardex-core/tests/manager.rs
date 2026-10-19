@@ -14,7 +14,7 @@ use wardex_core::process::Launcher;
 use wardex_core::store::Store;
 use wardex_core::time::now_ms;
 use wardex_core::{
-    Answer, Config, DriverKind, EndReason, EventKind, QuestionItem, RunSpec, SessionId,
+    Answer, Config, DriverKind, EndReason, EventKind, ListFilter, QuestionItem, RunSpec, SessionId,
     SessionState, StuckReason, ToolStatus,
 };
 
@@ -1712,6 +1712,123 @@ async fn zero_idle_stuck_secs_disables_no_output_detection() {
     h.manager.tick(now_ms());
     h.manager.tick(now_ms() + 86_400_000);
     assert!(last_of(&h.manager, &id, "stuck").await.is_none());
+}
+
+fn labelled(h: &Harness, prompt: &str, agent: &str, task: &str, dir: &str) -> RunSpec {
+    let mut s = spec(h, prompt);
+    s.agent = Some(agent.into());
+    s.task = Some(task.into());
+    s.cwd = h.dir.path().join(dir);
+    std::fs::create_dir_all(&s.cwd).unwrap();
+    s
+}
+
+async fn listed(m: &Manager, filter: ListFilter) -> Vec<SessionId> {
+    m.list_filtered(&filter)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.session.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn list_filters_and_latest_find_sessions_to_continue() {
+    let h = harness().await;
+    let run = |s: RunSpec| {
+        let m = h.manager.clone();
+        async move { m.run(s).await.unwrap().session.id }
+    };
+    let live = run(labelled(&h, "hello", "agent-a", "fix-1", "a1")).await;
+    let stopped = run(labelled(&h, "hello", "agent-a", "fix-2", "a2")).await;
+    let crashed = run(labelled(&h, "crash", "agent-b", "docs", "b1")).await;
+    let no_resume_id = labelled(&h, "hello", "agent-a", "fix-3", "a3");
+    std::fs::write(no_resume_id.cwd.join("omit-resume-id"), "").unwrap();
+    let no_resume_id = run(no_resume_id).await;
+    let gone = labelled(&h, "hello", "agent-a", "fix-4", "a4");
+    let gone_dir = gone.cwd.clone();
+    let gone = run(gone).await;
+    wait_state(&h.manager, &live, SessionState::Idle).await;
+    wait_state(&h.manager, &crashed, SessionState::Error).await;
+    for id in [&stopped, &no_resume_id, &gone] {
+        wait_state(&h.manager, id, SessionState::Idle).await;
+        h.manager.stop(id).await.unwrap();
+        wait_state(&h.manager, id, SessionState::Stopped).await;
+    }
+    std::fs::remove_dir_all(&gone_dir).unwrap();
+
+    let by = |agent: Option<&str>, task: Option<&str>| ListFilter {
+        agent: agent.map(String::from),
+        task: task.map(String::from),
+        ..Default::default()
+    };
+    assert_eq!(
+        listed(&h.manager, by(Some("agent-a"), None)).await,
+        std::slice::from_ref(&live)
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                ended: true,
+                ..by(Some("agent-a"), None)
+            }
+        )
+        .await,
+        [gone.clone(), no_resume_id.clone(), stopped.clone()]
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                resumable: true,
+                ..Default::default()
+            }
+        )
+        .await,
+        [crashed.clone(), stopped.clone()]
+    );
+    assert_eq!(
+        listed(
+            &h.manager,
+            ListFilter {
+                all: true,
+                ..by(Some("agent-?"), Some("fix-*"))
+            }
+        )
+        .await,
+        [
+            gone.clone(),
+            no_resume_id.clone(),
+            stopped.clone(),
+            live.clone()
+        ]
+    );
+    assert!(
+        listed(&h.manager, by(Some("agent-c"), None))
+            .await
+            .is_empty()
+    );
+
+    // `latest` picks the newest match, live or ended; `send` continues it.
+    let latest = |agent: Option<&str>, task: Option<&str>| {
+        h.manager
+            .latest(agent.map(String::from), task.map(String::from))
+    };
+    assert_eq!(latest(Some("agent-a"), None).await.unwrap(), gone);
+    assert_eq!(latest(None, Some("fix-1")).await.unwrap(), live);
+    let target = latest(Some("agent-a"), Some("fix-2")).await.unwrap();
+    assert_eq!(target, stopped);
+    assert!(h.manager.send(&target, "again".into()).await.unwrap());
+    wait_state(&h.manager, &stopped, SessionState::Idle).await;
+    assert!(matches!(
+        latest(Some("agent-c"), None).await,
+        Err(ManagerError::NotFound(_))
+    ));
+    assert!(matches!(
+        latest(None, None).await,
+        Err(ManagerError::Invalid(_))
+    ));
 }
 
 #[tokio::test]

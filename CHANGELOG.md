@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
+  filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
+  find a closed session again. `list` shows when and why a session ended.
+- `wardex send --latest --agent GLOB [--task GLOB] <message>` and `latest`
+  with `agent`/`task` on the MCP `send` tool (`id` is now optional): send to
+  the newest session with matching labels, resuming it if it ended.
 - Memory protection for idle sessions: `sessions.max_idle_live` (default 8)
   closes the longest idle agent process above that many idle ones, and
   `sessions.min_mem_available_mb` (default 1024) closes idle processes, longest

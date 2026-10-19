@@ -94,14 +94,14 @@ Session ids can be shortened to any unique prefix.
 |---|---|---|
 | `run` | `driver` (`claude`/`codex`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
 | `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration, `idle_since_ms`, `shutdown_in_ms` and latest events; counts per state; sessions ended in the last 24h |
-| `list` | optional `all` | session records, newest first |
+| `list` | optional `all`; filters `agent`, `task` (globs with `*`, `?`), `ended` (ended sessions only), `resumable` (ended sessions `send` can continue) | session records (with `ended_reason`), newest first, at most 500 |
 | `status` | `id` | record, pending questions, running tools, RSS/CPU |
 | `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60), `full` | events, oldest first |
 | `tool_output` | `id`, `seq` (of either `tool_call` event of the call) | the call's full `input` and `output` |
 | `summary` | `id` | final text, git state, durations, turn/event/tool counts |
 | `pending_questions` | – | open questions and approvals of all sessions |
 | `answer` | `id`; `text` **or** `answers` (item id → answer); optional `question_id` | `{session_id, question_id}` |
-| `send` | `id`, `message` | `{session_id, resumed}` |
+| `send` | `message`; `id`, **or** `latest` with `agent` and/or `task` globs (the newest matching session, live or ended) | `{session_id, resumed}` |
 | `interrupt` | `id` | `{session_id}` |
 | `stop` | `id` | `{session_id}` |
 | `resume` | `id`; optional `message` | session record |
@@ -188,6 +188,9 @@ Message deltas are never returned; full messages are.
    `sessions.max_idle_live` sessions are idle or memory runs low, and `send`
    resumes it with its context later. Use `stop` only to abort work.
 6. Use `overview` to see everything at once, e.g. after a bot restart.
+7. To pick up earlier work without its id, `list` with `resumable: true` and
+   your `agent`/`task` labels, or `send` with `latest: true` and the same
+   labels.
 
 Without webhooks, poll `overview` or follow one session with `tail` +
 `since_seq` + `wait_secs`.

@@ -12,7 +12,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::{DriverKind, EndReason, Event, EventKind, SessionId, SessionRecord, SessionState};
+use crate::{
+    DriverKind, EndReason, Event, EventKind, ListFilter, SessionId, SessionRecord, SessionState,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -501,13 +503,41 @@ impl Store {
 
     /// Sessions, newest first. Without `all`, only non-terminal ones.
     pub async fn list_sessions(&self, all: bool, limit: i64) -> Result<Vec<SessionRecord>> {
-        let sql = if all {
-            "SELECT * FROM sessions ORDER BY created_ms DESC LIMIT ?"
-        } else {
-            "SELECT * FROM sessions WHERE state IN ('starting','running','idle','waiting_input')
-             ORDER BY created_ms DESC LIMIT ?"
+        let filter = ListFilter {
+            all,
+            ..Default::default()
         };
-        let rows = sqlx::query(sql).bind(limit).fetch_all(&self.pool).await?;
+        self.list_sessions_matching(&filter, limit).await
+    }
+
+    /// Sessions passing `filter` (see [`ListFilter::matches`]; the working
+    /// directory of `resumable` is not checked here), newest first.
+    pub async fn list_sessions_matching(
+        &self,
+        filter: &ListFilter,
+        limit: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT * FROM sessions WHERE ");
+        if filter.ended || filter.resumable {
+            q.push("state IN ('done','error','stopped','orphaned')");
+        } else if filter.all {
+            q.push("1");
+        } else {
+            q.push("state IN ('starting','running','idle','waiting_input')");
+        }
+        if filter.resumable {
+            q.push(" AND driver_session_id IS NOT NULL AND cleanup_failed = 0");
+        }
+        if let Some(pattern) = &filter.agent {
+            q.push(" AND agent GLOB ")
+                .push_bind(crate::glob::to_sqlite(pattern));
+        }
+        if let Some(pattern) = &filter.task {
+            q.push(" AND task GLOB ")
+                .push_bind(crate::glob::to_sqlite(pattern));
+        }
+        q.push(" ORDER BY created_ms DESC LIMIT ").push_bind(limit);
+        let rows = q.build().fetch_all(&self.pool).await?;
         rows.iter().map(session_from_row).collect()
     }
 
@@ -1275,6 +1305,122 @@ mod tests {
         assert_eq!(store.list_sessions(true, 10).await.unwrap().len(), 1);
         let counts = store.event_counts(&s.id).await.unwrap();
         assert_eq!(counts, vec![("done".into(), 1), ("prompt".into(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn list_filters_run_in_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        let rows = [
+            (
+                "s1",
+                SessionState::Idle,
+                Some("agent-a"),
+                Some("fix-1"),
+                true,
+                false,
+            ),
+            (
+                "s2",
+                SessionState::Done,
+                Some("agent-a"),
+                Some("fix-2"),
+                true,
+                false,
+            ),
+            (
+                "s3",
+                SessionState::Stopped,
+                Some("agent-b"),
+                Some("[x]-3"),
+                true,
+                false,
+            ),
+            (
+                "s4",
+                SessionState::Error,
+                Some("agent-a"),
+                None,
+                false,
+                false,
+            ),
+            (
+                "s5",
+                SessionState::Orphaned,
+                None,
+                Some("fix-5"),
+                true,
+                true,
+            ),
+        ];
+        for (i, (id, state, agent, task, resume_id, cleanup_failed)) in rows.iter().enumerate() {
+            let mut r = record(id, *state);
+            r.agent = agent.map(String::from);
+            r.task = task.map(String::from);
+            r.driver_session_id = resume_id.then(|| format!("d-{id}"));
+            r.cleanup_failed = *cleanup_failed;
+            r.created_ms = i as i64;
+            store.insert_session(&r).await.unwrap();
+        }
+        let ids = |filter: ListFilter| {
+            let store = store.clone();
+            async move {
+                store
+                    .list_sessions_matching(&filter, 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let f = |agent: Option<&str>, task: Option<&str>, all, ended, resumable| ListFilter {
+            all,
+            agent: agent.map(String::from),
+            task: task.map(String::from),
+            ended,
+            resumable,
+        };
+        assert_eq!(ids(f(None, None, false, false, false)).await, ["s1"]);
+        assert_eq!(
+            ids(f(None, None, true, false, false)).await,
+            ["s5", "s4", "s3", "s2", "s1"]
+        );
+        assert_eq!(
+            ids(f(None, None, false, true, false)).await,
+            ["s5", "s4", "s3", "s2"]
+        );
+        assert_eq!(ids(f(None, None, false, false, true)).await, ["s3", "s2"]);
+        assert_eq!(
+            ids(f(Some("agent-a"), None, true, false, false)).await,
+            ["s4", "s2", "s1"]
+        );
+        assert_eq!(ids(f(Some("*-b"), None, true, false, false)).await, ["s3"]);
+        assert_eq!(
+            ids(f(None, Some("fix-?"), true, false, false)).await,
+            ["s5", "s2", "s1"]
+        );
+        assert_eq!(
+            ids(f(Some("agent-a"), Some("fix-*"), false, true, false)).await,
+            ["s2"]
+        );
+        // `[` is literal, as in webhook globs; a pattern never matches NULL.
+        assert_eq!(
+            ids(f(None, Some("[x]-*"), true, false, false)).await,
+            ["s3"]
+        );
+        assert_eq!(
+            ids(f(Some("*"), None, true, false, false)).await,
+            ["s4", "s3", "s2", "s1"]
+        );
+        assert_eq!(
+            store
+                .list_sessions_matching(&f(None, None, true, false, false), 2)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
