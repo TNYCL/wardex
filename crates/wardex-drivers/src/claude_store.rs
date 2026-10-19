@@ -325,14 +325,30 @@ pub fn parse_history(text: &str) -> History {
     let Some(mut leaf) = start else {
         return history;
     };
-    // Follow the newest child down to the real leaf: the marker may point
-    // at the last prompt, before the replies.
+    // The newest line in each node's subtree (children follow their parent
+    // in the file).
+    let mut latest: Vec<usize> = (0..nodes.len()).collect();
+    for i in (0..nodes.len()).rev() {
+        let uuid = nodes[i].value["uuid"].as_str().unwrap_or_default();
+        if let Some(kids) = children.get(uuid) {
+            for &k in kids {
+                if k > i && !nodes[k].sidechain {
+                    latest[i] = latest[i].max(latest[k]);
+                }
+            }
+        }
+    }
+    // Follow the child with the newest activity down to the real leaf: the
+    // marker may point at the last prompt, before the replies. Not simply
+    // the last child: a parallel tool call's result hangs off its own call
+    // and ends there, while the conversation goes on from the last call.
     for _ in 0..nodes.len() {
         let uuid = nodes[leaf].value["uuid"].as_str().unwrap_or_default();
-        match children
-            .get(uuid)
-            .and_then(|kids| kids.iter().rev().find(|&&k| !nodes[k].sidechain))
-        {
+        match children.get(uuid).and_then(|kids| {
+            kids.iter()
+                .filter(|&&k| k > leaf && !nodes[k].sidechain)
+                .max_by_key(|&&k| latest[k])
+        }) {
             Some(&next) => leaf = next,
             None => break,
         }
@@ -350,8 +366,27 @@ pub fn parse_history(text: &str) -> History {
     }
     chain.reverse();
 
+    // Results of parallel tool calls hang off their own `tool_use` line, so
+    // all but the last are off the active branch: match them by id.
+    let mut results: HashMap<&str, &Value> = HashMap::new();
+    for node in nodes
+        .iter()
+        .filter(|n| !n.sidechain && n.value["type"] == "user")
+    {
+        for block in node.value["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if block["type"] == "tool_result"
+                && let Some(id) = block["tool_use_id"].as_str()
+            {
+                results.entry(id).or_insert(block);
+            }
+        }
+    }
+
     let mut version = None;
-    let mut open_tools: HashMap<String, usize> = HashMap::new();
     for i in chain {
         let node = &nodes[i];
         let v = &node.value;
@@ -379,24 +414,7 @@ pub fn parse_history(text: &str) -> History {
                             match block["type"].as_str().unwrap_or_default() {
                                 "text" => texts
                                     .push(block["text"].as_str().unwrap_or_default().to_string()),
-                                "tool_result" => {
-                                    let id = block["tool_use_id"].as_str().unwrap_or_default();
-                                    let Some(&item) = open_tools.get(id) else {
-                                        continue;
-                                    };
-                                    let output = content_text(&block["content"]);
-                                    if let Some(tool) = &mut history.items[item].tool {
-                                        tool.status = if block["is_error"].as_bool() == Some(true) {
-                                            ToolStatus::Failed
-                                        } else {
-                                            ToolStatus::Completed
-                                        };
-                                        tool.result_summary =
-                                            Some(summarize(&output, RESULT_SUMMARY));
-                                        tool.output = Some(cap_tool_text(&output));
-                                    }
-                                    open_tools.remove(id);
-                                }
+                                // Matched with their tool_use below.
                                 _ => {}
                             }
                         }
@@ -425,18 +443,26 @@ pub fn parse_history(text: &str) -> History {
                         "tool_use" => {
                             let name = block["name"].as_str().unwrap_or_default().to_string();
                             let input = &block["input"];
+                            let result = block["id"].as_str().and_then(|id| results.get(id));
+                            let output = result.map(|r| content_text(&r["content"]));
+                            let status = match result {
+                                None => ToolStatus::Started,
+                                Some(r) if r["is_error"].as_bool() == Some(true) => {
+                                    ToolStatus::Failed
+                                }
+                                Some(_) => ToolStatus::Completed,
+                            };
                             let item = history.push(ts, HistoryKind::ToolCall, reference.clone());
                             history.items[item].tool = Some(HistoryTool {
                                 input_summary: input_summary(&name, input),
                                 name,
-                                status: ToolStatus::Started,
-                                result_summary: None,
+                                status,
+                                result_summary: output
+                                    .as_deref()
+                                    .map(|o| summarize(o, RESULT_SUMMARY)),
                                 input: Some(cap_tool_text(&input.to_string())),
-                                output: None,
+                                output: output.as_deref().map(cap_tool_text),
                             });
-                            if let Some(id) = block["id"].as_str() {
-                                open_tools.insert(id.to_string(), item);
-                            }
                         }
                         _ => {}
                     }

@@ -195,6 +195,55 @@ fn unknown_lines_and_types_are_tolerated() {
     assert!(h.warnings.iter().any(|w| w.contains("1 malformed")));
 }
 
+/// Claude writes parallel tool calls as one line per `tool_use` and hangs
+/// each result off its own call, so only the last result is on the branch.
+#[test]
+fn parallel_tool_results_off_the_branch_are_matched() {
+    let line = |v: serde_json::Value| format!("{v}\n");
+    let text = [
+        line(
+            serde_json::json!({"type": "user", "uuid": "p", "parentUuid": null,
+            "message": {"content": "check both"}}),
+        ),
+        line(
+            serde_json::json!({"type": "assistant", "uuid": "ta", "parentUuid": "p",
+            "message": {"content": [{"type": "tool_use", "id": "A", "name": "Read",
+                "input": {"file_path": "a.rs"}}]}}),
+        ),
+        line(
+            serde_json::json!({"type": "assistant", "uuid": "tb", "parentUuid": "ta",
+            "message": {"content": [{"type": "tool_use", "id": "B", "name": "Read",
+                "input": {"file_path": "b.rs"}}]}}),
+        ),
+        line(
+            serde_json::json!({"type": "user", "uuid": "ra", "parentUuid": "ta",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "A",
+                "content": "contents of a"}]}}),
+        ),
+        line(
+            serde_json::json!({"type": "user", "uuid": "rb", "parentUuid": "tb",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "B",
+                "is_error": true, "content": "no such file"}]}}),
+        ),
+        line(
+            serde_json::json!({"type": "assistant", "uuid": "m", "parentUuid": "rb",
+            "message": {"content": [{"type": "text", "text": "a exists, b does not"}]}}),
+        ),
+        line(serde_json::json!({"type": "last-prompt", "leafUuid": "p"})),
+    ]
+    .concat();
+    let h = parse_history(&text);
+    let tools: Vec<_> = h.items.iter().filter_map(|i| i.tool.as_ref()).collect();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].status, ToolStatus::Completed);
+    assert_eq!(tools[0].output.as_deref(), Some("contents of a"));
+    assert_eq!(tools[1].status, ToolStatus::Failed);
+    assert_eq!(
+        h.items.last().unwrap().text.as_deref(),
+        Some("a exists, b does not")
+    );
+}
+
 #[test]
 fn rejects_symlinks_and_oversized_files() {
     let dir = tempfile::tempdir().unwrap();

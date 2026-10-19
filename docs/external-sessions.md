@@ -68,9 +68,14 @@ root is `external.claude_home`, else `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
 - **Branches.** Rewinds and retries give a `parentUuid` several children, so
   reading the file top to bottom mixes abandoned branches in. The active
   branch is found by starting at the last `last-prompt.leafUuid`, following
-  the newest child down to a leaf, then walking `parentUuid` (or
-  `logicalParentUuid` across a compaction) back to the root. Without a
-  `last-prompt` line the newest message is the leaf (warning `no_leaf_marker`).
+  the child whose subtree was written last down to a leaf, then walking
+  `parentUuid` (or `logicalParentUuid` across a compaction) back to the root.
+  Without a `last-prompt` line the newest message is the leaf (warning
+  `no_leaf_marker`).
+- **Parallel tool calls** are written one `tool_use` line after another, and
+  each `tool_result` hangs off its own call, so all results but the last are
+  off the active branch. Results are therefore matched to calls by
+  `tool_use_id` across the whole file.
 - A half-written last line (the CLI is still appending) is skipped with the
   warning `partial_last_line`.
 
