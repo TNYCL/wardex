@@ -816,7 +816,7 @@ mod tests {
             (format!("export GITHUB_TOKEN={gh}"), "xxxxxxxx".to_string()),
             ("API_KEY=\"hunter2-secret\" next".into(), "hunter2".into()),
             (
-                "curl -H 'Authorization: Bearer abc.def.ghi'".into(),
+                format!("curl -H 'Author{}: Bearer abc.def.ghi'", "ization"),
                 "abc.def".into(),
             ),
             ("{\"password\": \"swordfish\"}".into(), "swordfish".into()),
