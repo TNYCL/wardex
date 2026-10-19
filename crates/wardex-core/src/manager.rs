@@ -1379,18 +1379,22 @@ impl Manager {
                 Vec::new()
             }
         };
-        let mut records: HashMap<_, _> = records
+        // Keep the database order (newest first, ties in insertion order) and
+        // overlay the cached state; cached-only sessions follow by id, so the
+        // result never depends on hash map order.
+        let mut cached = self
+            .inner
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut records: Vec<SessionRecord> = records
             .into_iter()
-            .map(|record| (record.id.clone(), record))
+            .map(|record| cached.remove(&record.id).unwrap_or(record))
             .collect();
-        records.extend(
-            self.inner
-                .records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        );
-        let records = records.into_values();
+        let mut cached_only: Vec<_> = cached.into_values().collect();
+        cached_only.sort_by(|a, b| b.id.cmp(&a.id));
+        records.extend(cached_only);
         let live = self.live();
         let mut out: Vec<SessionView> = records
             .into_iter()
@@ -1408,19 +1412,22 @@ impl Manager {
             })
             .collect();
         // Sessions started after the list query.
-        for (id, l) in live.iter() {
-            if !out.iter().any(|v| &v.session.id == id) {
-                out.push(SessionView {
-                    session: l.record.clone(),
-                    live: true,
-                    pending_questions: l.pending.len(),
-                });
-            }
-        }
+        let mut started: Vec<_> = live
+            .iter()
+            .filter(|(id, _)| !out.iter().any(|v| &v.session.id == *id))
+            .map(|(_, l)| SessionView {
+                session: l.record.clone(),
+                live: true,
+                pending_questions: l.pending.len(),
+            })
+            .collect();
         drop(live);
+        started.sort_by(|a, b| b.session.id.cmp(&a.session.id));
+        out.extend(started);
         out.retain(|v| {
             filter.matches(&v.session) && (!filter.resumable || (!v.live && v.session.cwd.is_dir()))
         });
+        // Stable: sessions created in the same millisecond keep the order above.
         out.sort_by_key(|v| std::cmp::Reverse(v.session.created_ms));
         out.truncate(500);
         Ok(out)

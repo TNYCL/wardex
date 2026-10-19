@@ -511,7 +511,8 @@ impl Store {
     }
 
     /// Sessions passing `filter` (see [`ListFilter::matches`]; the working
-    /// directory of `resumable` is not checked here), newest first.
+    /// directory of `resumable` is not checked here), newest first; sessions
+    /// created in the same millisecond newest-inserted first.
     pub async fn list_sessions_matching(
         &self,
         filter: &ListFilter,
@@ -536,7 +537,9 @@ impl Store {
             q.push(" AND task GLOB ")
                 .push_bind(crate::glob::to_sqlite(pattern));
         }
-        q.push(" ORDER BY created_ms DESC LIMIT ").push_bind(limit);
+        // rowid breaks ties between sessions created in the same millisecond.
+        q.push(" ORDER BY created_ms DESC, rowid DESC LIMIT ")
+            .push_bind(limit);
         let rows = q.build().fetch_all(&self.pool).await?;
         rows.iter().map(session_from_row).collect()
     }
@@ -1421,6 +1424,40 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_created_in_the_same_millisecond_list_newest_inserted_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        // Ids sort neither with nor against insertion order.
+        let inserted = ["s3", "s1", "s4", "s2", "s5"];
+        for id in inserted {
+            let mut r = record(id, SessionState::Done);
+            r.created_ms = 7;
+            store.insert_session(&r).await.unwrap();
+        }
+        let expected: Vec<_> = inserted.iter().rev().map(|id| id.to_string()).collect();
+        for filter in [
+            ListFilter {
+                all: true,
+                ..Default::default()
+            },
+            ListFilter {
+                ended: true,
+                agent: Some("a".into()),
+                ..Default::default()
+            },
+        ] {
+            let ids: Vec<_> = store
+                .list_sessions_matching(&filter, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id.0)
+                .collect();
+            assert_eq!(ids, expected);
+        }
     }
 
     #[tokio::test]

@@ -1832,6 +1832,55 @@ async fn list_filters_and_latest_find_sessions_to_continue() {
 }
 
 #[tokio::test]
+async fn sessions_created_in_the_same_millisecond_list_and_resolve_deterministically() {
+    let h = harness().await;
+    // One real session in the manager's cache, plus stored sessions that
+    // share one creation time; their ids sort neither with nor against
+    // insertion order.
+    let real = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &real, SessionState::Idle).await;
+    h.manager.stop(&real).await.unwrap();
+    wait_state(&h.manager, &real, SessionState::Stopped).await;
+    let template = h.manager.status(&real).await.unwrap().session;
+    let tied = ["f3", "f1", "f4", "f2"];
+    for id in tied {
+        let mut r = template.clone();
+        r.id = SessionId(id.into());
+        r.created_ms = template.created_ms - 60_000;
+        h.manager.store().insert_session(&r).await.unwrap();
+    }
+    let mut expected = vec![real.clone()];
+    expected.extend(tied.iter().rev().map(|id| SessionId((*id).into())));
+    for _ in 0..20 {
+        let filter = ListFilter {
+            ended: true,
+            agent: Some("agent-*".into()),
+            ..Default::default()
+        };
+        assert_eq!(listed(&h.manager, filter).await, expected);
+        assert_eq!(
+            h.manager.latest(None, Some("task-?".into())).await.unwrap(),
+            real
+        );
+    }
+    // Among the tied ones, the last inserted is the newest.
+    let mut only_tied = template.clone();
+    only_tied.id = SessionId("f0".into());
+    only_tied.task = Some("other".into());
+    only_tied.created_ms = template.created_ms - 60_000;
+    h.manager.store().insert_session(&only_tied).await.unwrap();
+    let mut again = only_tied.clone();
+    again.id = SessionId("f9".into());
+    h.manager.store().insert_session(&again).await.unwrap();
+    for _ in 0..20 {
+        assert_eq!(
+            h.manager.latest(None, Some("other".into())).await.unwrap(),
+            again.id
+        );
+    }
+}
+
+#[tokio::test]
 async fn crash_is_an_error_with_stderr() {
     let h = harness().await;
     let id = h.manager.run(spec(&h, "crash")).await.unwrap().session.id;
