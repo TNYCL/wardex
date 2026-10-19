@@ -2,7 +2,7 @@
 //! persists their events, tracks live state, answers questions, detects
 //! stuck sessions and applies retention.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,6 +38,11 @@ pub enum ManagerError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{message}: {sessions:?}; no turns were interrupted")]
+    DrainBlocked {
+        message: String,
+        sessions: Vec<SessionId>,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -61,6 +66,12 @@ pub enum AnswerInput {
 pub struct RunOutcome {
     pub session: SessionRecord,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainReport {
+    pub closed_sessions: Vec<SessionId>,
+    pub interrupted_sessions: Vec<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +254,10 @@ struct Inner {
     drivers: HashMap<DriverKind, Arc<dyn Driver>>,
     launcher: Launcher,
     live: Mutex<HashMap<SessionId, Live>>,
+    starting: Mutex<HashSet<SessionId>>,
     tx: broadcast::Sender<Event>,
     shutting_down: AtomicBool,
+    draining: AtomicBool,
     started_ms: i64,
 }
 
@@ -263,6 +276,7 @@ struct Live {
     stuck_flagged: bool,
     stop_requested: bool,
     idle_exit: bool,
+    drain_exit: bool,
     interrupt_requested: bool,
     cpu_sample: Option<(u64, i64)>,
     cpu_percent: Option<f64>,
@@ -275,6 +289,30 @@ struct Pending {
     asked_ms: i64,
     reminded: bool,
     stuck: bool,
+}
+
+/// Held across async database reads and released on errors or cancellation.
+struct StartReservation<'a> {
+    inner: &'a Inner,
+    id: SessionId,
+}
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        self.inner
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+struct DrainReservation<'a>(&'a Inner);
+
+impl Drop for DrainReservation<'_> {
+    fn drop(&mut self) {
+        self.0.draining.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Pending {
@@ -336,8 +374,10 @@ impl Manager {
                 drivers,
                 launcher,
                 live: Mutex::new(HashMap::new()),
+                starting: Mutex::new(HashSet::new()),
                 tx,
                 shutting_down: AtomicBool::new(false),
+                draining: AtomicBool::new(false),
                 started_ms: now_ms(),
             }),
         }
@@ -365,6 +405,35 @@ impl Manager {
         self.inner.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn reserve_start(&self, id: &SessionId) -> Result<StartReservation<'_>> {
+        let mut starting = self
+            .inner
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.accepting_work()?;
+        if self.live().contains_key(id) || !starting.insert(id.clone()) {
+            return Err(ManagerError::Conflict(format!(
+                "session {id} is already live or starting"
+            )));
+        }
+        Ok(StartReservation {
+            inner: &self.inner,
+            id: id.clone(),
+        })
+    }
+
+    fn accepting_work(&self) -> Result<()> {
+        if self.inner.draining.load(Ordering::SeqCst)
+            || self.inner.shutting_down.load(Ordering::SeqCst)
+        {
+            return Err(ManagerError::Conflict(
+                "the daemon is draining or shutting down".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Persist and broadcast an event for a live session.
     fn emit_live(&self, id: &SessionId, kind: EventKind) -> Option<Event> {
         let mut live = self.live();
@@ -383,9 +452,13 @@ impl Manager {
 
     fn publish(&self, event: &Event, record: Option<&SessionRecord>) {
         if !event.kind.is_delta() {
-            self.inner.store.append_event(event.clone());
-            if let Some(r) = record {
-                self.inner.store.queue_session_update(r.clone());
+            if let Err(error) = self.inner.store.append_event(event.clone()) {
+                tracing::error!(%error, session = %event.session_id, "event could not be queued");
+            }
+            if let Some(r) = record
+                && let Err(error) = self.inner.store.queue_session_update(r.clone())
+            {
+                tracing::error!(%error, session = %r.id, "session update could not be queued");
             }
         }
         let _ = self.inner.tx.send(event.clone());
@@ -458,14 +531,16 @@ impl Manager {
                     exit_code: None,
                 },
             );
-            self.inner.store.queue_cancel(&record.id);
+            self.inner.store.queue_cancel(&record.id)?;
             ids.push(record.id.clone());
         }
-        self.inner.store.flush().await;
+        self.inner.store.flush().await?;
         Ok(ids)
     }
 
     pub async fn run(&self, spec: RunSpec) -> Result<RunOutcome> {
+        self.accepting_work()?;
+        self.inner.store.flush().await?;
         let driver = spec
             .driver
             .ok_or_else(|| ManagerError::Invalid("driver is required".into()))?;
@@ -499,6 +574,7 @@ impl Manager {
         while self.inner.store.session_exists(id.as_str()).await? {
             id = SessionId::generate();
         }
+        let _reservation = self.reserve_start(&id)?;
 
         let (cwd, origin_cwd) = match &spec.worktree {
             Some(name) => {
@@ -583,16 +659,24 @@ impl Manager {
                     message: e.to_string(),
                 },
             );
-            self.inner.store.flush().await;
+            self.inner.store.flush().await?;
             return Err(e);
         }
         self.deliver(&id, spec.prompt)?;
+        self.inner.store.flush().await?;
         let session = self.record(&id).await?;
         Ok(RunOutcome { session, warnings })
     }
 
     /// Spawn a process for `record` and register it as live.
     fn spawn_process(&self, record: &mut SessionRecord, resume: Option<String>) -> Result<()> {
+        // Serialize process registration with the daemon shutdown gate.
+        let _starting = self
+            .inner
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.accepting_work()?;
         let driver = self
             .inner
             .drivers
@@ -616,7 +700,9 @@ impl Manager {
         record.state = SessionState::Starting;
         record.ended_ms = None;
         record.updated_ms = now_ms();
-        self.inner.store.queue_session_update(record.clone());
+        if let Err(error) = self.inner.store.queue_session_update(record.clone()) {
+            tracing::error!(%error, session = %record.id, "spawn state could not be queued");
+        }
 
         let now = now_ms();
         let live = Live {
@@ -632,6 +718,7 @@ impl Manager {
             stuck_flagged: false,
             stop_requested: false,
             idle_exit: false,
+            drain_exit: false,
             interrupt_requested: false,
             cpu_sample: None,
             cpu_percent: None,
@@ -642,18 +729,19 @@ impl Manager {
 
         let this = self.clone();
         let id = record.id.clone();
+        let generation = record.spawn_count;
         let mut events = handle.events;
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
                 match ev {
-                    DriverEvent::Event(kind) => this.on_event(&id, kind).await,
+                    DriverEvent::Event(kind) => this.on_event(&id, generation, kind).await,
                     DriverEvent::Exited { code, stderr_tail } => {
-                        this.on_exit(&id, code, stderr_tail).await;
+                        this.on_exit(&id, generation, code, stderr_tail).await;
                         return;
                     }
                 }
             }
-            this.on_exit(&id, None, Vec::new()).await;
+            this.on_exit(&id, generation, None, Vec::new()).await;
         });
         Ok(())
     }
@@ -661,9 +749,15 @@ impl Manager {
     /// Send a message to a live session.
     fn deliver(&self, id: &SessionId, text: String) -> Result<()> {
         let mut live = self.live();
+        self.accepting_work()?;
         let entry = live
             .get_mut(id)
             .ok_or_else(|| ManagerError::Conflict(format!("session {id} is not live")))?;
+        if entry.stop_requested || entry.idle_exit || entry.drain_exit {
+            return Err(ManagerError::Conflict(format!(
+                "session {id} is shutting down; retry after it exits"
+            )));
+        }
         let payload = if entry.record.readonly && !entry.first_prompt_sent {
             format!("{READONLY_PREFIX}{text}")
         } else {
@@ -684,7 +778,7 @@ impl Manager {
         Ok(())
     }
 
-    async fn on_event(&self, id: &SessionId, kind: EventKind) {
+    async fn on_event(&self, id: &SessionId, generation: u32, kind: EventKind) {
         let now = now_ms();
         // Done needs the git state, which is read outside the lock.
         let kind = match kind {
@@ -714,6 +808,9 @@ impl Manager {
             let Some(entry) = live.get_mut(id) else {
                 return;
             };
+            if entry.record.spawn_count != generation {
+                return;
+            }
             entry.last_activity_ms = now;
             entry.stuck_flagged = false;
             let kind = match kind {
@@ -780,7 +877,7 @@ impl Manager {
                         stuck: false,
                     };
                     // Queued under the lock: ordered before any answer.
-                    self.inner.store.queue_question(QuestionRow {
+                    if let Err(error) = self.inner.store.queue_question(QuestionRow {
                         session_id: id.clone(),
                         question_id,
                         kind: pending.kind().into(),
@@ -789,7 +886,9 @@ impl Manager {
                         answered_ms: None,
                         answer: None,
                         cancelled: false,
-                    });
+                    }) {
+                        tracing::error!(%error, session = %id, "question could not be queued");
+                    }
                     entry.pending.push(pending);
                     k
                 }
@@ -830,59 +929,77 @@ impl Manager {
         }
     }
 
-    async fn on_exit(&self, id: &SessionId, code: Option<i32>, stderr_tail: Vec<String>) {
-        let Some(entry) = self.live().remove(id) else {
-            return;
-        };
-        let mut record = entry.record;
-        let state = if self.inner.shutting_down.load(Ordering::SeqCst) {
-            record.resume_pending = true;
-            record.resume_with_prompt = entry.turn_active || !entry.pending.is_empty();
-            SessionState::Orphaned
-        } else if entry.stop_requested {
-            SessionState::Stopped
-        } else if entry.idle_exit || (code == Some(0) && !entry.turn_active) {
-            SessionState::Done
-        } else {
-            SessionState::Error
-        };
-        if state == SessionState::Error {
-            let mut message = match code {
-                Some(c) => format!("agent process exited unexpectedly with code {c}"),
-                None => "agent process exited unexpectedly".to_string(),
-            };
-            let tail: Vec<&String> = stderr_tail.iter().rev().take(5).rev().collect();
-            if !tail.is_empty() {
-                message.push_str(": ");
-                message.push_str(
-                    &tail
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" | "),
-                );
+    async fn on_exit(
+        &self,
+        id: &SessionId,
+        generation: u32,
+        code: Option<i32>,
+        stderr_tail: Vec<String>,
+    ) {
+        let (record, drain_exit) = {
+            // Queue the final snapshot before allowing a resume to read it.
+            let mut live = self.live();
+            if !live
+                .get(id)
+                .is_some_and(|l| l.record.spawn_count == generation)
+            {
+                return;
             }
-            record.last_error = Some(message.clone());
-            self.emit_record(&mut record, EventKind::Error { message });
-        }
-        record.state = state;
-        record.ended_ms = Some(now_ms());
-        record.pid = None;
-        self.emit_record(
-            &mut record,
-            EventKind::Ended {
-                state,
-                exit_code: code,
-            },
-        );
-        self.inner.store.queue_cancel(id);
-        tracing::info!(session = %id, state = state.as_str(), ?code, "session process ended");
-        if let Some(unit) = &record.unit {
+            let entry = live.remove(id).expect("generation checked under the lock");
+            let mut record = entry.record;
+            let shutting_down = self.inner.shutting_down.load(Ordering::SeqCst);
+            let state = if entry.stop_requested && !shutting_down {
+                SessionState::Stopped
+            } else if entry.drain_exit || shutting_down {
+                record.resume_pending = true;
+                record.resume_with_prompt = entry.turn_active || !entry.pending.is_empty();
+                SessionState::Orphaned
+            } else if entry.idle_exit || (code == Some(0) && !entry.turn_active) {
+                SessionState::Done
+            } else {
+                SessionState::Error
+            };
+            if state == SessionState::Error {
+                let mut message = match code {
+                    Some(c) => format!("agent process exited unexpectedly with code {c}"),
+                    None => "agent process exited unexpectedly".to_string(),
+                };
+                let tail: Vec<&String> = stderr_tail.iter().rev().take(5).rev().collect();
+                if !tail.is_empty() {
+                    message.push_str(": ");
+                    message.push_str(
+                        &tail
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    );
+                }
+                record.last_error = Some(message.clone());
+                self.emit_record(&mut record, EventKind::Error { message });
+            }
+            record.state = state;
+            record.ended_ms = Some(now_ms());
+            record.pid = None;
+            self.emit_record(
+                &mut record,
+                EventKind::Ended {
+                    state,
+                    exit_code: code,
+                },
+            );
+            if let Err(error) = self.inner.store.queue_cancel(id) {
+                tracing::error!(%error, session = %id, "question cancellation could not be queued");
+            }
+            tracing::info!(session = %id, state = state.as_str(), ?code, "session process ended");
+            (record, entry.drain_exit && !entry.stop_requested)
+        };
+        if !drain_exit && let Some(unit) = &record.unit {
             // Clean up anything the agent left running in its scope.
             Launcher::kill_unit(unit).await;
         }
         if record.remove_worktree
-            && matches!(state, SessionState::Done | SessionState::Stopped)
+            && matches!(record.state, SessionState::Done | SessionState::Stopped)
             && let Some(origin) = &record.origin_cwd
             && let Some(root) = git::repo_root(origin).await
             && let Err(e) = git::remove_worktree(&root, &record.cwd).await
@@ -892,6 +1009,7 @@ impl Manager {
     }
 
     pub async fn list(&self, all: bool) -> Result<Vec<SessionView>> {
+        self.inner.store.flush().await?;
         let records = self.inner.store.list_sessions(all, 500).await?;
         let live = self.live();
         let mut out: Vec<SessionView> = records
@@ -924,6 +1042,7 @@ impl Manager {
     }
 
     pub async fn status(&self, id: &SessionId) -> Result<SessionStatus> {
+        self.inner.store.flush().await?;
         if let Some(l) = self.live().get(id) {
             return Ok(SessionStatus {
                 session: l.record.clone(),
@@ -999,7 +1118,7 @@ impl Manager {
             })
             .collect();
         let store = &self.inner.store;
-        store.flush().await;
+        store.flush().await?;
         let mut live = snapshot;
         if events > 0 {
             for s in &mut live {
@@ -1080,7 +1199,7 @@ impl Manager {
     pub async fn tool_output(&self, id: &SessionId, seq: u64) -> Result<ToolOutput> {
         self.record(id).await?;
         let store = &self.inner.store;
-        store.flush().await;
+        store.flush().await?;
         let call_id = match store.event_at(id, seq).await?.map(|e| e.kind) {
             Some(EventKind::ToolCall { call_id, .. }) => call_id,
             Some(_) => {
@@ -1124,20 +1243,20 @@ impl Manager {
     /// Persisted events after `since_seq`. Waits for queued events first.
     pub async fn events(&self, id: &SessionId, since_seq: u64, limit: i64) -> Result<Vec<Event>> {
         self.record(id).await?;
-        self.inner.store.flush().await;
+        self.inner.store.flush().await?;
         Ok(self.inner.store.events(id, since_seq, limit).await?)
     }
 
     pub async fn last_events(&self, id: &SessionId, n: i64) -> Result<Vec<Event>> {
         self.record(id).await?;
-        self.inner.store.flush().await;
+        self.inner.store.flush().await?;
         Ok(self.inner.store.last_events(id, n).await?)
     }
 
     pub async fn summary(&self, id: &SessionId) -> Result<SessionSummary> {
         let record = self.record(id).await?;
         let store = &self.inner.store;
-        store.flush().await;
+        store.flush().await?;
         let event_counts: BTreeMap<String, i64> =
             store.event_counts(id).await?.into_iter().collect();
         let tool_counts: BTreeMap<String, i64> = store.tool_counts(id).await?.into_iter().collect();
@@ -1199,11 +1318,17 @@ impl Manager {
         question_id: Option<&str>,
         input: AnswerInput,
     ) -> Result<String> {
+        self.inner.store.flush().await?;
         let qid = {
             let mut live = self.live();
             let entry = live
                 .get_mut(id)
                 .ok_or_else(|| ManagerError::Conflict(format!("session {id} is not live")))?;
+            if entry.stop_requested || entry.idle_exit || entry.drain_exit {
+                return Err(ManagerError::Conflict(format!(
+                    "session {id} is shutting down"
+                )));
+            }
             let idx = match question_id {
                 Some(q) => entry
                     .pending
@@ -1220,7 +1345,7 @@ impl Manager {
                 }
             };
             let answer = build_answer(&entry.pending[idx].request, input)?;
-            let pending = entry.pending.remove(idx);
+            let pending = &entry.pending[idx];
             entry
                 .commands
                 .send(DriverCommand::Answer {
@@ -1228,6 +1353,7 @@ impl Manager {
                     answer: answer.clone(),
                 })
                 .map_err(|_| ManagerError::Conflict(format!("session {id} is shutting down")))?;
+            let pending = entry.pending.remove(idx);
             entry.turn_active = true;
             entry.last_activity_ms = now_ms();
             entry.stuck_flagged = false;
@@ -1245,21 +1371,25 @@ impl Manager {
                 &pending.question_id,
                 serde_json::to_value(&answer).unwrap_or_default(),
                 now_ms(),
-            );
+            )?;
             pending.question_id
         };
+        self.inner.store.flush().await?;
         Ok(qid)
     }
 
     /// Send a follow-up message. A session that is not live is resumed with
     /// the message. Returns whether it was resumed.
     pub async fn send(&self, id: &SessionId, text: String) -> Result<bool> {
+        self.accepting_work()?;
+        self.inner.store.flush().await?;
         if text.trim().is_empty() {
             return Err(ManagerError::Invalid("message is empty".into()));
         }
         let live = self.live().contains_key(id);
         if live {
             self.deliver(id, text)?;
+            self.inner.store.flush().await?;
             Ok(false)
         } else {
             self.resume(id, Some(text)).await?;
@@ -1269,11 +1399,8 @@ impl Manager {
 
     /// Resume a session that is not live, optionally with a message.
     pub async fn resume(&self, id: &SessionId, message: Option<String>) -> Result<SessionRecord> {
-        if self.live().contains_key(id) {
-            return Err(ManagerError::Conflict(format!(
-                "session {id} is already live"
-            )));
-        }
+        let _reservation = self.reserve_start(id)?;
+        self.inner.store.flush().await?;
         let mut record = self.record(id).await?;
         let resume_id = record.driver_session_id.clone().ok_or_else(|| {
             ManagerError::Conflict(format!(
@@ -1288,25 +1415,32 @@ impl Manager {
         if let Some(text) = message {
             self.deliver(id, text)?;
         }
+        self.inner.store.flush().await?;
         self.record(id).await
     }
 
     /// Stop a live session: close stdin, then kill after the grace period.
     pub async fn stop(&self, id: &SessionId) -> Result<()> {
+        self.inner.store.flush().await?;
         let grace = Duration::from_secs(self.inner.config.sessions.stop_grace_secs);
-        {
+        let generation = {
             let mut live = self.live();
             let entry = live
                 .get_mut(id)
                 .ok_or_else(|| ManagerError::Conflict(format!("session {id} is not live")))?;
             entry.stop_requested = true;
             let _ = entry.commands.send(DriverCommand::Shutdown);
-        }
+            entry.record.spawn_count
+        };
         let this = self.clone();
         let id = id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            let cmd = this.live().get(&id).map(|l| l.commands.clone());
+            let cmd = this
+                .live()
+                .get(&id)
+                .filter(|l| l.record.spawn_count == generation)
+                .map(|l| l.commands.clone());
             if let Some(cmd) = cmd {
                 let _ = cmd.send(DriverCommand::Kill);
             }
@@ -1316,6 +1450,7 @@ impl Manager {
 
     /// Interrupt the running turn of a live session.
     pub async fn interrupt(&self, id: &SessionId) -> Result<()> {
+        self.inner.store.flush().await?;
         let mut live = self.live();
         let entry = live
             .get_mut(id)
@@ -1350,6 +1485,7 @@ impl Manager {
                 .then(|| self.inner.config.sessions.resume_prompt.clone());
             match self.resume(&record.id, message).await {
                 Ok(_) => resumed.push(record.id.clone()),
+                Err(e @ ManagerError::Store(_)) => return Err(e),
                 Err(e) => {
                     tracing::error!(session = %record.id, error = %e, "automatic resume failed");
                     record.resume_pending = false;
@@ -1380,7 +1516,7 @@ impl Manager {
     }
 
     pub async fn pending_questions(&self) -> Result<Vec<QuestionRow>> {
-        self.inner.store.flush().await;
+        self.inner.store.flush().await?;
         Ok(self.inner.store.open_questions(None).await?)
     }
 
@@ -1388,10 +1524,115 @@ impl Manager {
         self.live().keys().cloned().collect()
     }
 
+    /// Drain without interrupting turns or losing live question/approval
+    /// request ids. Refuse shutdown on timeout; never escalate an idle
+    /// process to SIGKILL. Successfully closed sessions remain resumable.
+    pub async fn drain(&self, timeout: Duration, grace: Duration) -> Result<DrainReport> {
+        let _reservation = {
+            let starting = self
+                .inner
+                .starting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.accepting_work()?;
+            if !starting.is_empty() {
+                let mut sessions: Vec<_> = starting.iter().cloned().collect();
+                sessions.sort();
+                return Err(ManagerError::DrainBlocked {
+                    message: "drain refused while sessions are starting; retry when they are ready"
+                        .into(),
+                    sessions,
+                });
+            }
+            self.inner.draining.store(true, Ordering::SeqCst);
+            DrainReservation(&self.inner)
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut busy: Vec<_> = self
+                .live()
+                .values()
+                .filter(|l| l.turn_active || !l.pending.is_empty() || !l.started)
+                .map(|l| l.record.id.clone())
+                .collect();
+            if busy.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                busy.sort();
+                return Err(ManagerError::DrainBlocked {
+                    message: "drain timed out waiting for turns or answers; answer pending requests, wait, or explicitly stop these sessions before retrying".into(),
+                    sessions: busy,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Resume ids and every completed turn must be durable before EOF.
+        self.inner.store.flush().await?;
+        let mut closed_sessions = {
+            let mut live = self.live();
+            let mut blocked: Vec<_> = live
+                .values()
+                .filter(|l| {
+                    l.turn_active
+                        || !l.pending.is_empty()
+                        || !l.started
+                        || l.record.driver_session_id.is_none()
+                })
+                .map(|l| l.record.id.clone())
+                .collect();
+            if !blocked.is_empty() {
+                blocked.sort();
+                return Err(ManagerError::DrainBlocked {
+                    message:
+                        "sessions are no longer safely resumable and idle; retry after they settle"
+                            .into(),
+                    sessions: blocked,
+                });
+            }
+            let ids: Vec<_> = live.keys().cloned().collect();
+            for l in live.values_mut() {
+                l.drain_exit = true;
+                let _ = l.commands.send(DriverCommand::Drain);
+            }
+            ids
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let mut remaining = self.live_ids();
+            if remaining.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                remaining.sort();
+                return Err(ManagerError::DrainBlocked {
+                    message: "drain refused: processes did not exit after stdin closed; no force-kill was sent; wait for exit or explicitly stop these sessions before retrying".into(),
+                    sessions: remaining,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.inner.store.flush().await?;
+        // Keep new work out until the transport signals daemon shutdown.
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        closed_sessions.sort();
+        Ok(DrainReport {
+            closed_sessions,
+            interrupted_sessions: Vec::new(),
+        })
+    }
+
     /// Stop every live session and mark it orphaned so it can be resumed by
     /// the next daemon. Waits up to `timeout` for processes to exit.
-    pub async fn shutdown(&self, timeout: Duration) {
-        self.inner.shutting_down.store(true, Ordering::SeqCst);
+    pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
+        {
+            let _starting = self
+                .inner
+                .starting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.inner.shutting_down.store(true, Ordering::SeqCst);
+        }
         let commands: Vec<_> = self.live().values().map(|l| l.commands.clone()).collect();
         for cmd in &commands {
             let _ = cmd.send(DriverCommand::Shutdown);
@@ -1408,7 +1649,8 @@ impl Manager {
         while !self.live().is_empty() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        self.inner.store.flush().await;
+        self.inner.store.flush().await?;
+        Ok(())
     }
 
     /// Run the supervision loop forever: stuck detection, reminders, idle

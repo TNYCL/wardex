@@ -122,7 +122,8 @@ pub enum DaemonAction {
     /// sessions become orphaned (resumable, automatically with
     /// `sessions.auto_resume_orphaned`).
     Stop {
-        /// First wait up to this many seconds for running turns to finish.
+        /// Wait for turns and pending answers, then close idle sessions
+        /// gracefully. Refuse shutdown on timeout; never force-kill in drain.
         #[arg(long, value_name = "SECS")]
         drain: Option<u64>,
     },
@@ -130,7 +131,8 @@ pub enum DaemonAction {
     /// systemd keeps tracking it), running the currently installed binary.
     /// Waits until the new daemon answers.
     Restart {
-        /// First wait up to this many seconds for running turns to finish.
+        /// Wait for turns and pending answers, then close idle sessions
+        /// gracefully. Refuse restart on timeout; never force-kill in drain.
         #[arg(long, value_name = "SECS")]
         drain: Option<u64>,
     },

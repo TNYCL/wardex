@@ -87,7 +87,9 @@ pub enum Request {
         events: Option<i64>,
     },
     /// Stop the daemon. With `drain_secs`, first wait up to that long for
-    /// running turns to finish. With `restart`, the daemon starts again in
+    /// running turns and pending answers to finish. Drain refuses shutdown
+    /// on timeout or if an idle process will not exit gracefully; it never
+    /// interrupts a turn. With `restart`, the daemon starts again in
     /// the same process (same PID) after stopping.
     Shutdown {
         #[serde(default)]
@@ -134,11 +136,31 @@ impl Response {
 
 impl From<ManagerError> for Response {
     fn from(e: ManagerError) -> Self {
+        if let ManagerError::DrainBlocked { message, sessions } = e {
+            let mut response = Response::err(
+                "conflict",
+                format!(
+                    "{message}: {}; no turns were interrupted",
+                    sessions
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            response.data = Some(json!({
+                "shutting_down": false,
+                "blocked_sessions": sessions,
+                "interrupted_sessions": [],
+            }));
+            return response;
+        }
         let code = match &e {
             ManagerError::NotFound(_) => "not_found",
             ManagerError::Ambiguous(_) => "ambiguous",
             ManagerError::Invalid(_) => "invalid",
             ManagerError::Conflict(_) => "conflict",
+            ManagerError::DrainBlocked { .. } => "conflict",
             ManagerError::Store(_) | ManagerError::Driver(_) => "internal",
         };
         Response::err(code, e.to_string())
@@ -241,11 +263,10 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             )
             .await?,
         ),
-        Request::Shutdown {
-            drain_secs,
-            restart,
-        } => {
-            json!({"shutting_down": true, "drain_secs": drain_secs, "restart": restart})
+        Request::Shutdown { .. } => {
+            return Err(ManagerError::Invalid(
+                "shutdown is handled by the daemon's socket server".into(),
+            ));
         }
         Request::Reload => {
             return Err(ManagerError::Invalid(

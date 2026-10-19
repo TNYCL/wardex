@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,10 @@ pub enum StoreError {
     },
     #[error("corrupt row: {0}")]
     Corrupt(String),
+    #[error("persistence writer failed: {0}; repair the database and restart the daemon")]
+    WriterFailed(String),
+    #[error("persistence writer is unavailable")]
+    WriterStopped,
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
@@ -49,11 +54,12 @@ pub struct Store {
     pool: SqlitePool,
     path: PathBuf,
     writer: mpsc::UnboundedSender<WriterMsg>,
+    writer_error: Arc<Mutex<Option<String>>>,
 }
 
 enum WriterMsg {
     Item(Item),
-    Flush(oneshot::Sender<()>),
+    Flush(oneshot::Sender<Result<()>>),
 }
 
 enum Item {
@@ -70,6 +76,7 @@ enum Item {
 }
 
 const BATCH: usize = 256;
+const WRITE_ATTEMPTS: usize = 3;
 
 impl Store {
     /// Open (and create) the database and start the event writer. Must be
@@ -95,11 +102,13 @@ impl Store {
         sqlx::migrate!("./migrations").run(&pool).await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer_loop(pool.clone(), rx));
+        let writer_error = Arc::new(Mutex::new(None));
+        tokio::spawn(writer_loop(pool.clone(), rx, writer_error.clone()));
         Ok(Self {
             pool,
             path: path.to_path_buf(),
             writer: tx,
+            writer_error,
         })
     }
 
@@ -108,17 +117,13 @@ impl Store {
     }
 
     /// Queue an event for persistence. Deltas must not be passed here.
-    pub fn append_event(&self, event: Event) {
-        let _ = self
-            .writer
-            .send(WriterMsg::Item(Item::Event(Box::new(event))));
+    pub fn append_event(&self, event: Event) -> Result<()> {
+        self.enqueue(Item::Event(Box::new(event)))
     }
 
     /// Queue a new question row (ordered with events).
-    pub fn queue_question(&self, q: QuestionRow) {
-        let _ = self
-            .writer
-            .send(WriterMsg::Item(Item::Question(Box::new(q))));
+    pub fn queue_question(&self, q: QuestionRow) -> Result<()> {
+        self.enqueue(Item::Question(Box::new(q)))
     }
 
     /// Queue an answer for a question row (ordered with its insert).
@@ -128,36 +133,52 @@ impl Store {
         question_id: &str,
         answer: serde_json::Value,
         at_ms: i64,
-    ) {
-        let _ = self.writer.send(WriterMsg::Item(Item::Answer {
+    ) -> Result<()> {
+        self.enqueue(Item::Answer {
             session: session.clone(),
             question_id: question_id.to_string(),
             answer,
             at_ms,
-        }));
+        })
     }
 
     /// Queue cancelling all open questions of a session.
-    pub fn queue_cancel(&self, session: &SessionId) {
-        let _ = self
-            .writer
-            .send(WriterMsg::Item(Item::Cancel(session.clone())));
+    pub fn queue_cancel(&self, session: &SessionId) -> Result<()> {
+        self.enqueue(Item::Cancel(session.clone()))
     }
 
     /// Queue a session row update. Applied in order with queued events, so a
     /// later snapshot never gets overwritten by an earlier one.
-    pub fn queue_session_update(&self, record: SessionRecord) {
-        let _ = self
-            .writer
-            .send(WriterMsg::Item(Item::Session(Box::new(record))));
+    pub fn queue_session_update(&self, record: SessionRecord) -> Result<()> {
+        self.enqueue(Item::Session(Box::new(record)))
     }
 
-    /// Wait until every event queued so far is committed.
-    pub async fn flush(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.writer.send(WriterMsg::Flush(tx)).is_ok() {
-            let _ = rx.await;
+    fn writer_failure(&self) -> StoreError {
+        match &*self.writer_error.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(error) => StoreError::WriterFailed(error.clone()),
+            None => StoreError::WriterStopped,
         }
+    }
+
+    fn enqueue(&self, item: Item) -> Result<()> {
+        let error = self.writer_error.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = &*error {
+            return Err(StoreError::WriterFailed(error.clone()));
+        }
+        self.writer
+            .send(WriterMsg::Item(item))
+            .map_err(|_| StoreError::WriterStopped)
+    }
+
+    /// Wait until everything queued so far is committed. After exhausted
+    /// retries the writer stays failed: every flush and enqueue returns an
+    /// error, even if a later database operation would succeed.
+    pub async fn flush(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.writer
+            .send(WriterMsg::Flush(tx))
+            .map_err(|_| self.writer_failure())?;
+        rx.await.map_err(|_| self.writer_failure())?
     }
 
     pub async fn insert_session(&self, s: &SessionRecord) -> Result<()> {
@@ -534,15 +555,21 @@ impl Store {
         Ok(row.get::<i64, _>("used").max(0) as u64)
     }
 
-    pub async fn close(&self) {
-        self.flush().await;
+    pub async fn close(&self) -> Result<()> {
+        let result = self.flush().await;
         self.pool.close().await;
+        result
     }
 }
 
-async fn writer_loop(pool: SqlitePool, mut rx: mpsc::UnboundedReceiver<WriterMsg>) {
+async fn writer_loop(
+    pool: SqlitePool,
+    mut rx: mpsc::UnboundedReceiver<WriterMsg>,
+    writer_error: Arc<Mutex<Option<String>>>,
+) {
     let mut batch: Vec<Item> = Vec::with_capacity(BATCH);
-    let mut waiters: Vec<oneshot::Sender<()>> = Vec::new();
+    let mut waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
+    let mut failure = None;
     while let Some(msg) = rx.recv().await {
         push(&mut batch, &mut waiters, msg);
         while batch.len() < BATCH {
@@ -551,19 +578,43 @@ async fn writer_loop(pool: SqlitePool, mut rx: mpsc::UnboundedReceiver<WriterMsg
                 Err(_) => break,
             }
         }
-        if !batch.is_empty() {
-            if let Err(e) = write_batch(&pool, &batch).await {
-                tracing::error!(error = %e, count = batch.len(), "failed to persist events");
+        if failure.is_none() && !batch.is_empty() {
+            for attempt in 1..=WRITE_ATTEMPTS {
+                match write_batch(&pool, &batch).await {
+                    Ok(()) => {
+                        batch.clear();
+                        break;
+                    }
+                    Err(error) if attempt < WRITE_ATTEMPTS => {
+                        tracing::warn!(%error, attempt, count = batch.len(), "retrying persistence batch");
+                        tokio::time::sleep(Duration::from_millis(25 * attempt as u64)).await;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "batch of {} items failed after {attempt} attempts: {error}",
+                            batch.len()
+                        );
+                        tracing::error!(error = %message, "persistence writer stopped; uncommitted batch retained in memory");
+                        *writer_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(message.clone());
+                        failure = Some(message);
+                    }
+                }
             }
-            batch.clear();
         }
         for w in waiters.drain(..) {
-            let _ = w.send(());
+            let result = match &failure {
+                Some(error) => Err(StoreError::WriterFailed(error.clone())),
+                None => Ok(()),
+            };
+            let _ = w.send(result);
         }
+        // On permanent failure keep this batch and any items already queued
+        // during retries. New enqueues are rejected; only flushes are served.
     }
 }
 
-fn push(batch: &mut Vec<Item>, waiters: &mut Vec<oneshot::Sender<()>>, msg: WriterMsg) {
+fn push(batch: &mut Vec<Item>, waiters: &mut Vec<oneshot::Sender<Result<()>>>, msg: WriterMsg) {
     match msg {
         WriterMsg::Item(item) => batch.push(item),
         WriterMsg::Flush(tx) => waiters.push(tx),
@@ -654,6 +705,8 @@ fn cancel_questions_query(session: &SessionId) -> Query<'_> {
 fn update_session_query(
     s: &SessionRecord,
 ) -> sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    // `reasoning` is currently insert-only. Updating driver-reported effort
+    // is a separate persistence change, outside the lifecycle fixes.
     sqlx::query(
         "UPDATE sessions SET driver_session_id = ?, state = ?, model = ?, unit = ?, pid = ?,
             updated_ms = ?, ended_ms = ?, last_seq = ?, last_result = ?, last_error = ?,
@@ -794,25 +847,29 @@ mod tests {
             let store = Store::open(&path).await.unwrap();
             let mut s = record("abcd1234", SessionState::Running);
             store.insert_session(&s).await.unwrap();
-            store.append_event(event(
-                "abcd1234",
-                1,
-                EventKind::Prompt { text: "hi".into() },
-            ));
-            store.append_event(event(
-                "abcd1234",
-                2,
-                EventKind::Done {
-                    result: Some("ok".into()),
-                    interrupted: false,
-                    note: None,
-                    git: None,
-                },
-            ));
+            store
+                .append_event(event(
+                    "abcd1234",
+                    1,
+                    EventKind::Prompt { text: "hi".into() },
+                ))
+                .unwrap();
+            store
+                .append_event(event(
+                    "abcd1234",
+                    2,
+                    EventKind::Done {
+                        result: Some("ok".into()),
+                        interrupted: false,
+                        note: None,
+                        git: None,
+                    },
+                ))
+                .unwrap();
             s.state = SessionState::Done;
             s.last_seq = 2;
             store.update_session(&s).await.unwrap();
-            store.close().await;
+            store.close().await.unwrap();
         }
         let store = Store::open(&path).await.unwrap();
         let s = store
@@ -868,6 +925,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_batch_rolls_back_and_every_flush_reports_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        let mut session = record("s1", SessionState::Running);
+        store.insert_session(&session).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_event BEFORE INSERT ON events WHEN NEW.session_id = 'missing' BEGIN SELECT RAISE(FAIL, 'injected batch failure'); END")
+            .execute(&store.pool).await.unwrap();
+        store
+            .append_event(event(
+                "s1",
+                1,
+                EventKind::Prompt {
+                    text: "keep".into(),
+                },
+            ))
+            .unwrap();
+        session.state = SessionState::Idle;
+        store.queue_session_update(session.clone()).unwrap();
+        // This injected SQLite error rolls back the earlier event and snapshot.
+        store
+            .append_event(event(
+                "missing",
+                1,
+                EventKind::Prompt {
+                    text: "fail".into(),
+                },
+            ))
+            .unwrap();
+        let (first, second) = tokio::join!(store.flush(), store.flush());
+        for result in [first, second, store.flush().await] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("after 3 attempts"), "{error}");
+            assert!(error.contains("restart the daemon"), "{error}");
+        }
+        assert!(store.events(&session.id, 0, 10).await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session(&session.id).await.unwrap().unwrap().state,
+            SessionState::Running
+        );
+        sqlx::query("DROP TRIGGER reject_event")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store.flush().await.is_err(),
+            "repair must not hide an uncommitted batch"
+        );
+        assert!(matches!(
+            store.queue_session_update(session),
+            Err(StoreError::WriterFailed(_))
+        ));
+        assert!(matches!(
+            store.close().await,
+            Err(StoreError::WriterFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_pool_is_reported_to_flush_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        store.pool.close().await;
+        store
+            .append_event(event(
+                "s1",
+                1,
+                EventKind::Prompt {
+                    text: "fail".into(),
+                },
+            ))
+            .unwrap();
+        let (first, second) = tokio::join!(store.flush(), store.flush());
+        assert!(matches!(first, Err(StoreError::WriterFailed(_))));
+        assert!(matches!(second, Err(StoreError::WriterFailed(_))));
+        assert!(store.flush().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_writer_cannot_acknowledge_flush_or_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        store.writer = tx;
+        assert!(matches!(
+            store.flush().await,
+            Err(StoreError::WriterStopped)
+        ));
+        assert!(matches!(
+            store.queue_cancel(&SessionId("s1".into())),
+            Err(StoreError::WriterStopped)
+        ));
+        assert!(matches!(
+            store.close().await,
+            Err(StoreError::WriterStopped)
+        ));
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_a_locked_database_and_preserves_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+        store
+            .insert_session(&record("s1", SessionState::Running))
+            .await
+            .unwrap();
+        let mut lock = store.pool.begin().await.unwrap();
+        sqlx::query("UPDATE sessions SET task = 'locked'")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        store
+            .append_event(event(
+                "s1",
+                1,
+                EventKind::Prompt {
+                    text: "queued".into(),
+                },
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), store.flush())
+                .await
+                .is_err()
+        );
+        lock.commit().await.unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(
+            store
+                .events(&SessionId("s1".into()), 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn prune_keeps_live_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("w.db")).await.unwrap();
@@ -879,10 +1075,14 @@ mod tests {
             .await
             .unwrap();
         for seq in 1..=3 {
-            store.append_event(event("old", seq, EventKind::Prompt { text: "x".into() }));
-            store.append_event(event("live", seq, EventKind::Prompt { text: "x".into() }));
+            store
+                .append_event(event("old", seq, EventKind::Prompt { text: "x".into() }))
+                .unwrap();
+            store
+                .append_event(event("live", seq, EventKind::Prompt { text: "x".into() }))
+                .unwrap();
         }
-        store.flush().await;
+        store.flush().await.unwrap();
         let deleted = store.prune(1, 0, 10 * 86_400_000).await.unwrap();
         assert_eq!(deleted, 3);
         assert_eq!(

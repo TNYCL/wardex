@@ -189,9 +189,11 @@ pub async fn run_with(
     }
     let _ = shutdown_tx.send(true);
     let grace = Duration::from_secs(config.sessions.stop_grace_secs + 5);
-    manager.shutdown(grace).await;
+    let shutdown_result = manager.shutdown(grace).await;
     let _ = std::fs::remove_file(&socket_path);
-    store.close().await;
+    let close_result = store.close().await;
+    shutdown_result?;
+    close_result?;
     let exit = if control.restart_requested() {
         tracing::info!("wardex daemon stopped; restarting");
         Exit::Restart

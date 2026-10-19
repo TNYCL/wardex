@@ -111,6 +111,10 @@ transparently.
 
 - SQLite (WAL, single writer task, batched writes): `sessions`, `events`,
   `questions`. History and state survive daemon restarts.
+  Failed batches are retried three times with short backoff. Exhausted
+  retries leave the writer failed, retaining its uncommitted queue in memory
+  and rejecting new writes. Flush, history and session API calls report the
+  persistence error; repair the database and restart before continuing.
 - Before opening SQLite or recovering sessions, the daemon takes a
   non-blocking exclusive file lock on `<database>.lock` and binds its Unix
   socket, rejecting a live socket and replacing a stale one. The lock is held
@@ -121,9 +125,26 @@ transparently.
   sessions. On start, sessions whose process is gone are marked
   `error: orphaned` and can be continued with `wardex resume` (driver resume
   id). `auto_resume_orphaned` (default off) resumes them automatically.
-- **Graceful shutdown:** on stop the daemon persists state and resume ids and
-  exits without killing sessions; `wardex daemon stop --drain` interrupts
-  sessions explicitly.
+- **Ordinary shutdown** (`daemon stop` / `restart` without `--drain`, or a
+  termination signal): close session stdin, wait for the shutdown grace
+  period, then force-kill remaining processes/scopes. Sessions become
+  orphaned with persisted resume ids; pending protocol requests are cancelled.
+- **Graceful drain** (`daemon stop --drain SECS` / `restart --drain SECS`):
+  reject new runs, resumes and follow-ups while waiting for all turns and
+  question/approval answers, allowing answers to existing requests. If the
+  deadline expires, refuse shutdown and report the blocking session ids in
+  CLI errors and JSON `blocked_sessions`; every live session and pending
+  request remains available. No turns are interrupted (`interrupted_sessions`
+  is empty). Once all sessions are idle, flush state and resume ids, close
+  stdin, and wait up to `sessions.stop_grace_secs + 5` seconds for exit.
+  Drain never force-kills a session or its scope, including after stdout EOF.
+  If a process refuses EOF, refuse shutdown and report its id. Other sessions
+  may already have closed; the remaining process has closed stdin and rejects
+  new messages. Wait for it to exit or explicitly `stop` it before retrying.
+  Closed sessions are orphaned and can be resumed manually or through
+  `auto_resume_orphaned`, without an extra continuation prompt. A successful
+  JSON response lists `closed_sessions`; it is sent only after persistence
+  and graceful process exit complete.
 - A per-session shim that keeps pipes alive across restarts is Phase 3.
 - Event retention and size limits are configurable.
 

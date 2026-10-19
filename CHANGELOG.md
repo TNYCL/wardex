@@ -81,6 +81,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Retry failed SQLite batches up to three times, retain the uncommitted queue
+  in an explicit failed writer state, and return persistence errors from
+  flushes and session/history API calls instead of acknowledging lost events.
+- Reserve session starts atomically so concurrent resumes spawn one process.
+  Delayed stop timers and driver events target the original process generation.
+- Make daemon drain refuse shutdown on active-turn or pending-answer timeout,
+  preserving live questions and approvals. Close idle processes gracefully
+  without SIGKILL escalation, refuse restart if they do not exit, and report
+  blocking/closed session ids and an empty interrupted-session list. Resume ids
+  are flushed before closing stdin; successful responses wait for completion.
 - Reject duplicate daemons before opening the database or recovering sessions
   by holding an exclusive database lock for the daemon's lifetime and checking
   the socket first. A second start, even with a different socket, no longer

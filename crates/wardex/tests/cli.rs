@@ -709,6 +709,160 @@ fn restart_keeps_the_process_and_history() {
     env.stop_daemon(daemon);
 }
 
+/// Replay a completed turn, a running turn, or a pending question. A stubborn
+/// idle process keeps stdout open after EOF until the test releases it.
+fn lifecycle_agent(env: &Env, mode: &str) {
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../wardex-drivers/tests/fixtures/claude");
+    let records: Vec<Value> = std::fs::read_to_string(fixtures.join("resume.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let init = &records
+        .iter()
+        .find(|r| r["msg"]["subtype"] == "init")
+        .unwrap()["msg"];
+    let result = &records
+        .iter()
+        .find(|r| r["msg"]["type"] == "result")
+        .unwrap()["msg"];
+    let quote = |value: &Value| value.to_string().replace('\'', "'\\''");
+    let mut script = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{}'\nIFS= read -r _ || exit 0\n",
+        quote(init)
+    );
+    if mode == "idle" || mode == "stubborn" {
+        script.push_str(&format!("printf '%s\\n' '{}'\n", quote(result)));
+    }
+    script.push_str("while IFS= read -r _; do :; done\n");
+    if mode == "stubborn" {
+        script.push_str("touch eof-seen\nwhile [ ! -e release ]; do sleep 0.05; done\n");
+    }
+    std::fs::write(env.dir.path().join("fake-claude.sh"), script).unwrap();
+}
+
+#[test]
+fn drain_restart_preserves_a_running_turn_on_timeout() {
+    let env = Env::with_config("resume", "[sessions]\nstop_grace_secs = 0\n");
+    lifecycle_agent(&env, "busy");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "running");
+    let before = env.json(&["status", id]);
+    let response = env.run(&["--json", "daemon", "restart", "--drain", "0"]);
+    let after = env.json(&["status", id]);
+    env.stop_daemon(daemon);
+    assert!(
+        !response.status.success(),
+        "drain silently interrupted a running turn"
+    );
+    assert_eq!(after["live"], true);
+    assert_eq!(after["pid"], before["pid"]);
+    let response: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["code"], "conflict");
+    assert_eq!(
+        response["data"]["blocked_sessions"],
+        serde_json::json!([id])
+    );
+    assert_eq!(
+        response["data"]["interrupted_sessions"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn drain_restart_preserves_pending_questions() {
+    let env = Env::new("question");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "ask"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "waiting_input");
+    let before = env.json(&["pending"]);
+    let response = env.run(&["daemon", "restart", "--drain", "0"]);
+    let after = env.json(&["pending"]);
+    let live = env.json(&["status", id])["live"].clone();
+    // Clean up the isolated daemon even when the regression assertion fails.
+    if live == true {
+        env.json(&["answer", id, "blue"]);
+        env.wait_state(id, "done");
+    }
+    env.stop_daemon(daemon);
+    assert!(
+        !response.status.success(),
+        "restart discarded a pending question"
+    );
+    assert_eq!(live, true);
+    assert_eq!(after, before);
+    assert!(String::from_utf8_lossy(&response.stderr).contains(id));
+}
+
+#[test]
+fn drain_restart_does_not_kill_an_idle_process_that_ignores_eof() {
+    let env = Env::with_config("resume", "[sessions]\nstop_grace_secs = 0\n");
+    lifecycle_agent(&env, "stubborn");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "idle");
+    let response = env.run(&["--json", "daemon", "restart", "--drain", "0"]);
+    let after = env.json(&["status", id]);
+    let eof_seen = env.dir.path().join("eof-seen").exists();
+    std::fs::write(env.dir.path().join("release"), "").unwrap();
+    if after["live"] == true {
+        env.wait_state(id, "orphaned");
+    }
+    env.stop_daemon(daemon);
+    assert!(eof_seen, "graceful EOF was never attempted");
+    assert!(
+        !response.status.success(),
+        "drain forcibly killed an idle process"
+    );
+    assert_eq!(after["live"], true);
+    let response: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(
+        response["data"]["blocked_sessions"],
+        serde_json::json!([id])
+    );
+    assert_eq!(
+        response["data"]["interrupted_sessions"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn drain_restart_closes_idle_processes_gracefully_and_keeps_resume_ids() {
+    let env = Env::new("resume");
+    lifecycle_agent(&env, "idle");
+    let daemon = env.start_daemon();
+    let out = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+    let id = out["session"]["id"].as_str().unwrap();
+    env.wait_state(id, "idle");
+    let before = env.json(&["status", id]);
+    let report = env.json(&["daemon", "restart", "--drain", "1"]);
+    assert_eq!(report["closed_sessions"], serde_json::json!([id]));
+    assert_eq!(report["interrupted_sessions"], serde_json::json!([]));
+    let after = env.json(&["status", id]);
+    assert_eq!(after["state"], "orphaned");
+    assert_eq!(after["live"], false);
+    assert_eq!(after["driver_session_id"], before["driver_session_id"]);
+    let events = env.json(&["tail", id, "--since-seq", "0"]);
+    let ended = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "ended")
+        .unwrap();
+    assert_eq!(ended["payload"]["exit_code"], 0);
+    env.json(&["resume", id]);
+    env.wait_state(id, "idle");
+    env.json(&["send", id, "next"]);
+    env.wait_state(id, "idle");
+    assert_eq!(env.json(&["status", id])["spawn_count"], 2);
+    env.stop_daemon(daemon);
+}
+
 /// Full tool input/output: left out of `tail` by default, shown with
 /// `--full` and by `tool-output`.
 #[test]

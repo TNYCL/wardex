@@ -82,7 +82,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     .with_context(|| {
                         format!("the daemon did not exit within {}s", timeout.as_secs())
                     })?;
-                finish(json, resp, |_| "daemon stopped\n".into())
+                finish(json, resp, |data| shutdown_message("stopped", data))
             }
             Some(DaemonAction::Restart { drain }) => {
                 let before = daemon_info(&client).await?;
@@ -103,7 +103,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .with_context(|| {
                     format!("the daemon did not come back within {}s", timeout.as_secs())
                 })?;
-                finish(json, resp, |_| "daemon restarted\n".into())
+                finish(json, resp, |data| shutdown_message("restarted", data))
             }
             Some(DaemonAction::Reload) => {
                 let resp = client.request(&Request::Reload).await?;
@@ -402,6 +402,17 @@ fn process_running(pid: u32) -> bool {
 
 fn stop_timeout(config: &Config, drain: Option<u64>) -> Duration {
     Duration::from_secs(drain.unwrap_or(0) + config.sessions.stop_grace_secs + 30)
+}
+
+fn shutdown_message(action: &str, data: &Value) -> String {
+    let mut message = format!("daemon {action}\n");
+    if let Some(closed) = data["closed_sessions"].as_array() {
+        message.push_str(&format!(
+            "drained {} session(s); no turns were interrupted\n",
+            closed.len()
+        ));
+    }
+    message
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut done: F) -> Result<()>

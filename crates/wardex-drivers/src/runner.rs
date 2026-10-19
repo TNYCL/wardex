@@ -43,7 +43,7 @@ pub trait Protocol: Send + 'static {
         Output::default()
     }
     fn on_line(&mut self, line: &str) -> Output;
-    /// `Shutdown` and `Kill` are handled by the runner.
+    /// `Shutdown`, `Drain` and `Kill` are handled by the runner.
     fn on_command(&mut self, cmd: DriverCommand) -> Output;
 }
 
@@ -120,6 +120,7 @@ async fn run_loop<P: Protocol>(
 
     let mut lines = stdout.map(|s| BufReader::new(s).lines());
     let mut commands_open = true;
+    let mut draining = false;
     loop {
         tokio::select! {
             line = async {
@@ -145,6 +146,10 @@ async fn run_loop<P: Protocol>(
                     Some(DriverCommand::Shutdown) => {
                         stdin = None;
                     }
+                    Some(DriverCommand::Drain) => {
+                        draining = true;
+                        stdin = None;
+                    }
                     Some(DriverCommand::Kill) => {
                         kill(&mut child, unit.as_deref()).await;
                     }
@@ -163,13 +168,30 @@ async fn run_loop<P: Protocol>(
         }
     }
 
-    // stdout closed: the process is ending. Give it a moment, then kill.
+    // stdout closed: keep accepting drain/stop commands while reaping. A
+    // drain must not turn EOF into an implicit SIGKILL five seconds later.
     drop(stdin);
-    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        _ => {
-            kill(&mut child, unit.as_deref()).await;
-            child.wait().await.ok()
+    let mut deadline = (!draining).then(|| tokio::time::Instant::now() + Duration::from_secs(5));
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.ok(),
+            cmd = cmd_rx.recv(), if commands_open => {
+                match cmd {
+                    Some(DriverCommand::Drain) => deadline = None,
+                    Some(DriverCommand::Kill) => kill(&mut child, unit.as_deref()).await,
+                    None => commands_open = false,
+                    _ => {}
+                }
+            }
+            _ = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                kill(&mut child, unit.as_deref()).await;
+                deadline = None;
+            }
         }
     };
     // Let the stderr task drain.

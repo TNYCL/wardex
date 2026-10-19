@@ -490,7 +490,7 @@ impl Protocol for CodexProtocol {
                     );
                 }
             }
-            DriverCommand::Shutdown | DriverCommand::Kill => {}
+            DriverCommand::Shutdown | DriverCommand::Drain | DriverCommand::Kill => {}
         }
         out
     }

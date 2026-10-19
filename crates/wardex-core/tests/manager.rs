@@ -49,6 +49,7 @@ impl Driver for FakeDriver {
                 reasoning: Some("fake-effort".into()),
             });
             let mut pending_tool = false;
+            let mut ignore_eof = false;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     DriverCommand::Send(text) => {
@@ -71,6 +72,10 @@ impl Driver for FakeDriver {
                                 summary: "rm -rf build".into(),
                             }),
                             "hang" => {}
+                            "idle-ignore-eof" => {
+                                ignore_eof = true;
+                                send(done(Some("idle".into()), false));
+                            }
                             "tool-hang" => {
                                 pending_tool = true;
                                 send(EventKind::ToolCall {
@@ -120,7 +125,10 @@ impl Driver for FakeDriver {
                         }
                         send(done(None, true));
                     }
-                    DriverCommand::Shutdown => {
+                    DriverCommand::Shutdown | DriverCommand::Drain => {
+                        if ignore_eof {
+                            continue;
+                        }
                         let _ = ev_tx.send(DriverEvent::Exited {
                             code: Some(0),
                             stderr_tail: vec![],
@@ -507,6 +515,212 @@ async fn stop_then_send_resumes() {
 }
 
 #[tokio::test]
+async fn delayed_stop_does_not_kill_a_resumed_process() {
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 1;
+    let h = harness_with(config).await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    h.manager.resume(&id, None).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let status = h.manager.status(&id).await.unwrap();
+    assert!(status.live, "the old stop timer killed the new process");
+    assert_eq!(status.session.spawn_count, 2);
+    h.manager.stop(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn simultaneous_resumes_spawn_only_one_process() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    let (first, second) = tokio::join!(h.manager.resume(&id, None), h.manager.resume(&id, None),);
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let error = first.err().or_else(|| second.err()).unwrap();
+    assert!(matches!(error, ManagerError::Conflict(_)));
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
+    h.manager.stop(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn persistence_failure_reaches_history_clients() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.events(&id, 0, 100).await.unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", h.manager.store().path().display()))
+            .await
+            .unwrap();
+    sqlx::query("CREATE TRIGGER reject_events BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'injected write failure'); END")
+        .execute(&pool).await.unwrap();
+    let send_result = h.manager.send(&id, "another turn".into()).await;
+    let result = h.manager.events(&id, 0, 100).await;
+    sqlx::query("DROP TRIGGER reject_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(
+        send_result.is_err(),
+        "a failed event write was reported as a successful send"
+    );
+    assert!(
+        result.is_err(),
+        "a failed event write was reported as successful history"
+    );
+}
+
+#[tokio::test]
+async fn drain_timeout_preserves_active_idle_questions_and_approvals() {
+    let h = harness().await;
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let question = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    let approval = h.manager.run(spec(&h, "approve")).await.unwrap().session.id;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    wait_state(&h.manager, &question, SessionState::WaitingInput).await;
+    wait_state(&h.manager, &approval, SessionState::WaitingInput).await;
+    let pending = h.manager.pending_questions().await.unwrap();
+    let error = h
+        .manager
+        .drain(Duration::ZERO, Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    let ManagerError::DrainBlocked { mut sessions, .. } = error else {
+        panic!("{error}")
+    };
+    sessions.sort();
+    let mut expected = vec![busy.clone(), question.clone(), approval.clone()];
+    expected.sort();
+    assert_eq!(sessions, expected);
+    for id in [&busy, &idle, &question, &approval] {
+        assert!(h.manager.status(id).await.unwrap().live);
+        assert!(!kinds(&h.manager, id).await.contains(&"ended".into()));
+    }
+    assert_eq!(h.manager.pending_questions().await.unwrap(), pending);
+    // The original protocol request ids still work after a refused restart.
+    h.manager
+        .answer(&question, Some("q1"), AnswerInput::Text("blue".into()))
+        .await
+        .unwrap();
+    h.manager
+        .answer(&approval, Some("r1"), AnswerInput::Text("deny".into()))
+        .await
+        .unwrap();
+    h.manager.interrupt(&busy).await.unwrap();
+    wait_state(&h.manager, &busy, SessionState::Idle).await;
+    wait_state(&h.manager, &question, SessionState::Idle).await;
+    wait_state(&h.manager, &approval, SessionState::Idle).await;
+    let report = h
+        .manager
+        .drain(Duration::ZERO, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(report.closed_sessions.len(), 4);
+    assert!(report.interrupted_sessions.is_empty());
+    for id in &report.closed_sessions {
+        let record = h.manager.status(id).await.unwrap().session;
+        assert_eq!(record.state, SessionState::Orphaned);
+        assert!(record.resume_pending);
+        assert!(!record.resume_with_prompt);
+    }
+    let path = h.manager.store().path().to_path_buf();
+    h.manager.store().close().await.unwrap();
+    let mut config = Config::default();
+    config.sessions.auto_resume_orphaned = true;
+    let next = Manager::new(
+        config,
+        Store::open(&path).await.unwrap(),
+        vec![Arc::new(FakeDriver {
+            spawns: h.spawns.clone(),
+            received: h.received.clone(),
+        })],
+        Launcher::direct(),
+    );
+    assert!(next.recover().await.unwrap().is_empty());
+    assert_eq!(next.auto_resume().await.unwrap().len(), 4);
+    for id in &report.closed_sessions {
+        wait_state(&next, id, SessionState::Idle).await;
+        assert_eq!(next.status(id).await.unwrap().session.spawn_count, 2);
+    }
+    next.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn drain_accepts_answers_but_reserves_against_new_work() {
+    let h = harness().await;
+    let question = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &question, SessionState::WaitingInput).await;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    let manager = h.manager.clone();
+    let drain = tokio::spawn(async move {
+        manager
+            .drain(Duration::from_secs(2), Duration::from_secs(1))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        h.manager.run(spec(&h, "new")).await,
+        Err(ManagerError::Conflict(_))
+    ));
+    assert!(matches!(
+        h.manager.send(&idle, "new".into()).await,
+        Err(ManagerError::Conflict(_))
+    ));
+    assert!(matches!(
+        h.manager.resume(&SessionId("missing".into()), None).await,
+        Err(ManagerError::Conflict(_))
+    ));
+    h.manager
+        .answer(&question, None, AnswerInput::Text("blue".into()))
+        .await
+        .unwrap();
+    let report = drain.await.unwrap().unwrap();
+    assert_eq!(report.closed_sessions.len(), 2);
+    assert!(report.interrupted_sessions.is_empty());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn drain_never_escalates_idle_eof_and_explicit_stop_still_works() {
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    let h = harness_with(config).await;
+    let id = h
+        .manager
+        .run(spec(&h, "idle-ignore-eof"))
+        .await
+        .unwrap()
+        .session
+        .id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    assert!(matches!(
+        h.manager
+            .drain(Duration::ZERO, Duration::from_millis(20))
+            .await,
+        Err(ManagerError::DrainBlocked { .. })
+    ));
+    assert!(h.manager.status(&id).await.unwrap().live);
+    assert!(matches!(
+        h.manager.send(&id, "new".into()).await,
+        Err(ManagerError::Conflict(_))
+    ));
+    // Explicit stop retains its force-kill fallback after a refused drain.
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    h.manager.resume(&id, Some("again".into())).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
 async fn idle_shutdown_ends_as_done() {
     let mut config = Config::default();
     config.sessions.idle_shutdown_secs = 1;
@@ -610,7 +824,7 @@ async fn recover_marks_live_sessions_orphaned() {
         wait_state(&m, &id, SessionState::Running).await;
         // Simulate a crash of the daemon: the store is closed, the session
         // row still says running.
-        store.close().await;
+        store.close().await.unwrap();
     }
     let store = Store::open(&db).await.unwrap();
     let driver = Arc::new(FakeDriver {
@@ -728,7 +942,7 @@ async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
         wait_state(&m, &idle, SessionState::Idle).await;
         // Drain gives up on the hanging turn but not on the idle session.
         assert!(!m.wait_for_turns(Duration::from_millis(200)).await);
-        m.shutdown(Duration::from_secs(2)).await;
+        m.shutdown(Duration::from_secs(2)).await.unwrap();
         for id in [&busy, &idle] {
             let st = m.status(id).await.unwrap().session;
             assert_eq!(st.state, SessionState::Orphaned);
@@ -736,7 +950,7 @@ async fn shutdown_orphans_and_auto_resume_continues_busy_sessions() {
         }
         assert!(m.status(&busy).await.unwrap().session.resume_with_prompt);
         assert!(!m.status(&idle).await.unwrap().session.resume_with_prompt);
-        store.close().await;
+        store.close().await.unwrap();
     }
     let mut config = Config::default();
     config.sessions.auto_resume_orphaned = true;
@@ -791,8 +1005,8 @@ async fn orphans_are_not_resumed_unless_enabled() {
             .session
             .id;
         wait_state(&m, &id, SessionState::Idle).await;
-        m.shutdown(Duration::from_secs(2)).await;
-        store.close().await;
+        m.shutdown(Duration::from_secs(2)).await.unwrap();
+        store.close().await.unwrap();
     }
     let spawns = Arc::new(AtomicU32::new(0));
     let driver = Arc::new(FakeDriver {

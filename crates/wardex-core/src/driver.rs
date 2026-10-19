@@ -42,6 +42,8 @@ pub enum DriverCommand {
     Interrupt,
     /// End the process gracefully (close stdin).
     Shutdown,
+    /// Close stdin for daemon drain, without an automatic force-kill fallback.
+    Drain,
     /// Kill the process (and its scope).
     Kill,
 }
