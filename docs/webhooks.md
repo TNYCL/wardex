@@ -15,7 +15,7 @@ Any event type can be listed in `events`; message deltas are never sent.
 | `question` | The agent asked something and waits (`wardex answer`). |
 | `approval` | The agent asks for permission (rare with full-access modes). |
 | `reminder` | A question has waited `timeouts.question_reminder_secs`. |
-| `stuck` | A question has waited `question_stuck_secs` (`reason: waiting_input`), or a running turn produced nothing for `idle_stuck_secs` while no tool ran (`reason: no_output`). |
+| `stuck` | A question has waited `question_stuck_secs` (`reason: waiting_input`), or a running turn produced nothing for `idle_stuck_secs` while no tool ran (`reason: no_output`; `idle_stuck_secs = 0` turns this off). Idle sessions (no turn running) are never reported stuck. |
 | `done` | A turn finished. Carries the final text, the CLI's turn note and the git state (branch, changed files). |
 | `error` | A turn failed or the agent process died. |
 

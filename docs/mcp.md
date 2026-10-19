@@ -171,7 +171,7 @@ Message deltas are never returned; full messages are.
 4. On `done`: read `summary` (result text, changed files, branch). Either
    `send` the next instruction or leave the session alone.
 5. **Do not `stop` a session because its work is done.** An idle session
-   closes itself after `sessions.idle_shutdown_secs` (default 900 s;
+   closes itself after `sessions.idle_shutdown_secs` (default 43200 s = 12 h;
    `overview` shows `shutdown_in_ms`), and `send` resumes it with its context
    later. Use `stop` only to abort work.
 6. Use `overview` to see everything at once, e.g. after a bot restart.

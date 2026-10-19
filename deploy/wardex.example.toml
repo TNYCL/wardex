@@ -28,15 +28,16 @@ auth_failures_per_minute = 30
 auto_resume_orphaned = false
 # Directory (relative to the repo) for --worktree sessions.
 worktree_dir = ".worktree"
-# Close an idle agent process after this long; `send` resumes it. 0 = never.
-idle_shutdown_secs = 900
+# Close an idle agent process after this long (default 12 h, at most 30 days);
+# `send` resumes it. 0 = never. Each idle process keeps its memory meanwhile.
+idle_shutdown_secs = 43200
 # Seconds between closing stdin and killing a stopping session.
 stop_grace_secs = 5
 
 [timeouts]
 question_reminder_secs = 180
 question_stuck_secs = 480
-# Silence while no tool is running before a session counts as stuck.
+# Silence while no tool is running before a session counts as stuck. 0 = off.
 idle_stuck_secs = 480
 # CPU usage (% of one core) of a session's processes that counts as activity.
 busy_cpu_percent = 5.0

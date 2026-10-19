@@ -254,6 +254,11 @@ fn idle_since(l: &Live) -> Option<i64> {
         .flatten()
 }
 
+/// Seconds from the config as milliseconds, saturating instead of wrapping.
+fn secs_to_ms(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -1379,7 +1384,7 @@ impl Manager {
     /// that ended in the last 24 hours.
     pub async fn overview(&self, events: i64) -> Result<Overview> {
         let now = now_ms();
-        let idle_shutdown_ms = self.inner.config.sessions.idle_shutdown_secs as i64 * 1000;
+        let idle_shutdown_ms = secs_to_ms(self.inner.config.sessions.idle_shutdown_secs);
         let snapshot: Vec<OverviewSession> = self
             .live()
             .values()
@@ -2192,7 +2197,8 @@ impl Manager {
                     }
                 }
                 let silent = (now - l.last_activity_ms).max(0) as u64 / 1000;
-                if l.turn_active
+                if t.idle_stuck_secs > 0
+                    && l.turn_active
                     && l.pending.is_empty()
                     && l.running_tools.is_empty()
                     && !l.stuck_flagged

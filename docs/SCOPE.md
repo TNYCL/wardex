@@ -77,8 +77,8 @@ Events: `started`, `prompt`, `message` (delta and full text), `tool_call`
 Session states: `starting`, `running`, `idle` (turn done, process waiting for
 the next message), `waiting_input`, and the resumable end states `done`,
 `error`, `stopped`, `orphaned`. An idle process is closed after
-`sessions.idle_shutdown_secs`; `send` to an ended session resumes it
-transparently.
+`sessions.idle_shutdown_secs` (default 12 h); `send` to an ended session
+resumes it transparently.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.
@@ -90,7 +90,7 @@ transparently.
   3 min and `stuck` at 8 min. A session with no output gets `stuck` at 8 min,
   but **only while no tool is running** (a long build is not stuck);
   optionally the scope's CPU usage is checked too. All timings are
-  configurable.
+  configurable; `idle_stuck_secs = 0` turns the no-output check off.
 
 ### 1.3 Sessions and workspace
 

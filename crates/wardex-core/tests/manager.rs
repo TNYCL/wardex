@@ -1411,6 +1411,63 @@ async fn idle_shutdown_ends_as_done() {
 }
 
 #[tokio::test]
+async fn default_config_keeps_idle_sessions_for_twelve_hours() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    let left = h.manager.overview(0).await.unwrap().live[0]
+        .shutdown_in_ms
+        .unwrap();
+    assert!((43_190_000..=43_200_000).contains(&left), "{left}");
+    // The old default (15 minutes) no longer closes it.
+    h.manager.tick(now_ms() + 901_000);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().session.state,
+        SessionState::Idle
+    );
+    h.manager.tick(now_ms() + 43_201_000);
+    wait_state(&h.manager, &id, SessionState::Done).await;
+}
+
+#[tokio::test]
+async fn stuck_detection_and_idle_shutdown_are_independent() {
+    let h = harness_with(fast_config()).await;
+    let hang = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &hang, SessionState::Running).await;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    // Far past both limits: the running turn is stuck, never shut down; the
+    // idle session is shut down, never reported stuck.
+    h.manager.tick(now_ms() + 43_300_000);
+    wait_state(&h.manager, &idle, SessionState::Done).await;
+    assert!(matches!(
+        last_of(&h.manager, &hang, "stuck").await,
+        Some(EventKind::Stuck {
+            reason: StuckReason::NoOutput,
+            ..
+        })
+    ));
+    assert_eq!(
+        h.manager.status(&hang).await.unwrap().session.state,
+        SessionState::Running
+    );
+    assert!(last_of(&h.manager, &idle, "stuck").await.is_none());
+}
+
+#[tokio::test]
+async fn zero_idle_stuck_secs_disables_no_output_detection() {
+    let mut config = fast_config();
+    config.timeouts.idle_stuck_secs = 0;
+    let h = harness_with(config).await;
+    let id = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Running).await;
+    h.manager.tick(now_ms());
+    h.manager.tick(now_ms() + 86_400_000);
+    assert!(last_of(&h.manager, &id, "stuck").await.is_none());
+}
+
+#[tokio::test]
 async fn crash_is_an_error_with_stderr() {
     let h = harness().await;
     let id = h.manager.run(spec(&h, "crash")).await.unwrap().session.id;

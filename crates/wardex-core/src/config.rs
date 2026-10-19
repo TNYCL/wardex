@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{EVENT_NAMES, NOTABLE_EVENTS};
 
+/// Upper bound for `sessions.idle_shutdown_secs` (30 days).
+pub const MAX_IDLE_SHUTDOWN_SECS: u64 = 30 * 86_400;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read config {path}: {source}")]
@@ -110,7 +113,8 @@ pub struct SessionsConfig {
     /// Directory (relative to the repo root) for `--worktree` sessions.
     pub worktree_dir: String,
     /// Close an idle agent process after this long. Sending a message to it
-    /// later resumes it transparently. 0 keeps it forever.
+    /// later resumes it transparently. 0 keeps it forever. At most
+    /// [`MAX_IDLE_SHUTDOWN_SECS`].
     pub idle_shutdown_secs: u64,
     /// Grace period between closing stdin and killing a stopping process.
     pub stop_grace_secs: u64,
@@ -123,7 +127,7 @@ impl Default for SessionsConfig {
         Self {
             auto_resume_orphaned: false,
             worktree_dir: ".worktree".into(),
-            idle_shutdown_secs: 900,
+            idle_shutdown_secs: 12 * 3600,
             stop_grace_secs: 5,
             resume_prompt: "The previous run was interrupted by a restart of the session \
                             manager. Continue where you left off."
@@ -138,6 +142,7 @@ pub struct TimeoutsConfig {
     pub question_reminder_secs: u64,
     pub question_stuck_secs: u64,
     /// Silence while no tool is running before a session counts as stuck.
+    /// 0 disables this check.
     pub idle_stuck_secs: u64,
     /// CPU usage (percent of one core) of the session's process tree that
     /// counts as activity for stuck detection. 0 disables the CPU check.
@@ -470,6 +475,12 @@ impl Config {
         if self.daemon.tick_ms == 0 {
             return Err(ConfigError::Invalid("daemon.tick_ms must be > 0".into()));
         }
+        if self.sessions.idle_shutdown_secs > MAX_IDLE_SHUTDOWN_SECS {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.idle_shutdown_secs must be at most {MAX_IDLE_SHUTDOWN_SECS} (30 days); \
+                 use 0 to keep idle sessions forever"
+            )));
+        }
         Ok(())
     }
 
@@ -600,6 +611,27 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.timeouts.question_reminder_secs, 180);
         assert_eq!(config.webhooks.len(), 1);
+        assert_eq!(config.sessions, SessionsConfig::default());
+    }
+
+    #[test]
+    fn idle_sessions_are_kept_for_twelve_hours_by_default() {
+        assert_eq!(Config::default().sessions.idle_shutdown_secs, 43_200);
+    }
+
+    #[test]
+    fn idle_shutdown_is_bounded() {
+        let parse = |secs: u64| {
+            Config::parse(&format!("[sessions]\nidle_shutdown_secs = {secs}\n"))
+                .unwrap()
+                .validate()
+        };
+        assert!(parse(0).is_ok());
+        assert!(parse(MAX_IDLE_SHUTDOWN_SECS).is_ok());
+        let err = parse(MAX_IDLE_SHUTDOWN_SECS + 1).unwrap_err().to_string();
+        assert!(err.contains("idle_shutdown_secs"), "{err}");
+        // Would overflow i64 milliseconds without the bound.
+        assert!(parse(i64::MAX as u64).is_err());
     }
 
     #[test]

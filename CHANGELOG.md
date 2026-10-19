@@ -135,6 +135,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `sessions.idle_shutdown_secs` now defaults to 43200 (12 h) instead of 900,
+  so a follow-up `send` usually reaches a process that still has its context
+  loaded. Each idle agent process keeps its memory meanwhile (roughly
+  100–300 MB per session, partly swapped out over time); set
+  `idle_shutdown_secs = 900` to keep the old behaviour. Values above 30 days
+  are rejected (0 still keeps idle sessions forever).
+- `timeouts.idle_stuck_secs = 0` disables `stuck` (`no_output`) detection
+  instead of flagging every turn at once.
 - Event model: `tool_call` has a `call_id` and start/finish status,
   `question` carries question items with options, `approval` has a kind,
   `done` reports interrupts.
