@@ -213,7 +213,15 @@ async fn connection(
         Request::Shutdown {
             drain_secs,
             restart,
+            force,
         } => {
+            if force && drain_secs.is_none() {
+                return send(
+                    &mut write,
+                    &Response::err("invalid", "force requires an explicit drain_secs deadline"),
+                )
+                .await;
+            }
             if control
                 .stopping
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -230,26 +238,55 @@ async fn connection(
             }
             let grace =
                 std::time::Duration::from_secs(manager.config().sessions.stop_grace_secs + 5);
+            let mut forced = false;
             let result = match drain_secs {
-                Some(secs) => manager
+                Some(secs) => match manager
                     .drain(std::time::Duration::from_secs(secs), grace)
                     .await
-                    .map(|report| {
-                        serde_json::json!({
-                            "shutting_down": true, "drain_secs": secs, "restart": restart,
-                            "closed_sessions": report.closed_sessions,
-                            "interrupted_sessions": report.interrupted_sessions,
+                {
+                    Ok(report) => Ok(report),
+                    Err(error) if force => {
+                        forced = true;
+                        let closed = match &error {
+                            wardex_core::manager::ManagerError::DrainBlocked {
+                                closed_sessions,
+                                ..
+                            } => closed_sessions.clone(),
+                            _ => Vec::new(),
+                        };
+                        manager.force_shutdown(grace).await.map(|mut report| {
+                            report.closed_sessions.extend(closed);
+                            report.closed_sessions.sort();
+                            report.closed_sessions.dedup();
+                            report
                         })
-                    }),
-                None => manager.shutdown(grace).await.map(|()| {
-                    serde_json::json!({
-                        "shutting_down": true, "drain_secs": null, "restart": restart,
-                    })
-                }),
+                    }
+                    Err(error) => Err(error),
+                },
+                None => manager.shutdown(grace).await,
             };
             let response = match result {
-                Ok(data) => Response::ok(data),
+                Ok(report) => {
+                    let mut response = Response::ok(serde_json::json!({
+                        "shutting_down": true, "drain_secs": drain_secs, "restart": restart,
+                        "forced": forced, "closed_sessions": report.closed_sessions,
+                        "interrupted_sessions": report.interrupted_sessions,
+                        "persisted": report.persisted,
+                    }));
+                    response.applied = Some(true);
+                    response.persisted = Some(report.persisted);
+                    response.warnings = report.warnings;
+                    response
+                }
                 Err(error) => {
+                    // A non-drain shutdown must still exit after control has
+                    // been applied, including a final persistence failure.
+                    if drain_secs.is_none() || force {
+                        control.restart.store(restart, Ordering::SeqCst);
+                        let sent = send(&mut write, &Response::from(error)).await;
+                        let _ = control.shutdown.send(true);
+                        return sent;
+                    }
                     control.stopping.store(false, Ordering::SeqCst);
                     return send(&mut write, &Response::from(error)).await;
                 }
@@ -387,19 +424,23 @@ mod tests {
         let client = Client::new(&path);
         for request in [
             Request::Pending,
-            Request::List { all: true },
             Request::Shutdown {
                 drain_secs: Some(0),
                 restart: true,
+                force: false,
             },
         ] {
             let response = client.request(&request).await.unwrap();
             assert!(!response.ok);
             assert_eq!(response.code.as_deref(), Some("internal"));
             let error = response.error.unwrap();
-            assert!(error.contains("persistence writer failed"), "{error}");
-            assert!(error.contains("restart the daemon"), "{error}");
+            assert!(error.contains("persistence writer is retrying"), "{error}");
+            assert!(error.contains("daemon stop without --drain"), "{error}");
         }
+        let list = client.request(&Request::List { all: true }).await.unwrap();
+        assert!(list.ok);
+        assert_eq!(list.persisted, Some(false));
+        assert!(!list.warnings.is_empty());
         assert!(!control.restart_requested());
         assert!(!*control.shutdown.borrow());
         assert!(client.request(&Request::Ping).await.unwrap().ok);

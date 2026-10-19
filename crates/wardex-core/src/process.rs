@@ -9,6 +9,7 @@ use tokio::process::{Child, Command};
 #[derive(Debug, Clone)]
 pub struct Launcher {
     scope: bool,
+    scope_command: PathBuf,
 }
 
 pub struct LaunchRequest<'a> {
@@ -34,12 +35,101 @@ impl Launcher {
         if systemd_scope && !scope {
             tracing::warn!("systemd user manager not available; sessions run without scopes");
         }
-        Self { scope }
+        Self {
+            scope,
+            scope_command: "systemctl".into(),
+        }
     }
 
     /// Spawn processes directly, without systemd.
     pub fn direct() -> Self {
-        Self { scope: false }
+        Self {
+            scope: false,
+            scope_command: "systemctl".into(),
+        }
+    }
+
+    /// Inject a scope controller for temporary-process tests. Process launches
+    /// remain direct; the injected controller only receives recorded unit ids.
+    pub fn with_scope_command(program: PathBuf) -> Self {
+        Self {
+            scope: false,
+            scope_command: program,
+        }
+    }
+
+    /// Reap all descendants after the session leader exits. Verify the scope
+    /// is inactive before a new generation can start alongside it.
+    pub async fn cleanup_unit(
+        &self,
+        unit: &str,
+        grace: std::time::Duration,
+    ) -> std::io::Result<()> {
+        self.scope_call(&["--user", "kill", "--signal=SIGTERM", unit])
+            .await?;
+        let deadline = tokio::time::Instant::now() + grace;
+        while self.unit_active(unit).await? {
+            if tokio::time::Instant::now() >= deadline {
+                self.scope_call(&["--user", "kill", "--signal=SIGKILL", unit])
+                    .await?;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                while self.unit_active(unit).await? {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::other(
+                            "scope still active after SIGKILL; stop its descendants before resuming",
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    async fn scope_call(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(&self.scope_command);
+        command.args(args).kill_on_drop(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), command.output())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "scope controller timed out")
+            })?
+    }
+
+    async fn unit_active(&self, unit: &str) -> std::io::Result<bool> {
+        let output = self
+            .scope_call(&[
+                "--user",
+                "show",
+                "--property=LoadState,ActiveState,TasksCurrent",
+                unit,
+            ])
+            .await?;
+        let state = String::from_utf8_lossy(&output.stdout);
+        if state
+            .lines()
+            .find_map(|line| line.strip_prefix("TasksCurrent="))
+            .and_then(|tasks| tasks.parse::<u64>().ok())
+            .is_some_and(|tasks| tasks > 0)
+        {
+            return Ok(true);
+        }
+        if state.lines().any(|line| {
+            matches!(
+                line,
+                "LoadState=not-found" | "ActiveState=inactive" | "ActiveState=failed"
+            )
+        }) {
+            return Ok(false);
+        }
+        if output.status.success() && state.lines().any(|line| line.starts_with("ActiveState=")) {
+            return Ok(true);
+        }
+        Err(std::io::Error::other(
+            "cannot verify scope state; inspect the user systemd manager before resuming",
+        ))
     }
 
     pub fn uses_scope(&self) -> bool {

@@ -111,10 +111,27 @@ transparently.
 
 - SQLite (WAL, single writer task, batched writes): `sessions`, `events`,
   `questions`. History and state survive daemon restarts.
-  Failed batches are retried three times with short backoff. Exhausted
-  retries leave the writer failed, retaining its uncommitted queue in memory
-  and rejecting new writes. Flush, history and session API calls report the
-  persistence error; repair the database and restart before continuing.
+  Failed batches remain in a bounded queue (4096 pending writes, including
+  in-flight and quarantined writes) and retry in the background with
+  exponential backoff from 25 ms to 2 s. Recovery clears the writer error and
+  reopens new-work admission. A failed constraint/serialization batch is split
+  to isolate the offending session; its later writes stay ordered in quarantine
+  while other sessions continue. Quarantined writes also retry and consume
+  queue capacity; inspect the reported constraint/record and repair its cause.
+  A global database outage or full queue rejects new work before agent commands
+  are sent. Existing driver output waits for bounded writer capacity. Flush
+  reports errors instead of acknowledging uncommitted writes.
+- Persistence failure does not disable `list`, `status`, `stop` or `interrupt`.
+  Live/cached status remains available with `persisted: false` and warnings
+  when SQLite cannot be read or writes are uncommitted. Inspect database access
+  and free disk space; retries do not require a restart. To exit during an
+  outage, use `daemon stop` without `--drain`: shutdown completes even when its
+  final flush fails and reports the durability warning. Uncommitted writes are
+  only in memory and can be lost on exit. `run`, `send` and `answer` distinguish
+  an applied action from a durable one: a post-action write failure returns
+  success with `applied: true`, `persisted: false` and a do-not-resend warning.
+  An admission failure reports that no action was applied. On degraded CLI/MCP
+  reads, array payloads use a `data` wrapper to carry warnings and durability.
 - Before opening SQLite or recovering sessions, the daemon takes a
   non-blocking exclusive file lock on `<database>.lock` and binds its Unix
   socket, rejecting a live socket and replacing a stale one. The lock is held
@@ -130,21 +147,37 @@ transparently.
   period, then force-kill remaining processes/scopes. Sessions become
   orphaned with persisted resume ids; pending protocol requests are cancelled.
 - **Graceful drain** (`daemon stop --drain SECS` / `restart --drain SECS`):
-  reject new runs, resumes and follow-ups while waiting for all turns and
+  reject new runs, resumes and follow-ups while waiting for existing starts,
+  all turns and
   question/approval answers, allowing answers to existing requests. If the
   deadline expires, refuse shutdown and report the blocking session ids in
   CLI errors and JSON `blocked_sessions`; every live session and pending
   request remains available. No turns are interrupted (`interrupted_sessions`
-  is empty). Once all sessions are idle, flush state and resume ids, close
+  is empty). Errors include `closed_sessions`, `blocked_sessions` and three
+  `next_steps`: (1) `answer` or `stop <id>`, (2) retry `--drain`, (3) explicitly
+  use `--force`. A session that never reports a resume id requires `stop`.
+  Once all sessions are idle, flush state and resume ids, close
   stdin, and wait up to `sessions.stop_grace_secs + 5` seconds for exit.
-  Drain never force-kills a session or its scope, including after stdout EOF.
+  Drain never force-kills an idle leader that refuses EOF, including after
+  stdout EOF. After the leader exits, clean its scope with SIGTERM and a grace
+  period, then SIGKILL if needed, and verify that no descendants remain before
+  drain succeeds. Recover and manual/automatic resume also clean any old unit
+  recorded on an orphan awaiting resume; cleanup failure prevents a new spawn.
   If a process refuses EOF, refuse shutdown and report its id. Other sessions
   may already have closed; the remaining process has closed stdin and rejects
-  new messages. Wait for it to exit or explicitly `stop` it before retrying.
+  new messages. Clear its drain flag so a later natural exit is classified
+  normally. Wait for it to exit or explicitly `stop` it before retrying.
   Closed sessions are orphaned and can be resumed manually or through
   `auto_resume_orphaned`, without an extra continuation prompt. A successful
   JSON response lists `closed_sessions`; it is sent only after persistence
   and graceful process exit complete.
+- **Forced drain** (`daemon restart --drain SECS --force`, also supported on
+  `daemon stop`): try normal drain first; if it cannot finish, use ordinary
+  shutdown. Responses and human CLI output list `interrupted_sessions`; each
+  interrupted session receives a `done` event with `interrupted: true` and an
+  explicit force/shutdown note. Pending questions/approvals are cancelled.
+  The response reports `persisted: false` if those records cannot be committed.
+  `--force` requires an explicit drain deadline.
 - A per-session shim that keeps pipes alive across restarts is Phase 3.
 - Event retention and size limits are configurable.
 

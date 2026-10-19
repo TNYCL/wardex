@@ -65,12 +65,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     Exit::Restart => Err(reexec()),
                 }
             }
-            Some(DaemonAction::Stop { drain }) => {
+            Some(DaemonAction::Stop { drain, force }) => {
                 let before = daemon_info(&client).await?;
                 let resp = client
                     .request(&Request::Shutdown {
                         drain_secs: drain,
                         restart: false,
+                        force,
                     })
                     .await?;
                 if !resp.ok {
@@ -84,12 +85,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     })?;
                 finish(json, resp, |data| shutdown_message("stopped", data))
             }
-            Some(DaemonAction::Restart { drain }) => {
+            Some(DaemonAction::Restart { drain, force }) => {
                 let before = daemon_info(&client).await?;
                 let resp = client
                     .request(&Request::Shutdown {
                         drain_secs: drain,
                         restart: true,
+                        force,
                     })
                     .await?;
                 if !resp.ok {
@@ -406,11 +408,29 @@ fn stop_timeout(config: &Config, drain: Option<u64>) -> Duration {
 
 fn shutdown_message(action: &str, data: &Value) -> String {
     let mut message = format!("daemon {action}\n");
-    if let Some(closed) = data["closed_sessions"].as_array() {
-        message.push_str(&format!(
-            "drained {} session(s); no turns were interrupted\n",
-            closed.len()
-        ));
+    if data["drain_secs"].is_number()
+        && let Some(closed) = data["closed_sessions"].as_array()
+    {
+        let interrupted = data["interrupted_sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if interrupted.is_empty() {
+            message.push_str(&format!(
+                "drained {} session(s); no turns were interrupted\n",
+                closed.len()
+            ));
+        } else {
+            message.push_str(&format!(
+                "closed {} session(s); interrupted sessions: {}\n",
+                closed.len(),
+                interrupted
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     message
 }
@@ -459,10 +479,13 @@ fn finish(json: bool, resp: Response, human: impl FnOnce(&Value) -> String) -> R
         }
         bail!(resp.error.unwrap_or_else(|| "request failed".into()));
     }
-    let data = resp.data.unwrap_or(Value::Null);
     if json {
-        println!("{}", output::json(&data));
+        println!("{}", output::json(&resp.client_data()));
     } else {
+        for warning in &resp.warnings {
+            eprintln!("wardex: warning: {warning}");
+        }
+        let data = resp.data.unwrap_or(Value::Null);
         print!("{}", human(&data));
     }
     Ok(ExitCode::SUCCESS)

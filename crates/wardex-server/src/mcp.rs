@@ -231,7 +231,7 @@ pub async fn serve_stdio(client: Client) -> std::io::Result<()> {
 /// Successful results are the same JSON the CLI prints with `--json`.
 fn respond(resp: Response) -> CallToolResult {
     if resp.ok {
-        let data = resp.data.unwrap_or(serde_json::Value::Null);
+        let data = resp.client_data();
         CallToolResult::success(vec![ContentBlock::text(data.to_string())])
     } else {
         CallToolResult::error(vec![ContentBlock::text(format!(

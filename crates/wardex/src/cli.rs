@@ -126,6 +126,9 @@ pub enum DaemonAction {
         /// gracefully. Refuse shutdown on timeout; never force-kill in drain.
         #[arg(long, value_name = "SECS")]
         drain: Option<u64>,
+        /// If drain cannot finish, interrupt remaining turns and shut down.
+        #[arg(long, requires = "drain")]
+        force: bool,
     },
     /// Stop the daemon and start it again in the same process (same PID, so
     /// systemd keeps tracking it), running the currently installed binary.
@@ -135,6 +138,9 @@ pub enum DaemonAction {
         /// gracefully. Refuse restart on timeout; never force-kill in drain.
         #[arg(long, value_name = "SECS")]
         drain: Option<u64>,
+        /// If drain cannot finish, interrupt remaining turns and restart.
+        #[arg(long, requires = "drain")]
+        force: bool,
     },
     /// Re-read the config and env files and apply webhook changes without a
     /// restart (same as SIGHUP / `systemctl --user reload wardex`).
@@ -221,5 +227,13 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["wardex", "daemon", "stop"]).is_ok());
         assert!(Cli::try_parse_from(["wardex", "--json", "list", "-a"]).is_ok());
+    }
+
+    #[test]
+    fn force_requires_an_explicit_drain() {
+        assert!(Cli::try_parse_from(["wardex", "daemon", "restart", "--force"]).is_err());
+        assert!(
+            Cli::try_parse_from(["wardex", "daemon", "restart", "--drain", "0", "--force"]).is_ok()
+        );
     }
 }

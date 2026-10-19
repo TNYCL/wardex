@@ -81,16 +81,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- Retry failed SQLite batches up to three times, retain the uncommitted queue
-  in an explicit failed writer state, and return persistence errors from
-  flushes and session/history API calls instead of acknowledging lost events.
+- Retain accepted SQLite writes in a bounded queue and retry with exponential
+  background backoff. Split constraint failures to quarantine the offending
+  session while other sessions continue; clear errors after recovery.
+- Keep live/cached status, stop and interrupt available during database errors.
+  Shutdown exits even if the final flush fails. Applied actions report
+  `applied: true`, `persisted: false` and warnings instead of implying they
+  should be resent; a full write queue rejects new work before agent commands.
 - Reserve session starts atomically so concurrent resumes spawn one process.
   Delayed stop timers and driver events target the original process generation.
-- Make daemon drain refuse shutdown on active-turn or pending-answer timeout,
-  preserving live questions and approvals. Close idle processes gracefully
-  without SIGKILL escalation, refuse restart if they do not exit, and report
-  blocking/closed session ids and an empty interrupted-session list. Resume ids
-  are flushed before closing stdin; successful responses wait for completion.
+- Reap scope descendants after drain with SIGTERM then SIGKILL as necessary,
+  and clean old orphan scopes before manual/automatic resume. Failed cleanup
+  prevents a new generation from spawning alongside old descendants.
+- Report closed sessions on a partially completed drain and clear remaining
+  drain flags. Wait for existing starts until the drain deadline and give
+  explicit stop instructions when an agent never reports a resume id.
 - Reject duplicate daemons before opening the database or recovering sessions
   by holding an exclusive database lock for the daemon's lifetime and checking
   the socket first. A second start, even with a different socket, no longer
@@ -107,6 +112,17 @@ All notable changes to this project are documented here. The format follows
 - Daemon logs use colors only on a terminal.
 - Question rows are written in order with events, so `pending` never misses
   a question that was just asked.
+
+### Changed (breaking)
+
+- `daemon stop/restart --drain SECS` refuses shutdown when turns, answers or
+  graceful leader exit do not finish. Existing questions/approvals stay live;
+  idle leaders are not force-killed. Use `answer`/`stop`, retry `--drain`, or
+  explicitly choose `--drain SECS --force` to fall back to ordinary shutdown.
+  Forced shutdown reports interrupted session ids in CLI/JSON and session
+  notes. Error responses include `closed_sessions` and three operator steps.
+- Degraded CLI/MCP array results use a `data` wrapper to carry persistence
+  warnings; ordinary healthy payloads keep their existing shape.
 
 ### Changed
 

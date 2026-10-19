@@ -811,7 +811,7 @@ fn drain_restart_does_not_kill_an_idle_process_that_ignores_eof() {
     let eof_seen = env.dir.path().join("eof-seen").exists();
     std::fs::write(env.dir.path().join("release"), "").unwrap();
     if after["live"] == true {
-        env.wait_state(id, "orphaned");
+        env.wait_state(id, "done");
     }
     env.stop_daemon(daemon);
     assert!(eof_seen, "graceful EOF was never attempted");
@@ -860,6 +860,47 @@ fn drain_restart_closes_idle_processes_gracefully_and_keeps_resume_ids() {
     env.json(&["send", id, "next"]);
     env.wait_state(id, "idle");
     assert_eq!(env.json(&["status", id])["spawn_count"], 2);
+    env.stop_daemon(daemon);
+}
+
+#[test]
+fn force_drain_restart_reports_interrupted_sessions_in_json_and_human_output() {
+    let env = Env::with_config("resume", "[sessions]\nstop_grace_secs = 0\n");
+    lifecycle_agent(&env, "busy");
+    let daemon = env.start_daemon();
+    for json in [true, false] {
+        let run = env.json(&["run", "--driver", "claude", "--prompt", "go"]);
+        let id = run["session"]["id"].as_str().unwrap();
+        env.wait_state(id, "running");
+        let output = if json {
+            env.run(&["--json", "daemon", "restart", "--drain", "0", "--force"])
+        } else {
+            env.run(&["daemon", "restart", "--drain", "0", "--force"])
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["forced"], true);
+            assert_eq!(report["interrupted_sessions"], serde_json::json!([id]));
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("interrupted sessions:"), "{text}");
+            assert!(text.contains(id), "{text}");
+            assert!(!text.contains("no turns were interrupted"), "{text}");
+        }
+        let events = env.json(&["tail", id, "--since-seq", "0"]);
+        assert!(events.as_array().unwrap().iter().any(|event| {
+            event["type"] == "done"
+                && event["payload"]["interrupted"] == true
+                && event["payload"]["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("--force"))
+        }));
+    }
     env.stop_daemon(daemon);
 }
 

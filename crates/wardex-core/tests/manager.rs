@@ -39,18 +39,30 @@ impl Driver for FakeDriver {
             .resume
             .clone()
             .unwrap_or_else(|| format!("fake-{}", spec.session_id));
+        let dsid = (!spec.cwd.join("omit-resume-id").exists()).then_some(dsid);
+        let release_eof = spec.cwd.join("release-eof");
         tokio::spawn(async move {
             let send = |k: EventKind| {
                 let _ = ev_tx.send(DriverEvent::Event(k));
             };
             send(EventKind::Started {
-                driver_session_id: Some(dsid),
+                driver_session_id: dsid,
                 model: Some(format!("fake-model-{n}")),
                 reasoning: Some("fake-effort".into()),
             });
             let mut pending_tool = false;
             let mut ignore_eof = false;
-            while let Some(cmd) = cmd_rx.recv().await {
+            loop {
+                let cmd = tokio::select! {
+                    command = cmd_rx.recv() => match command { Some(command) => command, None => return },
+                    _ = async {
+                        if !ignore_eof { std::future::pending::<()>().await; }
+                        while !release_eof.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+                    } => {
+                        let _ = ev_tx.send(DriverEvent::Exited { code: Some(0), stderr_tail: Vec::new() });
+                        return;
+                    }
+                };
                 match cmd {
                     DriverCommand::Send(text) => {
                         received.lock().unwrap().push(text.clone());
@@ -567,13 +579,493 @@ async fn persistence_failure_reaches_history_clients() {
         .unwrap();
     pool.close().await;
     assert!(
-        send_result.is_err(),
-        "a failed event write was reported as a successful send"
+        send_result.is_ok(),
+        "an applied send must not be reported as unapplied"
     );
+    assert!(!h.manager.persistence().persisted);
     assert!(
         result.is_err(),
         "a failed event write was reported as successful history"
     );
+}
+
+#[tokio::test]
+async fn writer_fault_does_not_block_control_or_live_snapshots() {
+    let h = harness().await;
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let question = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    wait_state(&h.manager, &question, SessionState::WaitingInput).await;
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", h.manager.store().path().display()))
+            .await
+            .unwrap();
+    sqlx::query("CREATE TRIGGER reject_writes BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'injected outage'); END").execute(&pool).await.unwrap();
+    let _ = h.manager.send(&idle, "trigger outage".into()).await;
+    let list = h.manager.list(true).await;
+    let status = h.manager.status(&busy).await;
+    let interrupt = h.manager.interrupt(&busy).await;
+    let answer = h
+        .manager
+        .answer(&question, None, AnswerInput::Text("blue".into()))
+        .await;
+    let stop = h.manager.stop(&idle).await;
+    let shutdown = h.manager.shutdown(Duration::from_millis(50)).await;
+    sqlx::query("DROP TRIGGER reject_writes")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(list.is_ok(), "writer fault blocked list: {list:?}");
+    assert!(status.is_ok(), "writer fault blocked status: {status:?}");
+    assert!(
+        interrupt.is_ok(),
+        "writer fault blocked interrupt: {interrupt:?}"
+    );
+    assert!(answer.is_ok(), "writer fault blocked answer: {answer:?}");
+    assert!(stop.is_ok(), "writer fault blocked stop: {stop:?}");
+    assert!(
+        shutdown.is_ok(),
+        "writer fault prevented shutdown: {shutdown:?}"
+    );
+    assert!(h.manager.live_ids().is_empty());
+}
+
+#[tokio::test]
+async fn closed_database_keeps_cached_resolution_status_and_control_available() {
+    let h = harness().await;
+    let busy = h.manager.run(spec(&h, "hang")).await.unwrap().session.id;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    h.manager.store().close().await.unwrap();
+    assert_eq!(h.manager.resolve(&busy.as_str()[..4]).await.unwrap(), busy);
+    assert_eq!(h.manager.list(true).await.unwrap().len(), 2);
+    assert!(h.manager.status(&busy).await.unwrap().live);
+    assert!(!h.manager.persistence().persisted);
+    assert!(!h.manager.persistence().warnings.is_empty());
+    h.manager.interrupt(&busy).await.unwrap();
+    h.manager.stop(&idle).await.unwrap();
+    wait_state(&h.manager, &idle, SessionState::Stopped).await;
+    let shutdown = h.manager.shutdown(Duration::from_millis(50)).await.unwrap();
+    assert!(!shutdown.persisted);
+    assert!(!shutdown.warnings.is_empty());
+    assert!(h.manager.live_ids().is_empty());
+}
+
+#[tokio::test]
+async fn partial_drain_reports_closed_sessions_and_resets_remaining_flags() {
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    let h = harness_with(config).await;
+    let idle = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    let stubborn = h
+        .manager
+        .run(spec(&h, "idle-ignore-eof"))
+        .await
+        .unwrap()
+        .session
+        .id;
+    wait_state(&h.manager, &idle, SessionState::Idle).await;
+    wait_state(&h.manager, &stubborn, SessionState::Idle).await;
+    let error = h
+        .manager
+        .drain(Duration::ZERO, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    let ManagerError::DrainBlocked {
+        sessions,
+        closed_sessions,
+        ..
+    } = &error
+    else {
+        panic!("{error}")
+    };
+    assert_eq!(sessions, std::slice::from_ref(&stubborn));
+    assert_eq!(closed_sessions, std::slice::from_ref(&idle));
+    let text = error.to_string();
+    for step in ["answer <id>", "stop <id>", "restart --drain N", "--force"] {
+        assert!(text.contains(step), "{text}");
+    }
+    // A late, natural exit must become Done, proving that the failed drain
+    // no longer leaves drain_exit set and cannot orphan-mark this process.
+    std::fs::write(h.dir.path().join("release-eof"), "").unwrap();
+    wait_state(&h.manager, &stubborn, SessionState::Done).await;
+    h.manager
+        .resume(&stubborn, Some("again".into()))
+        .await
+        .unwrap();
+    wait_state(&h.manager, &stubborn, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn full_writer_queue_rejects_new_work_before_agent_commands() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.store().flush().await.unwrap();
+    let before = h.received.lock().unwrap().clone();
+    let mut accepted = 0;
+    for seq in 1..=10000 {
+        let result = h.manager.store().append_event(wardex_core::Event {
+            session_id: SessionId("backlog".into()),
+            seq,
+            ts_ms: 1,
+            agent: None,
+            task: None,
+            driver: DriverKind::Claude,
+            kind: EventKind::Prompt {
+                text: "queued".into(),
+            },
+        });
+        if result.is_err() {
+            break;
+        }
+        accepted += 1;
+    }
+    assert!(accepted <= 4096);
+    let send = h.manager.send(&id, "must not run".into()).await;
+    let run = h.manager.run(spec(&h, "must not spawn")).await;
+    assert!(matches!(
+        send,
+        Err(ManagerError::Store(
+            wardex_core::store::StoreError::QueueFull(_)
+        ))
+    ));
+    assert!(matches!(
+        run,
+        Err(ManagerError::Store(
+            wardex_core::store::StoreError::QueueFull(_)
+        ))
+    ));
+    assert_eq!(*h.received.lock().unwrap(), before);
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    // Management remains available even when the persistence budget is full.
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+    h.manager.store().flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn drain_without_resume_id_requires_explicit_stop() {
+    let h = harness().await;
+    std::fs::write(h.dir.path().join("omit-resume-id"), "").unwrap();
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    let error = h
+        .manager
+        .drain(Duration::ZERO, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("never reports a resume id"));
+    assert!(error.to_string().contains("wardex stop <id>"));
+    assert!(h.manager.status(&id).await.unwrap().live);
+    h.manager.stop(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Stopped).await;
+}
+
+struct ScopedFakeDriver {
+    inner: FakeDriver,
+    unit: Option<String>,
+    must_be_reaped: Option<std::path::PathBuf>,
+}
+
+impl Driver for ScopedFakeDriver {
+    fn kind(&self) -> DriverKind {
+        self.inner.kind()
+    }
+    fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError> {
+        if let Some(pid_path) = &self.must_be_reaped {
+            let pid = std::fs::read_to_string(pid_path).unwrap();
+            assert!(
+                !process_alive(pid.trim()),
+                "new generation started beside old descendants"
+            );
+        }
+        let mut handle = self.inner.spawn(spec, launcher)?;
+        handle.unit = self.unit.clone();
+        Ok(handle)
+    }
+}
+
+fn process_alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        !status
+            .lines()
+            .any(|line| line.starts_with("State:") && line.contains('Z'))
+    })
+}
+
+async fn mock_descendant(dir: &std::path::Path) -> (tokio::process::Child, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut child = tokio::process::Command::new("sh")
+        .args([
+            "-c",
+            "trap '' TERM; echo $$ > descendant.pid; touch ready; exec sleep 60",
+        ])
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !dir.join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let controller = dir.join("scope-controller.sh");
+    // This controller only signals the test-owned PID, never a host service.
+    std::fs::write(
+        &controller,
+        format!(
+            r#"#!/bin/sh
+cd '{}' || exit 1
+pid=$(cat descendant.pid)
+if [ "$2" = kill ]; then
+  printf '%s\n' "$3" >> signals
+  if [ "$3" = --signal=SIGTERM ]; then kill -TERM "$pid" 2>/dev/null || :; fi
+  if [ "$3" = --signal=SIGKILL ]; then kill -KILL "$pid" 2>/dev/null || :; fi
+else
+  state=$(awk '/^State:/ {{ print $2 }}' "/proc/$pid/status" 2>/dev/null)
+  if [ -z "$state" ] || [ "$state" = Z ]; then
+    printf 'LoadState=loaded\nActiveState=inactive\n'
+  else printf 'LoadState=loaded\nActiveState=active\n'; fi
+fi
+"#,
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    (child, controller)
+}
+
+#[tokio::test]
+async fn drain_reaps_descendants_with_term_then_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, controller) = mock_descendant(dir.path()).await;
+    let store = Store::open(&dir.path().join("w.db")).await.unwrap();
+    let spawns = Arc::new(AtomicU32::new(0));
+    let driver = ScopedFakeDriver {
+        inner: FakeDriver {
+            spawns,
+            received: Arc::default(),
+        },
+        unit: Some("mock.scope".into()),
+        must_be_reaped: None,
+    };
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    let manager = Manager::new(
+        config,
+        store,
+        vec![Arc::new(driver)],
+        Launcher::with_scope_command(controller),
+    );
+    let id = manager
+        .run(RunSpec {
+            driver: Some(DriverKind::Claude),
+            prompt: "hello".into(),
+            cwd: dir.path().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    wait_state(&manager, &id, SessionState::Idle).await;
+    let result = manager.drain(Duration::ZERO, Duration::from_secs(3)).await;
+    let alive = child.try_wait().unwrap().is_none();
+    if alive {
+        child.kill().await.unwrap();
+    }
+    child.wait().await.unwrap();
+    let report = result.unwrap();
+    assert_eq!(report.closed_sessions, vec![id.clone()]);
+    assert!(
+        !alive,
+        "drain returned while descendants were still running"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("signals")).unwrap(),
+        "--signal=SIGTERM\n--signal=SIGKILL\n"
+    );
+    assert!(manager.status(&id).await.unwrap().session.unit.is_none());
+}
+
+async fn resume_reaps_pending_scope(recover_first: bool) {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+    let (mut child, controller) = mock_descendant(h.dir.path()).await;
+    let mut record = h.manager.store().get_session(&id).await.unwrap().unwrap();
+    record.unit = Some("old-mock.scope".into());
+    record.resume_pending = true;
+    h.manager.store().update_session(&record).await.unwrap();
+    h.manager.store().close().await.unwrap();
+    let driver = ScopedFakeDriver {
+        inner: FakeDriver {
+            spawns: h.spawns.clone(),
+            received: h.received.clone(),
+        },
+        unit: None,
+        must_be_reaped: Some(h.dir.path().join("descendant.pid")),
+    };
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    config.sessions.auto_resume_orphaned = true;
+    let manager = Manager::new(
+        config,
+        Store::open(h.manager.store().path()).await.unwrap(),
+        vec![Arc::new(driver)],
+        Launcher::with_scope_command(controller),
+    );
+    let result = if recover_first {
+        assert!(manager.recover().await.unwrap().is_empty());
+        manager.auto_resume().await
+    } else {
+        manager.resume(&id, None).await.map(|_| vec![id.clone()])
+    };
+    if child.try_wait().unwrap().is_none() {
+        child.kill().await.unwrap();
+    }
+    child.wait().await.unwrap();
+    assert_eq!(result.unwrap(), vec![id.clone()]);
+    wait_state(&manager, &id, SessionState::Idle).await;
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
+    manager.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_resume_reaps_old_scope_before_new_spawn() {
+    resume_reaps_pending_scope(true).await;
+}
+
+#[tokio::test]
+async fn manual_resume_reaps_pending_scope_before_new_spawn() {
+    resume_reaps_pending_scope(false).await;
+}
+
+#[tokio::test]
+async fn unverifiable_old_scope_prevents_a_new_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "hello")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.shutdown(Duration::from_secs(1)).await.unwrap();
+    let mut record = h.manager.store().get_session(&id).await.unwrap().unwrap();
+    record.unit = Some("unverifiable.scope".into());
+    record.resume_pending = true;
+    h.manager.store().update_session(&record).await.unwrap();
+    h.manager.store().close().await.unwrap();
+    let controller = h.dir.path().join("unavailable-controller.sh");
+    std::fs::write(&controller, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manager = Manager::new(
+        Config::default(),
+        Store::open(h.manager.store().path()).await.unwrap(),
+        vec![Arc::new(FakeDriver {
+            spawns: h.spawns.clone(),
+            received: h.received.clone(),
+        })],
+        Launcher::with_scope_command(controller),
+    );
+    let error = manager.resume(&id, None).await.unwrap_err();
+    assert!(error.to_string().contains("stop the old scope"));
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    assert!(manager.live_ids().is_empty());
+}
+
+struct ScopedProcessDriver;
+
+impl Driver for ScopedProcessDriver {
+    fn kind(&self) -> DriverKind {
+        DriverKind::Claude
+    }
+    fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError> {
+        let mut spawned = launcher.spawn(&wardex_core::process::LaunchRequest {
+            unit: &spec.unit, slice: None, program: "sh", cwd: &spec.cwd,
+            args: &["-c".into(), "sh -c 'trap \"\" TERM; exec sleep 60' </dev/null >/dev/null 2>&1 & echo $! > descendant.pid; exec cat".into()],
+        }).map_err(|source| DriverError::Spawn { program: "sh".into(), source })?;
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let mut stdin = spawned.child.stdin.take();
+        tokio::spawn(async move {
+            let _ = events.send(DriverEvent::Event(EventKind::Started {
+                driver_session_id: Some("mock-session".into()),
+                model: None,
+                reasoning: None,
+            }));
+            loop {
+                tokio::select! {
+                    status = spawned.child.wait() => {
+                        let _ = events.send(DriverEvent::Exited { code: status.ok().and_then(|s| s.code()), stderr_tail: Vec::new() });
+                        return;
+                    }
+                    command = rx.recv() => match command {
+                        Some(DriverCommand::Send(_)) => { let _ = events.send(DriverEvent::Event(done(None, false))); }
+                        Some(DriverCommand::Shutdown | DriverCommand::Drain) | None => { stdin.take(); }
+                        Some(DriverCommand::Kill) => { let _ = spawned.child.start_kill(); }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        Ok(DriverHandle {
+            pid: spawned.pid,
+            unit: spawned.unit,
+            commands,
+            events: event_rx,
+        })
+    }
+}
+
+/// Run explicitly only in an isolated environment with user systemd available.
+#[tokio::test]
+#[ignore = "requires user systemd; default suite uses a mock scope controller"]
+async fn drain_reaps_a_real_systemd_scope_before_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = Launcher::new(true);
+    assert!(launcher.uses_scope());
+    let mut config = Config::default();
+    config.sessions.stop_grace_secs = 0;
+    let manager = Manager::new(
+        config,
+        Store::open(&dir.path().join("w.db")).await.unwrap(),
+        vec![Arc::new(ScopedProcessDriver)],
+        launcher,
+    );
+    let id = manager
+        .run(RunSpec {
+            driver: Some(DriverKind::Claude),
+            prompt: "go".into(),
+            cwd: dir.path().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    wait_state(&manager, &id, SessionState::Idle).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.path().join("descendant.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = std::fs::read_to_string(dir.path().join("descendant.pid")).unwrap();
+    let unit = manager.status(&id).await.unwrap().session.unit.unwrap();
+    let result = manager.drain(Duration::ZERO, Duration::from_secs(5)).await;
+    let descendant_survived = process_alive(pid.trim());
+    // Test-owned scope cleanup also runs if the regression assertion will fail.
+    Launcher::kill_unit(&unit).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(!descendant_survived, "drain leaked a real scope descendant");
 }
 
 #[tokio::test]

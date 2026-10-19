@@ -14,8 +14,12 @@ CLI version changes.
 
 The lifecycle fixes are tested with these recorded versions and temporary
 shell processes; no live Claude/Codex CLI is called. The shared runner handles
-`Drain` by closing stdin without a force-kill deadline, including when stdout
-has already closed. Explicit `Shutdown`/`Kill` retain their existing fallback.
+`Drain` by closing stdin without a force-kill deadline for the leader, including
+when stdout has already closed. After leader exit the manager reaps remaining
+scope descendants with SIGTERM, escalating to SIGKILL and verifying exit before
+drain/resume completes. Default tests use test-owned processes and an injected
+scope controller; the real user-systemd drain test is explicitly ignored.
+Explicit `Shutdown`/`Kill` retain their existing fallback.
 Pending question/approval request ids belong to the live process, so drain
 waits for answers and refuses restart on timeout instead of trying to replay
 those ids into a resumed driver.
