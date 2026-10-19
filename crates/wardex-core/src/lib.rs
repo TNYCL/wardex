@@ -4,6 +4,7 @@
 pub mod config;
 pub mod driver;
 pub mod event;
+pub mod external;
 pub mod git;
 pub mod glob;
 pub mod manager;

@@ -460,7 +460,7 @@ pub fn input_summary(tool: &str, input: &Value) -> String {
     summarize(&text, INPUT_SUMMARY)
 }
 
-fn content_text(content: &Value) -> String {
+pub(crate) fn content_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
