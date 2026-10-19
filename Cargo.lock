@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "wardex"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "wardex-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "wardex-drivers"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ruzstd",
  "serde_json",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "wardex-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "axum",
  "fs2",
