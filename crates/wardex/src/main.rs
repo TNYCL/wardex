@@ -137,6 +137,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 (None, Some(path)) => read_prompt_file(path)?,
                 (None, None) => bail!("--prompt or --prompt-file is required"),
             };
+            if let Some(source) = args.fork_from {
+                let resp = client
+                    .request(&Request::Adopt {
+                        id: source,
+                        driver: args.driver.map(driver_kind),
+                        agent: args.agent,
+                        task: args.task,
+                        model: args.model,
+                        reasoning: args.reasoning,
+                        readonly: args.readonly,
+                        message: Some(prompt),
+                        force: false,
+                        fork: true,
+                        via_mcp: false,
+                    })
+                    .await?;
+                return finish(json, resp, adopt_message);
+            }
+            let driver = args.driver.ok_or_else(|| anyhow!("--driver is required"))?;
             let cwd = match &args.cwd {
                 Some(c) => c.clone(),
                 None => std::env::current_dir()?,
@@ -144,7 +163,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let cwd = std::fs::canonicalize(&cwd)
                 .with_context(|| format!("cannot use cwd {}", cwd.display()))?;
             let spec = RunSpec {
-                driver: Some(driver_kind(args.driver)),
+                driver: Some(driver_kind(driver)),
                 prompt,
                 model: args.model,
                 reasoning: args.reasoning,
@@ -464,28 +483,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     readonly: a.readonly,
                     message,
                     force: a.force,
+                    fork: a.fork,
                     via_mcp: false,
                 })
                 .await?;
-            finish(json, resp, |v| {
-                match serde_json::from_value::<AdoptOutcome>(v.clone()) {
-                    // Only the id goes to stdout, like `run`.
-                    Ok(out) => {
-                        for w in &out.warnings {
-                            eprintln!("warning: {w}");
-                        }
-                        let what = match (out.adopted, out.resumed) {
-                            (true, true) => "adopted and resumed",
-                            (true, false) => "adopted",
-                            (false, true) => "already managed; message sent",
-                            (false, false) => "already managed",
-                        };
-                        eprintln!("{} {what}", out.source.qualified_id());
-                        format!("{}\n", out.session.id)
-                    }
-                    Err(_) => output::json(v),
-                }
-            })
+            finish(json, resp, adopt_message)
         }
         Command::Overview { events } => {
             let resp = client
@@ -500,6 +502,29 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             })
         }
+    }
+}
+
+/// `adopt` / `run --fork-from`: only the id goes to stdout, like `run`.
+fn adopt_message(v: &Value) -> String {
+    match serde_json::from_value::<AdoptOutcome>(v.clone()) {
+        Ok(out) => {
+            for w in &out.warnings {
+                eprintln!("warning: {w}");
+            }
+            let forked = out.session.origin == SessionOrigin::Forked;
+            let what = match (out.adopted, out.resumed) {
+                (true, true) if forked => "forked and started",
+                (true, false) if forked => "fork created; the next send starts it",
+                (true, true) => "adopted and resumed",
+                (true, false) => "adopted",
+                (false, true) => "already managed; message sent",
+                (false, false) => "already managed",
+            };
+            eprintln!("{} {what}", out.source.qualified_id());
+            format!("{}\n", out.session.id)
+        }
+        Err(_) => output::json(v),
     }
 }
 

@@ -202,8 +202,9 @@ pub struct ListFilter {
     /// Only ended sessions (implies `all`).
     #[serde(default)]
     pub ended: bool,
-    /// Only ended sessions `send` can continue: a resume id is known, no
-    /// scope cleanup is pending and the working directory still exists.
+    /// Only ended sessions `send` can continue: a resume id is known (or a
+    /// fork source), no scope cleanup is pending and the working directory
+    /// still exists.
     #[serde(default)]
     pub resumable: bool,
     /// Only sessions of this origin.
@@ -226,7 +227,9 @@ impl ListFilter {
             Some(p) => value.as_deref().is_some_and(|v| crate::glob::glob(p, v)),
         };
         state_ok
-            && (!self.resumable || (record.driver_session_id.is_some() && !record.cleanup_failed))
+            && (!self.resumable
+                || ((record.driver_session_id.is_some() || record.forked_from.is_some())
+                    && !record.cleanup_failed))
             && label_ok(&self.agent, &record.agent)
             && label_ok(&self.task, &record.task)
             && self.origin.is_none_or(|o| o == record.origin)
@@ -331,6 +334,10 @@ pub struct AdoptSpec {
     /// Adopt a `recent` or `unknown` session anyway (CLI only).
     #[serde(default)]
     pub force: bool,
+    /// Branch a new native session off the external one instead; the
+    /// source is only read. Allowed while it is live.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 #[cfg(test)]

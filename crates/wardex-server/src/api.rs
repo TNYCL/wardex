@@ -188,6 +188,9 @@ pub enum Request {
         /// Adopt a `recent`/`unknown` session anyway. Refused over MCP.
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
+        /// Branch a new native session off it instead (`origin: forked`).
+        #[serde(default, skip_serializing_if = "is_false")]
+        fork: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         via_mcp: bool,
     },
@@ -554,9 +557,11 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             readonly,
             message,
             force,
+            fork,
             via_mcp,
         } => {
             let spec = AdoptSpec {
+                fork,
                 id,
                 driver,
                 agent,

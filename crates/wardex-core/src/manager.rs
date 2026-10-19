@@ -944,7 +944,7 @@ impl Manager {
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
-        if let Err(e) = self.spawn_process(&mut record, None) {
+        if let Err(e) = self.spawn_process(&mut record, None, false) {
             record.state = SessionState::Error;
             record.ended_ms = Some(now_ms());
             record.ended_reason = Some(EndReason::Error);
@@ -966,7 +966,12 @@ impl Manager {
     }
 
     /// Spawn a process for `record` and register it as live.
-    fn spawn_process(&self, record: &mut SessionRecord, resume: Option<String>) -> Result<()> {
+    fn spawn_process(
+        &self,
+        record: &mut SessionRecord,
+        resume: Option<String>,
+        fork: bool,
+    ) -> Result<()> {
         // Serialize process registration with the daemon shutdown gate.
         let _starting = self
             .inner
@@ -991,6 +996,7 @@ impl Manager {
             reasoning: record.reasoning.clone(),
             readonly: record.readonly,
             resume,
+            fork,
             slice: record.slice.clone(),
             unit: format!("wardex-{}-{}", record.id, record.spawn_count),
         };
@@ -1623,9 +1629,14 @@ impl Manager {
             Err(ManagerError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let native = record.driver_session_id.clone().ok_or_else(|| {
-            ManagerError::Conflict(format!("session {id} has no native session id yet"))
-        })?;
+        // A fork that has not run yet shows its source.
+        let native = record
+            .driver_session_id
+            .clone()
+            .or_else(|| record.forked_from.clone())
+            .ok_or_else(|| {
+                ManagerError::Conflict(format!("session {id} has no native session id yet"))
+            })?;
         Ok(Some((record.driver, native)))
     }
 
@@ -2157,12 +2168,20 @@ impl Manager {
                 record.cwd.display()
             )));
         }
-        let resume_id = record.driver_session_id.clone().ok_or_else(|| {
-            ManagerError::Conflict(format!(
-                "session {id} cannot be resumed: the agent never reported a session id"
-            ))
-        })?;
-        if record.origin != SessionOrigin::Wardex {
+        // A fork that has not run yet branches off its source; the source is
+        // only read, so it may be open elsewhere.
+        let (resume_id, fork) = match (&record.driver_session_id, &record.forked_from) {
+            (Some(native), _) => (native.clone(), false),
+            (None, Some(source)) if record.origin == SessionOrigin::Forked => {
+                (source.clone(), true)
+            }
+            _ => {
+                return Err(ManagerError::Conflict(format!(
+                    "session {id} cannot be resumed: the agent never reported a session id"
+                )));
+            }
+        };
+        if record.origin != SessionOrigin::Wardex && !fork {
             self.check_not_open_elsewhere(&record, &resume_id).await?;
         }
         record.last_seq = record.last_seq.max(self.inner.store.max_seq(id).await?);
@@ -2174,7 +2193,7 @@ impl Manager {
         } else {
             None
         };
-        self.spawn_process(&mut record, Some(resume_id))?;
+        self.spawn_process(&mut record, Some(resume_id), fork)?;
         if let Some(text) = message {
             self.deliver(id, text, true, publication)?;
         }
@@ -2212,7 +2231,9 @@ impl Manager {
     /// `ended_reason: adopted`), so `send`/`resume` continue it under the
     /// same native id. Refused while the session is `live`; `recent` and
     /// `unknown` need `force` (never over MCP). A session this daemon
-    /// already manages returns its Wardex session.
+    /// already manages returns its Wardex session. With `fork`, the new
+    /// session branches off instead (`origin: forked`) when it first runs;
+    /// the source is only read, so it may be live.
     pub async fn adopt(&self, spec: AdoptSpec, via_mcp: bool) -> Result<AdoptOutcome> {
         self.external_allowed(via_mcp)?;
         if via_mcp && spec.force {
@@ -2235,7 +2256,9 @@ impl Manager {
             )));
         }
         let qualified = source.qualified_id();
+        let fork = spec.fork;
         let existing = match &source.managed_by {
+            _ if fork => None,
             Some(id) => Some(id.clone()),
             None => {
                 self.inner
@@ -2258,6 +2281,7 @@ impl Manager {
             });
         }
         match &source.liveness {
+            _ if fork => {}
             Liveness::Live { pid, .. } => {
                 return Err(ManagerError::Conflict(format!(
                     "{qualified} is open in process {pid}; continue it there, or fork it \
@@ -2282,6 +2306,11 @@ impl Manager {
         }
 
         let mut warnings = source.warnings.clone();
+        if fork && source.liveness.is_live() {
+            warnings.push(format!(
+                "{qualified} is open elsewhere; the fork starts from what it has written so far"
+            ));
+        }
         if !spec.readonly {
             warnings.push(
                 "the session continues with Wardex's full permissions (bypassPermissions / \
@@ -2326,7 +2355,8 @@ impl Manager {
         let mut record = SessionRecord {
             id: id.clone(),
             driver,
-            driver_session_id: Some(source.native_id.clone()),
+            // A fork gets its own id when it first runs.
+            driver_session_id: (!fork).then(|| source.native_id.clone()),
             state: SessionState::Stopped,
             agent: spec.agent,
             task: spec.task,
@@ -2352,8 +2382,12 @@ impl Manager {
             resume_with_prompt: false,
             cleanup_failed: false,
             ended_reason: Some(EndReason::Adopted),
-            origin: SessionOrigin::Adopted,
-            forked_from: None,
+            origin: if fork {
+                SessionOrigin::Forked
+            } else {
+                SessionOrigin::Adopted
+            },
+            forked_from: fork.then(|| source.native_id.clone()),
             adopted_ms: Some(now),
         };
         let publication = self.inner.store.reserve_publication()?;
@@ -2362,7 +2396,7 @@ impl Manager {
             &mut record,
             EventKind::Adopted {
                 source_driver_session_id: source.native_id.clone(),
-                forked: false,
+                forked: fork,
                 cli_version: source.cli_version.clone(),
                 liveness: source.liveness.as_str().into(),
                 path_hint: source.path_hint.clone(),
@@ -2370,7 +2404,7 @@ impl Manager {
         );
         self.publish_reserved(&event, &record, publication);
         drop(reservation);
-        tracing::info!(session = %id, driver = driver.as_str(), "external session adopted");
+        tracing::info!(session = %id, driver = driver.as_str(), fork, "external session adopted");
         let mut resumed = false;
         if let Some(message) = spec.message {
             if let Err(e) = self.resume(&id, Some(message)).await {

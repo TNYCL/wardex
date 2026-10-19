@@ -377,8 +377,9 @@ continued. Details: [`external-sessions.md`](external-sessions.md).
   `ended_reason: adopted`, `origin: adopted`) bound to the native id, so `send`
   and `resume` continue it. Refused while the session is `live`; `recent` or
   `unknown` need `--force` (CLI only). Re-checked on every resume.
-- `--fork` / `run --fork-from <id>`: a new native session branched from the
-  external one (`origin: forked`); allowed while the source is live.
+- `adopt --fork` / `run --fork-from <id>` / MCP `adopt` with `fork`: a new
+  native session branched from the external one (`origin: forked`; Claude
+  `--fork-session`, Codex `thread/fork`); allowed while the source is live.
 - Off by default: `[external] enabled` gates the feature and `mcp` its MCP
   exposure separately.
 

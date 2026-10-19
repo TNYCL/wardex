@@ -33,6 +33,7 @@ fn spec(readonly: bool, resume: Option<&str>) -> SpawnSpec {
         reasoning: Some("low".into()),
         readonly,
         resume: resume.map(String::from),
+        fork: false,
         slice: None,
         unit: "wardex-abcd1234-1".into(),
     }
@@ -272,6 +273,37 @@ fn resume_uses_thread_resume() {
         "01a15013-9936-7f63-9424-379ccce357ea"
     );
     assert_eq!(writes[2]["params"]["excludeTurns"], true);
+    match events.last().unwrap() {
+        EventKind::Done { result, .. } => assert_eq!(result.as_deref(), Some("file")),
+        e => panic!("{e:?}"),
+    }
+}
+
+/// `fork.jsonl` is derived from the recorded `resume.jsonl` and the 0.163.0
+/// schema (see `tools/fixtures/derive_codex_fork.py`).
+#[test]
+fn fork_uses_thread_fork_and_reports_the_new_thread() {
+    let source = "01a15013-9936-7f63-9424-379ccce357ea";
+    let fork = "01a15013-9936-7f63-9424-3fa4cce357eb";
+    let mut s = spec(true, Some(source));
+    s.fork = true;
+    let mut p = CodexProtocol::new(&s);
+    let (events, writes) = drive(&mut p, &load("codex", "fork"));
+    assert_eq!(writes[2]["method"], "thread/fork");
+    let params = &writes[2]["params"];
+    assert_eq!(params["threadId"], source);
+    assert_eq!(params["excludeTurns"], true);
+    assert_eq!(params["cwd"], "/work");
+    assert_eq!(params["approvalPolicy"], "never");
+    assert_eq!(params["sandbox"], "read-only");
+    match &events[0] {
+        EventKind::Started {
+            driver_session_id, ..
+        } => assert_eq!(driver_session_id.as_deref(), Some(fork)),
+        e => panic!("{e:?}"),
+    }
+    let turn = writes.iter().find(|w| w["method"] == "turn/start").unwrap();
+    assert_eq!(turn["params"]["threadId"], fork, "turns go to the fork");
     match events.last().unwrap() {
         EventKind::Done { result, .. } => assert_eq!(result.as_deref(), Some("file")),
         e => panic!("{e:?}"),

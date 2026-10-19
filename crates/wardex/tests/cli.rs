@@ -568,6 +568,32 @@ fn external_sessions_from_the_cli() {
     // The transcript is still read through the Wardex id.
     let page = env.json(&["history", &id]);
     assert_eq!(page["items"][0]["text"], "What is in this directory?");
+
+    // Forks are new sessions every time; the fork runs on the next send.
+    let out = env.run(&["adopt", "--fork", "claude:33333333"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("fork created"));
+    let fork = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_ne!(fork, id);
+    let status = env.json(&["status", &fork]);
+    assert_eq!(status["origin"], "forked");
+    assert_eq!(
+        status["forked_from"],
+        "33333333-3333-4333-8333-333333333333"
+    );
+    // The fixture's cwd does not exist here, so starting the fork fails
+    // after the record is created, and says so.
+    let out = env.run(&["run", "--fork-from", "claude:33333333", "--prompt", "go"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("adopted as session") && err.contains("no longer exists"),
+        "{err}"
+    );
     env.stop_daemon(daemon);
 }
 

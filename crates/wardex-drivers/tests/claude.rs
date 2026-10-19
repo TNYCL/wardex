@@ -199,6 +199,7 @@ fn args_for_new_resume_and_readonly() {
         reasoning: Some("low".into()),
         readonly: false,
         resume: None,
+        fork: false,
         slice: None,
         unit: "wardex-abcd1234-1".into(),
     };
@@ -215,7 +216,17 @@ fn args_for_new_resume_and_readonly() {
     let joined = d.args(&spec, &new_id).join(" ");
     assert!(joined.contains("--resume prev"));
     assert!(!joined.contains("--session-id"));
+    assert!(!joined.contains("--fork-session"));
     assert!(joined.contains("--permission-mode plan"));
+    // A fork resumes the source under a new id chosen up front.
+    spec.fork = true;
+    let joined = d.args(&spec, &new_id).join(" ");
+    assert!(
+        joined.contains(&format!(
+            "--resume prev --fork-session --session-id {new_id}"
+        )),
+        "{joined}"
+    );
 }
 
 async fn manager_for(script: &std::path::Path, db: &std::path::Path) -> Manager {
@@ -326,6 +337,85 @@ async fn the_chosen_session_id_is_recorded_before_the_first_event() {
     wait_state(&m, &id, SessionState::Stopped).await;
     let stored = m.store().get_session(&id).await.unwrap().unwrap();
     assert_eq!(stored.driver_session_id.as_deref(), Some(sid));
+}
+
+#[tokio::test]
+async fn a_fork_resumes_its_source_under_a_new_id() {
+    use wardex_core::{EndReason, SessionOrigin, SessionRecord};
+    let dir = tempfile::tempdir().unwrap();
+    let args_file = dir.path().join("args");
+    let script = dir.path().join("silent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile IFS= read -r _; do :; done\n",
+            args_file.display()
+        ),
+    )
+    .unwrap();
+    let m = manager_for(&script, &dir.path().join("w.db")).await;
+    let source = "11111111-1111-4111-8111-111111111111";
+    let now = wardex_core::time::now_ms();
+    let record = SessionRecord {
+        id: SessionId("f0f0f0f0".into()),
+        driver: DriverKind::Claude,
+        driver_session_id: None,
+        state: SessionState::Stopped,
+        agent: None,
+        task: None,
+        model: None,
+        reasoning: None,
+        cwd: dir.path().to_path_buf(),
+        origin_cwd: None,
+        worktree: None,
+        branch: None,
+        remove_worktree: false,
+        readonly: false,
+        slice: None,
+        unit: None,
+        pid: None,
+        created_ms: now,
+        updated_ms: now,
+        ended_ms: Some(now),
+        last_seq: 0,
+        last_result: None,
+        last_error: None,
+        spawn_count: 0,
+        resume_pending: false,
+        resume_with_prompt: false,
+        cleanup_failed: false,
+        ended_reason: Some(EndReason::Adopted),
+        origin: SessionOrigin::Forked,
+        forked_from: Some(source.into()),
+        adopted_ms: Some(now),
+    };
+    m.store().insert_session(&record).await.unwrap();
+    m.resume(&record.id, Some("go on".into())).await.unwrap();
+    let mut args = String::new();
+    for _ in 0..200 {
+        args = std::fs::read_to_string(&args_file).unwrap_or_default();
+        if args.contains("--session-id") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let args: Vec<&str> = args.lines().collect();
+    let at = args.iter().position(|a| *a == "--resume").unwrap();
+    assert_eq!(
+        &args[at..at + 4],
+        ["--resume", source, "--fork-session", "--session-id"]
+    );
+    let fork = args[at + 4];
+    assert!(uuid::Uuid::parse_str(fork).is_ok());
+    let status = m.status(&record.id).await.unwrap();
+    assert_eq!(status.session.driver_session_id.as_deref(), Some(fork));
+    assert_eq!(status.session.forked_from.as_deref(), Some(source));
+    m.stop(&record.id).await.unwrap();
+    wait_state(&m, &record.id, SessionState::Stopped).await;
+    // Later resumes continue the fork, not the source.
+    let stored = m.store().get_session(&record.id).await.unwrap().unwrap();
+    assert_eq!(stored.driver_session_id.as_deref(), Some(fork));
+    assert_eq!(stored.origin, SessionOrigin::Forked);
 }
 
 #[tokio::test]

@@ -44,6 +44,8 @@ wardex overview [-n EVENTS]        # live sessions, questions, resources at a gl
 wardex mcp --stdio                 # MCP server on stdin/stdout (e.g. over ssh)
 wardex external list [--cwd DIR [--under] | --here]   # sessions started outside Wardex
 wardex history <id> [--turns N] [--format text|markdown|json]  # native conversation
+wardex adopt <id> [--fork] [--readonly] [--message TEXT] [--force]  # continue it in Wardex
+wardex run --fork-from <id> --prompt "..."                     # fork it and continue
 ```
 
 Session ids can be shortened to any unique prefix. Every command accepts
@@ -56,7 +58,7 @@ many are idle or memory runs low, see `[sessions]` in
 
 The same capabilities are MCP tools: `run`, `overview`, `list`, `status`,
 `tail`, `summary`, `pending_questions`, `answer`, `send`, `interrupt`, `stop`,
-`resume`, `tool_output` (plus `external_list` and `history` when
+`resume`, `tool_output` (plus `external_list`, `history` and `adopt` when
 `[external]` enables them, see [`docs/external-sessions.md`](docs/external-sessions.md)).
 Two transports: `wardex mcp --stdio` (forwards to the daemon's
 socket; remote clients use `ssh <host> wardex mcp --stdio`), and, with a token

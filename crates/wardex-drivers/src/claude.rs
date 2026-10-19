@@ -43,7 +43,7 @@ impl ClaudeDriver {
         }
     }
 
-    /// Arguments for `spec`. A new session gets `new_id` as its
+    /// Arguments for `spec`. A new session or a fork gets `new_id` as its
     /// `--session-id`.
     pub fn args(&self, spec: &SpawnSpec, new_id: &str) -> Vec<String> {
         let mut a: Vec<String> = self.prefix_args.clone();
@@ -71,6 +71,15 @@ impl ClaudeDriver {
             .into(),
         );
         match &spec.resume {
+            Some(id) if spec.fork => {
+                // Claude accepts --session-id with --resume only together
+                // with --fork-session, so the fork's id is known up front.
+                a.push("--resume".into());
+                a.push(id.clone());
+                a.push("--fork-session".into());
+                a.push("--session-id".into());
+                a.push(new_id.to_string());
+            }
             Some(id) => {
                 a.push("--resume".into());
                 a.push(id.clone());
@@ -109,7 +118,7 @@ impl Driver for ClaudeDriver {
             cwd: &spec.cwd,
         };
         let mut handle = spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))?;
-        if spec.resume.is_none() {
+        if spec.resume.is_none() || spec.fork {
             handle.driver_session_id = Some(new_id);
         }
         Ok(handle)

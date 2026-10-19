@@ -107,7 +107,7 @@ Session ids can be shortened to any unique prefix.
 | `resume` | `id`; optional `message` | session record |
 | `external_list` | optional `driver`, `cwd` (absolute), `under`, `since_secs`, `limit` (default 50), `include_managed` | `{sessions}`: sessions started outside Wardex, newest first, with `liveness` |
 | `history` | `id` (Wardex id or external id); optional `driver`, `turns` (default 20), `before`, `tools` (`none`/`summary`/`full`), `max_bytes` (default 65536) | `{session, items, next_before, truncated, warnings}` |
-| `adopt` | `id` (external id); optional `driver`, `agent`, `task`, `model`, `reasoning`, `readonly`, `message` | `{session, adopted, resumed, source, warnings}` |
+| `adopt` | `id` (external id); optional `driver`, `agent`, `task`, `model`, `reasoning`, `readonly`, `message`, `fork` | `{session, adopted, resumed, source, warnings}` |
 
 `external_list`, `history` and `adopt` are listed only when the daemon has both
 `external.enabled` and `external.mcp` set (both off by default); see
@@ -195,6 +195,9 @@ acceptable. Details: [`external-sessions.md`](external-sessions.md).
   any other session. Refused while the session is `live` or `recent`/`unknown`
   (there is no `force` over MCP). Unless `readonly` is set, the session
   continues with full permissions, whatever mode it was started in.
+- `adopt {"id": "…", "fork": true, "message": "…"}`: a new session
+  (`origin: forked`) that branches off the external one; the original is only
+  read, so this also works while it is open elsewhere.
 
 ### Paging and waiting
 

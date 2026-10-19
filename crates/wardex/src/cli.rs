@@ -178,8 +178,12 @@ pub struct AdoptArgs {
     pub prompt_file: Option<PathBuf>,
     /// Adopt even if the session was written recently or its liveness is
     /// unknown (never when it is live).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fork")]
     pub force: bool,
+    /// Branch a new session off it instead; the original is only read, so
+    /// this works while it is open elsewhere.
+    #[arg(long)]
+    pub fork: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -319,8 +323,16 @@ pub enum DaemonAction {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    #[arg(long, value_enum)]
-    pub driver: Driver,
+    #[arg(long, value_enum, required_unless_present = "fork_from")]
+    pub driver: Option<Driver>,
+    /// Fork this external session (`wardex external list`) and continue
+    /// the fork with the prompt; same as `adopt --fork --message`.
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["cwd", "worktree", "slice"]
+    )]
+    pub fork_from: Option<String>,
     #[arg(long)]
     pub model: Option<String>,
     /// Reasoning effort (passed through to the driver).
@@ -382,6 +394,41 @@ mod tests {
         assert!(
             Cli::try_parse_from(["wardex", "run", "--driver", "codex", "--prompt", "hi"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["wardex", "run", "--prompt", "hi"]).is_err());
+    }
+
+    #[test]
+    fn run_fork_from() {
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "run",
+            "--fork-from",
+            "claude:abcd1234",
+            "--prompt",
+            "go",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(r) => {
+                assert_eq!(r.fork_from.as_deref(), Some("claude:abcd1234"));
+                assert!(r.driver.is_none());
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "wardex",
+                "run",
+                "--fork-from",
+                "x",
+                "--prompt",
+                "go",
+                "--worktree",
+                "w"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["wardex", "adopt", "x", "--fork", "--force"]).is_err());
     }
 
     #[test]

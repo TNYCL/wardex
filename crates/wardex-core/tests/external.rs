@@ -102,7 +102,10 @@ impl Driver for FakeDriver {
         self.spawns.lock().unwrap().push(spec.clone());
         let (commands, mut rx) = mpsc::unbounded_channel();
         let (tx, events) = mpsc::unbounded_channel();
-        let id = spec.resume.clone();
+        let id = match (&spec.resume, spec.fork) {
+            (Some(source), true) => Some(format!("fork-of-{source}")),
+            (resume, _) => resume.clone(),
+        };
         tokio::spawn(async move {
             let _ = tx.send(DriverEvent::Event(EventKind::Started {
                 driver_session_id: id,
@@ -713,4 +716,93 @@ async fn adopt_needs_the_feature() {
         h.manager.adopt(adopt(C1), false).await,
         Err(ManagerError::Invalid(_))
     ));
+}
+
+#[tokio::test]
+async fn fork_is_allowed_while_live_and_branches_on_first_run() {
+    let h = harness().await;
+    h.claude_live(4444, C1);
+    let first = h.manager.adopt(adopt(C1), false).await;
+    assert!(matches!(first, Err(ManagerError::Conflict(_))));
+    let out = h
+        .manager
+        .adopt(
+            AdoptSpec {
+                fork: true,
+                ..adopt(C1)
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(out.adopted && !out.resumed);
+    let s = out.session.clone();
+    assert_eq!(s.origin, SessionOrigin::Forked);
+    assert_eq!(s.forked_from.as_deref(), Some(C1));
+    assert_eq!(
+        s.driver_session_id, None,
+        "the fork has no id until it runs"
+    );
+    assert!(
+        out.warnings.iter().any(|w| w.contains("open elsewhere")),
+        "{:?}",
+        out.warnings
+    );
+    match &h.manager.events(&s.id, 0, 10).await.unwrap()[0].kind {
+        EventKind::Adopted {
+            forked, liveness, ..
+        } => {
+            assert!(forked);
+            assert_eq!(liveness, "live");
+        }
+        e => panic!("{e:?}"),
+    }
+    // Waiting forks are resumable, and history shows the source meanwhile.
+    let resumable = ListFilter {
+        resumable: true,
+        ..Default::default()
+    };
+    assert_eq!(h.manager.list_filtered(&resumable).await.unwrap().len(), 1);
+    let page = h
+        .manager
+        .history(s.id.as_str(), None, HistoryQuery::default(), false)
+        .await
+        .unwrap();
+    assert_eq!(page.session.native_id, C1);
+
+    // The first send forks (the live source is only read).
+    assert!(h.manager.send(&s.id, "branch off".into()).await.unwrap());
+    h.wait_state(&s.id, SessionState::Idle).await;
+    {
+        let spawns = h.spawns.lock().unwrap();
+        assert_eq!(spawns.len(), 1);
+        assert!(spawns[0].fork);
+        assert_eq!(spawns[0].resume.as_deref(), Some(C1));
+    }
+    let fork_id = format!("fork-of-{C1}");
+    let status = h.manager.status(&s.id).await.unwrap();
+    assert_eq!(status.session.driver_session_id.as_deref(), Some(&*fork_id));
+    h.manager.stop(&s.id).await.unwrap();
+    h.wait_state(&s.id, SessionState::Stopped).await;
+    // The next resume continues the fork and does not fork again.
+    assert!(h.manager.send(&s.id, "more".into()).await.unwrap());
+    h.wait_state(&s.id, SessionState::Idle).await;
+    let spawns = h.spawns.lock().unwrap();
+    assert_eq!(spawns.len(), 2);
+    assert!(!spawns[1].fork);
+    assert_eq!(spawns[1].resume.as_deref(), Some(&*fork_id));
+}
+
+#[tokio::test]
+async fn every_fork_is_a_new_session() {
+    let h = harness().await;
+    let fork = || AdoptSpec {
+        fork: true,
+        message: Some("go".into()),
+        ..adopt(C2)
+    };
+    let a = h.manager.adopt(fork(), false).await.unwrap();
+    let b = h.manager.adopt(fork(), false).await.unwrap();
+    assert!(a.resumed && b.resumed);
+    assert_ne!(a.session.id, b.session.id);
 }

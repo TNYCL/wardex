@@ -29,6 +29,12 @@ All notable changes to this project are documented here. The format follows
   event (not sent to webhooks by default), `origin`, `forked_from` and
   `adopted_ms` on session records, and `list --origin wardex|adopted|forked`
   (MCP `list` `origin`).
+- Forks: `wardex adopt --fork <id>`, `wardex run --fork-from <id> --prompt …`
+  and MCP `adopt` with `fork` create a session (`origin: forked`) that
+  branches off an external session when it first runs (Claude
+  `--resume <id> --fork-session --session-id <new>`, Codex `thread/fork`); the
+  original is only read, so this works while it is open elsewhere. Every fork
+  is a new session, and later resumes continue the fork.
 - `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
   filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
   find a closed session again. `list` shows when and why a session ended.

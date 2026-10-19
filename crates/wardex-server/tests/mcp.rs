@@ -462,6 +462,27 @@ async fn external_sessions_over_mcp() {
     );
     let listed = data(&call(&client, "list", json!({"all": true, "origin": "adopted"})).await);
     assert_eq!(listed.as_array().unwrap().len(), 1);
+    let forked = data(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "fork": true}),
+        )
+        .await,
+    );
+    assert_eq!(forked["session"]["origin"], "forked");
+    assert_ne!(forked["session"]["id"], adopted["session"]["id"]);
+    // With a message the fork starts at once; the fixture's cwd does not
+    // exist here, so that fails after the record is created.
+    let err = error_text(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "fork": true, "message": "go"}),
+        )
+        .await,
+    );
+    assert!(err.contains("adopted as session"), "{err}");
     client.cancel().await.unwrap();
     d.cancel.cancel();
 }

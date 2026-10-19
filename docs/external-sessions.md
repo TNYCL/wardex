@@ -235,7 +235,14 @@ in a restricted mode continues with full permissions after adopt; the response
 says so. Use `--readonly` to keep it read-only.
 
 `wardex run --fork-from <ID> --prompt …` is a shortcut for
-`adopt --fork --message …`.
+`adopt --fork --message …`. Over MCP, use `adopt` with `fork` and `message`
+(the `run` tool keeps `cwd` required).
+
+A fork record has no native id of its own until it first runs: it keeps the
+source in `forked_from`, `history` shows the source meanwhile, and the first
+`send` (or the `--message`) starts the native fork. Every later resume
+continues the fork, never the source. Each `adopt --fork` creates a new
+session.
 
 ## Configuration
 

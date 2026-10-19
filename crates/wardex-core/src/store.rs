@@ -572,7 +572,10 @@ impl Store {
             q.push("state IN ('starting','running','idle','waiting_input')");
         }
         if filter.resumable {
-            q.push(" AND driver_session_id IS NOT NULL AND cleanup_failed = 0");
+            q.push(
+                " AND (driver_session_id IS NOT NULL OR forked_from IS NOT NULL) \
+                 AND cleanup_failed = 0",
+            );
         }
         if let Some(pattern) = &filter.agent {
             q.push(" AND agent GLOB ")

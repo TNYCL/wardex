@@ -25,6 +25,10 @@ pub struct SpawnSpec {
     pub readonly: bool,
     /// Driver session id to resume instead of starting fresh.
     pub resume: Option<String>,
+    /// With `resume`: start a new native session branched from it; the
+    /// original is only read. The new id comes with `started` (or in the
+    /// handle when the driver picks it up front).
+    pub fork: bool,
     pub slice: Option<String>,
     /// Unique systemd unit name for this process (without `.scope`).
     pub unit: String,

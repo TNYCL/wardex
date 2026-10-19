@@ -307,6 +307,10 @@ pub struct AdoptParams {
     /// Resume the session with this message right away.
     #[serde(default)]
     pub message: Option<String>,
+    /// Branch a new session off it instead of continuing it; the original
+    /// is only read, so this works while it is open elsewhere.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -609,8 +613,10 @@ impl WardexMcp {
         description = "Take over a session started outside Wardex: creates a Wardex session \
                        (state stopped, origin adopted) bound to the same native id; `send` or \
                        `message` continues it in a Wardex process. Refused while the session is \
-                       open elsewhere (live) or was written very recently (recent). Unless \
-                       `readonly`, it continues with full permissions."
+                       open elsewhere (live) or was written very recently (recent); `fork` \
+                       branches a new session off it instead, which is always allowed (with \
+                       `message`, like `run` on a fork). Unless `readonly`, it continues with \
+                       full permissions."
     )]
     async fn adopt(&self, Parameters(p): Parameters<AdoptParams>) -> CallToolResult {
         self.call(Request::Adopt {
@@ -623,6 +629,7 @@ impl WardexMcp {
             readonly: p.readonly,
             message: p.message,
             force: false,
+            fork: p.fork,
             via_mcp: true,
         })
         .await

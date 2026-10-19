@@ -76,6 +76,7 @@ enum Rpc {
     Initialize,
     ThreadStart,
     ThreadResume,
+    ThreadFork,
     TurnStart,
     TurnInterrupt,
 }
@@ -93,6 +94,7 @@ pub struct CodexProtocol {
     reasoning: Option<String>,
     readonly: bool,
     resume: Option<String>,
+    fork: bool,
     next_id: u64,
     rpcs: HashMap<u64, Rpc>,
     thread_id: Option<String>,
@@ -113,6 +115,7 @@ impl CodexProtocol {
             reasoning: spec.reasoning.clone(),
             readonly: spec.readonly,
             resume: spec.resume.clone(),
+            fork: spec.fork,
             next_id: 0,
             rpcs: HashMap::new(),
             thread_id: None,
@@ -151,6 +154,11 @@ impl CodexProtocol {
             params["model"] = json!(m);
         }
         match self.resume.clone() {
+            Some(thread_id) if self.fork => {
+                params["threadId"] = json!(thread_id);
+                params["excludeTurns"] = json!(true);
+                self.request(out, Rpc::ThreadFork, "thread/fork", params);
+            }
             Some(thread_id) => {
                 params["threadId"] = json!(thread_id);
                 params["excludeTurns"] = json!(true);
@@ -201,7 +209,7 @@ impl CodexProtocol {
                 .unwrap_or("request failed")
                 .to_string();
             match rpc {
-                Rpc::Initialize | Rpc::ThreadStart | Rpc::ThreadResume => {
+                Rpc::Initialize | Rpc::ThreadStart | Rpc::ThreadResume | Rpc::ThreadFork => {
                     out.events.push(EventKind::Error {
                         message: format!("codex {rpc:?} failed: {message}"),
                     });
@@ -227,7 +235,7 @@ impl CodexProtocol {
                     .push(json!({"method": "initialized"}).to_string());
                 self.open_thread(out);
             }
-            Rpc::ThreadStart | Rpc::ThreadResume => {
+            Rpc::ThreadStart | Rpc::ThreadResume | Rpc::ThreadFork => {
                 let thread_id = result["thread"]["id"].as_str().map(String::from);
                 self.thread_id = thread_id.clone();
                 out.events.push(EventKind::Started {
