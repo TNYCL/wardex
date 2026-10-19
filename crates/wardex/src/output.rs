@@ -35,6 +35,9 @@ pub fn list(views: &[SessionView]) -> String {
         if v.pending_questions > 0 {
             state = format!("{state}({})", v.pending_questions);
         }
+        if s.cleanup_failed {
+            state = "cleanup_failed".into();
+        }
         let _ = writeln!(
             out,
             "{:<9} {:<13} {:<7} {:<12} {:<14} {:>6}  {}",
@@ -132,6 +135,14 @@ pub fn status(st: &SessionStatus) -> String {
     }
     if let Some(e) = &s.last_error {
         let _ = writeln!(out, "error     {e}");
+    }
+    if s.cleanup_failed {
+        let _ = writeln!(
+            out,
+            "warning   cleanup_failed; old scope {}; use wardex resume {} to retry scope cleanup",
+            opt(&s.unit),
+            s.id
+        );
     }
     out
 }

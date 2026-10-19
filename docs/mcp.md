@@ -3,6 +3,15 @@
 Every CLI capability is an MCP tool, and the tools return the same JSON as the
 CLI's `--json` output. Bots use them to start sessions, answer questions and
 read results; webhooks ([`webhooks.md`](webhooks.md)) tell them when to look.
+
+During a persistence outage, successful actions can return `applied: true`,
+`persisted: false` and `warnings`: the agent command was accepted, so do not
+resend it. The writer retains accepted writes and retries automatically.
+Live `list`/`status` and `stop`/`interrupt` remain available. Degraded array
+results use an object with `data`, `persisted` and `warnings`; ordinary healthy
+results retain their existing shape. An admission error means no agent command
+was applied (for example, when the bounded write queue is full).
+
 Two transports serve the same tools:
 
 - **stdio:** `wardex mcp --stdio` forwards every call to the running daemon

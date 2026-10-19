@@ -12,6 +12,18 @@ CLI version changes.
 | Claude Code | 2.1.302 | 2026-10-18 |
 | Codex CLI | 0.163.0 | 2026-10-18 |
 
+The lifecycle fixes are tested with these recorded versions and temporary
+shell processes; no live Claude/Codex CLI is called. The shared runner handles
+`Drain` by closing stdin without a force-kill deadline for the leader, including
+when stdout has already closed. After leader exit the manager reaps remaining
+scope descendants with SIGTERM, escalating to SIGKILL and verifying exit before
+drain/resume completes. Default tests use test-owned processes and an injected
+scope controller; the real user-systemd drain test is explicitly ignored.
+Explicit `Shutdown`/`Kill` retain their existing fallback.
+Pending question/approval request ids belong to the live process, so drain
+waits for answers and refuses restart on timeout instead of trying to replay
+those ids into a resumed driver.
+
 ## Fixture format
 
 One JSON object per line:

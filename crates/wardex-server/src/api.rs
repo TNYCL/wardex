@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use wardex_core::manager::{AnswerInput, Manager, ManagerError};
+use wardex_core::manager::{AnswerInput, Manager, ManagerError, drain_next_steps};
 use wardex_core::{Event, EventKind, RunSpec};
 
 /// Default number of events `tail` shows.
@@ -87,13 +87,17 @@ pub enum Request {
         events: Option<i64>,
     },
     /// Stop the daemon. With `drain_secs`, first wait up to that long for
-    /// running turns to finish. With `restart`, the daemon starts again in
+    /// running turns and pending answers to finish. Drain refuses shutdown
+    /// on timeout or if an idle process will not exit gracefully; it never
+    /// interrupts a turn. With `restart`, the daemon starts again in
     /// the same process (same PID) after stopping.
     Shutdown {
         #[serde(default)]
         drain_secs: Option<u64>,
         #[serde(default)]
         restart: bool,
+        #[serde(default)]
+        force: bool,
     },
     /// Re-read the config and env files and apply the webhook settings.
     Reload,
@@ -110,6 +114,12 @@ pub struct Response {
     /// `conflict`, `internal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Response {
@@ -119,6 +129,9 @@ impl Response {
             data: Some(data),
             error: None,
             code: None,
+            persisted: None,
+            applied: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -128,17 +141,64 @@ impl Response {
             data: None,
             error: Some(message.into()),
             code: Some(code.into()),
+            persisted: None,
+            applied: Some(false),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Keep ordinary successful payloads compatible. Degraded responses carry
+    /// durability metadata through CLI/MCP too, including array payloads.
+    pub fn client_data(&self) -> Value {
+        let data = self.data.clone().unwrap_or(Value::Null);
+        if self.warnings.is_empty() {
+            return data;
+        }
+        let mut data = match data {
+            Value::Object(object) => object,
+            other => serde_json::Map::from_iter([("data".into(), other)]),
+        };
+        data.insert("persisted".into(), json!(self.persisted.unwrap_or(false)));
+        let mut warnings = data
+            .remove("warnings")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        warnings.extend(self.warnings.iter().map(|warning| json!(warning)));
+        data.insert("warnings".into(), json!(warnings));
+        if let Some(applied) = self.applied {
+            data.insert("applied".into(), json!(applied));
+        }
+        Value::Object(data)
     }
 }
 
 impl From<ManagerError> for Response {
     fn from(e: ManagerError) -> Self {
+        if let ManagerError::DrainBlocked {
+            ref sessions,
+            ref closed_sessions,
+            ref cleanup_failed,
+            ..
+        } = e
+        {
+            let mut response = Response::err("conflict", e.to_string());
+            response.data = Some(json!({
+                "shutting_down": false,
+                "blocked_sessions": sessions,
+                "closed_sessions": closed_sessions,
+                "interrupted_sessions": [],
+                "cleanup_failed": cleanup_failed,
+                "next_steps": drain_next_steps(sessions, cleanup_failed),
+            }));
+            response.applied = Some(!closed_sessions.is_empty());
+            return response;
+        }
         let code = match &e {
             ManagerError::NotFound(_) => "not_found",
             ManagerError::Ambiguous(_) => "ambiguous",
             ManagerError::Invalid(_) => "invalid",
             ManagerError::Conflict(_) => "conflict",
+            ManagerError::DrainBlocked { .. } => "conflict",
             ManagerError::Store(_) | ManagerError::Driver(_) => "internal",
         };
         Response::err(code, e.to_string())
@@ -158,8 +218,27 @@ fn to_value<T: Serialize>(v: &T) -> Value {
 /// Handle a request that produces a single response. `Tail` with `follow`
 /// and `Shutdown` are handled by the transport.
 pub async fn handle(manager: &Manager, req: Request) -> Response {
+    let action = matches!(
+        &req,
+        Request::Run(_)
+            | Request::Send { .. }
+            | Request::Answer { .. }
+            | Request::Resume { .. }
+            | Request::Stop { .. }
+            | Request::Interrupt { .. }
+    );
     match handle_inner(manager, req).await {
-        Ok(v) => Response::ok(v),
+        Ok(v) => {
+            let persistence = manager.persistence();
+            let mut response = Response::ok(v);
+            response.persisted = Some(persistence.persisted);
+            response.warnings = persistence.warnings;
+            response.applied = action.then_some(true);
+            if action && !persistence.persisted {
+                response.warnings.insert(0, "Action applied but not yet committed; do not resend it. Accepted writes are retained for background retries.".into());
+            }
+            response
+        }
         Err(e) => e.into(),
     }
 }
@@ -241,11 +320,10 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             )
             .await?,
         ),
-        Request::Shutdown {
-            drain_secs,
-            restart,
-        } => {
-            json!({"shutting_down": true, "drain_secs": drain_secs, "restart": restart})
+        Request::Shutdown { .. } => {
+            return Err(ManagerError::Invalid(
+                "shutdown is handled by the daemon's socket server".into(),
+            ));
         }
         Request::Reload => {
             return Err(ManagerError::Invalid(

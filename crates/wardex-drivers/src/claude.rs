@@ -402,7 +402,7 @@ impl Protocol for ClaudeProtocol {
                     .to_string(),
                 )
             }
-            DriverCommand::Shutdown | DriverCommand::Kill => out,
+            DriverCommand::Shutdown | DriverCommand::Drain | DriverCommand::Kill => out,
         }
     }
 }

@@ -81,6 +81,28 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Isolate unverifiable old scopes during recovery so one session cannot
+  prevent daemon startup. Persist `cleanup_failed`, keep its scope recorded,
+  skip automatic/implicit resume and expose the warning in status/list/overview.
+  Explicit `resume` retries cleanup before allowing a new process; drain
+  errors recommend `resume` or `--force` for these orphans.
+- Reset both drain exit flags after a refused/cancelled drain, retaining the
+  closed-stdin guard and any independent idle shutdown.
+- Retain accepted SQLite writes in a bounded queue and retry with exponential
+  background backoff. Split constraint failures to quarantine the offending
+  session while other sessions continue; clear errors after recovery.
+- Keep live/cached status, stop and interrupt available during database errors.
+  Shutdown exits even if the final flush fails. Applied actions report
+  `applied: true`, `persisted: false` and warnings instead of implying they
+  should be resent; a full write queue rejects new work before agent commands.
+- Reserve session starts atomically so concurrent resumes spawn one process.
+  Delayed stop timers and driver events target the original process generation.
+- Reap scope descendants after drain with SIGTERM then SIGKILL as necessary,
+  and clean old orphan scopes before manual/automatic resume. Failed cleanup
+  prevents a new generation from spawning alongside old descendants.
+- Report closed sessions on a partially completed drain and clear remaining
+  drain flags. Wait for existing starts until the drain deadline and give
+  explicit stop instructions when an agent never reports a resume id.
 - Reject duplicate daemons before opening the database or recovering sessions
   by holding an exclusive database lock for the daemon's lifetime and checking
   the socket first. A second start, even with a different socket, no longer
@@ -97,6 +119,19 @@ All notable changes to this project are documented here. The format follows
 - Daemon logs use colors only on a terminal.
 - Question rows are written in order with events, so `pending` never misses
   a question that was just asked.
+
+### Changed (breaking)
+
+- After migration 0003 is applied, older binaries can no longer open this
+  database; back up `wardex.db` before installing.
+- `daemon stop/restart --drain SECS` refuses shutdown when turns, answers or
+  graceful leader exit do not finish. Existing questions/approvals stay live;
+  idle leaders are not force-killed. Use `answer`/`stop`, retry `--drain`, or
+  explicitly choose `--drain SECS --force` to fall back to ordinary shutdown.
+  Forced shutdown reports interrupted session ids in CLI/JSON and session
+  notes. Error responses include `closed_sessions` and three operator steps.
+- Degraded CLI/MCP array results use a `data` wrapper to carry persistence
+  warnings; ordinary healthy payloads keep their existing shape.
 
 ### Changed
 

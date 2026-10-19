@@ -189,9 +189,23 @@ pub async fn run_with(
     }
     let _ = shutdown_tx.send(true);
     let grace = Duration::from_secs(config.sessions.stop_grace_secs + 5);
-    manager.shutdown(grace).await;
+    let shutdown_result = manager.shutdown(grace).await;
     let _ = std::fs::remove_file(&socket_path);
-    store.close().await;
+    let close_result = store.close().await;
+    match shutdown_result {
+        Ok(report) => {
+            for warning in report.warnings {
+                tracing::warn!(%warning, "shutdown persistence or cleanup warning");
+            }
+            if !report.interrupted_sessions.is_empty() {
+                tracing::warn!(sessions = ?report.interrupted_sessions, "shutdown interrupted sessions");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "shutdown completed with a control error"),
+    }
+    if let Err(error) = close_result {
+        tracing::warn!(%error, "daemon exiting with uncommitted state; inspect database access before restart");
+    }
     let exit = if control.restart_requested() {
         tracing::info!("wardex daemon stopped; restarting");
         Exit::Restart
