@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-19
+## [0.1.0] - 2026-10-20
 
 First functional release (Phases 1 and 2 of `docs/SCOPE.md`). 0.0.1 was a
 skeleton with stub commands.

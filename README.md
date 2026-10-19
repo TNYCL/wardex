@@ -98,11 +98,11 @@ install -Dm755 target/release/wardex ~/.local/bin/wardex
 ```
 
 Run it as a systemd user service with the example config and unit from
-[`deploy/`](https://github.com/TNYCL/wardex/tree/main/deploy) (in a clone,
+[`deploy/`](https://github.com/TNYCL/wardex/tree/v0.1.0/deploy) (in a clone,
 copy them from `deploy/` instead of downloading):
 
 ```sh
-base=https://raw.githubusercontent.com/TNYCL/wardex/main/deploy
+base=https://raw.githubusercontent.com/TNYCL/wardex/v0.1.0/deploy
 mkdir -p ~/.config/wardex ~/.config/systemd/user
 curl -fsSLo ~/.config/wardex/wardex.toml "$base/wardex.example.toml"
 curl -fsSLo ~/.config/systemd/user/wardex.service "$base/wardex.service"
@@ -165,8 +165,8 @@ and add the hostname to `http.allowed_hosts`:
 }
 ```
 
-Any MCP client that can run a command (stdio) or send a custom header (HTTP)
-works. Wardex is used with Claude Code and Grok Bot, among others.
+Wardex works with any MCP client (e.g. Claude Code) that can run a command
+(stdio) or send a custom header (HTTP).
 
 Give each bot or agent its own `agent` label so its sessions stay apart
 (`list --agent`, `send --latest --agent`), and point a webhook at it so it
