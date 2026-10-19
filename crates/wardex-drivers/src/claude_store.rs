@@ -409,16 +409,13 @@ pub fn parse_history(text: &str) -> History {
                 let mut texts = Vec::new();
                 match content {
                     Value::String(s) => texts.push(s.clone()),
-                    Value::Array(blocks) => {
-                        for block in blocks {
-                            match block["type"].as_str().unwrap_or_default() {
-                                "text" => texts
-                                    .push(block["text"].as_str().unwrap_or_default().to_string()),
-                                // Matched with their tool_use below.
-                                _ => {}
-                            }
-                        }
-                    }
+                    // Tool results are matched with their tool_use below.
+                    Value::Array(blocks) => texts.extend(
+                        blocks
+                            .iter()
+                            .filter(|b| b["type"] == "text")
+                            .map(|b| b["text"].as_str().unwrap_or_default().to_string()),
+                    ),
                     _ => {}
                 }
                 let text = texts.join("\n");
