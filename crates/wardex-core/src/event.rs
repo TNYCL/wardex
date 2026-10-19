@@ -121,6 +121,19 @@ pub enum EventKind {
         reason: StuckReason,
         idle_secs: u64,
     },
+    /// A session record was created from an external session (`adopt`).
+    Adopted {
+        /// The external session's native id.
+        source_driver_session_id: String,
+        /// A fork: the source is only read; the new id comes with `started`.
+        forked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cli_version: Option<String>,
+        /// Liveness of the source when it was adopted.
+        liveness: String,
+        /// Transcript path relative to the CLI's root.
+        path_hint: String,
+    },
     /// The agent process ended.
     Ended {
         state: SessionState,
@@ -202,6 +215,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "error",
     "stuck",
     "ended",
+    "adopted",
 ];
 
 /// Event type names that are pushed to webhooks by default.
@@ -223,6 +237,7 @@ impl EventKind {
             Self::Error { .. } => "error",
             Self::Stuck { .. } => "stuck",
             Self::Ended { .. } => "ended",
+            Self::Adopted { .. } => "adopted",
         }
     }
 
@@ -321,6 +336,15 @@ impl EventKind {
             Self::Error { message } => format!("error: {message}"),
             Self::Stuck { reason, idle_secs } => {
                 format!("stuck ({reason:?}) for {idle_secs}s")
+            }
+            Self::Adopted {
+                source_driver_session_id,
+                forked,
+                liveness,
+                ..
+            } => {
+                let verb = if *forked { "forked from" } else { "adopted" };
+                format!("{verb} external session {source_driver_session_id} ({liveness})")
             }
             Self::Ended {
                 state,
@@ -438,6 +462,26 @@ mod tests {
         });
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], ev.kind.name());
+    }
+
+    #[test]
+    fn adopted_is_not_notable() {
+        let ev = event(EventKind::Adopted {
+            source_driver_session_id: "abc".into(),
+            forked: false,
+            cli_version: None,
+            liveness: "inactive".into(),
+            path_hint: "projects/x/abc.jsonl".into(),
+        });
+        assert!(!ev.kind.is_notable());
+        assert!(EVENT_NAMES.contains(&ev.kind.name()));
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "adopted");
+        assert_eq!(serde_json::from_value::<Event>(json).unwrap(), ev);
+        assert_eq!(
+            ev.kind.describe(),
+            "adopted external session abc (inactive)"
+        );
     }
 
     #[test]

@@ -79,6 +79,32 @@ pub struct ExternalSession {
 }
 
 impl ExternalSession {
+    /// Just enough of a session to probe its liveness by id and cwd (the
+    /// transcript is not read; it counts as old).
+    pub fn probe_only(driver: DriverKind, native_id: &str, cwd: &Path) -> Self {
+        Self {
+            driver,
+            native_id: native_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            title: None,
+            created_ms: None,
+            updated_ms: 0,
+            cli_version: None,
+            entrypoint: None,
+            forked_from: None,
+            continued_in: None,
+            size_bytes: 0,
+            compressed: false,
+            archived: false,
+            subagent: false,
+            managed_by: None,
+            liveness: Liveness::not_probed(),
+            path_hint: String::new(),
+            warnings: Vec::new(),
+            path: PathBuf::new(),
+        }
+    }
+
     /// `claude:<id>` / `codex:<id>`.
     pub fn qualified_id(&self) -> String {
         format!("{}:{}", self.driver.as_str(), self.native_id)

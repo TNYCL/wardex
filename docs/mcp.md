@@ -94,7 +94,7 @@ Session ids can be shortened to any unique prefix.
 |---|---|---|
 | `run` | `driver` (`claude`/`codex`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
 | `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration, `idle_since_ms`, `shutdown_in_ms` and latest events; counts per state; sessions ended in the last 24h |
-| `list` | optional `all`; filters `agent`, `task` (globs with `*`, `?`), `ended` (ended sessions only), `resumable` (ended sessions `send` can continue) | session records (with `ended_reason`), newest first, at most 500 |
+| `list` | optional `all`; filters `agent`, `task` (globs with `*`, `?`), `ended` (ended sessions only), `resumable` (ended sessions `send` can continue), `origin` (`wardex`, `adopted`, `forked`) | session records (with `ended_reason`, `origin`), newest first, at most 500 |
 | `status` | `id` | record, pending questions, running tools, RSS/CPU |
 | `tail` | `id`; optional `since_seq`, `last`, `wait_secs` (max 60), `full` | events, oldest first |
 | `tool_output` | `id`, `seq` (of either `tool_call` event of the call) | the call's full `input` and `output` |
@@ -107,8 +107,9 @@ Session ids can be shortened to any unique prefix.
 | `resume` | `id`; optional `message` | session record |
 | `external_list` | optional `driver`, `cwd` (absolute), `under`, `since_secs`, `limit` (default 50), `include_managed` | `{sessions}`: sessions started outside Wardex, newest first, with `liveness` |
 | `history` | `id` (Wardex id or external id); optional `driver`, `turns` (default 20), `before`, `tools` (`none`/`summary`/`full`), `max_bytes` (default 65536) | `{session, items, next_before, truncated, warnings}` |
+| `adopt` | `id` (external id); optional `driver`, `agent`, `task`, `model`, `reasoning`, `readonly`, `message` | `{session, adopted, resumed, source, warnings}` |
 
-`external_list` and `history` are listed only when the daemon has both
+`external_list`, `history` and `adopt` are listed only when the daemon has both
 `external.enabled` and `external.mcp` set (both off by default); see
 [External sessions](#external-sessions).
 
@@ -155,7 +156,8 @@ items:
   (idle for `sessions.idle_shutdown_secs`), `idle_evicted` (more than
   `sessions.max_idle_live` idle sessions), `memory_pressure` (available memory
   below `sessions.min_mem_available_mb`), `error`, `drain`, `shutdown` (daemon
-  stop or restart) or `daemon_lost` (the daemon died while it ran). It is
+  stop or restart), `daemon_lost` (the daemon died while it ran) or `adopted`
+  (created by `adopt`; no Wardex process has run yet). It is
   empty while the session is live and for sessions that ended before it was
   recorded. After `idle_shutdown`, `idle_evicted` and `memory_pressure` the
   work is unfinished: `send` continues it, and a `remove_worktree` worktree is
@@ -188,6 +190,11 @@ acceptable. Details: [`external-sessions.md`](external-sessions.md).
   transcript every time (never copied into Wardex). Page back with
   `before` = `next_before`. Secrets are masked on a best-effort basis; treat
   the result as sensitive anyway. `history` also takes a Wardex session id.
+- `adopt {"id": "claude:1a2b3c4d", "message": "…"}`: a Wardex session
+  (`origin: adopted`) bound to the same native id; `send` continues it like
+  any other session. Refused while the session is `live` or `recent`/`unknown`
+  (there is no `force` over MCP). Unless `readonly` is set, the session
+  continues with full permissions, whatever mode it was started in.
 
 ### Paging and waiting
 

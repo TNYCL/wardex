@@ -19,6 +19,16 @@ All notable changes to this project are documented here. The format follows
   or `json`). The MCP tools `external_list` and `history` additionally need
   `external.mcp = true`. Wardex never writes, locks or deletes anything in
   the CLIs' stores, and history is not copied into its database.
+- `wardex adopt <id> [--readonly] [--message TEXT] [--force]` and the MCP
+  tool `adopt`: link an external session to a new Wardex session (`stopped`,
+  `ended_reason: adopted`, `origin: adopted`) under the same native id, so
+  `send`/`resume` continue it. Refused while the session is open in a process
+  (`live`); `recent` or `unknown` sessions need `--force`, which exists only
+  in the CLI. Adopting again returns the same session. Every resume of an
+  adopted session checks again that no CLI process has it open. New `adopted`
+  event (not sent to webhooks by default), `origin`, `forked_from` and
+  `adopted_ms` on session records, and `list --origin wardex|adopted|forked`
+  (MCP `list` `origin`).
 - `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
   filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
   find a closed session again. `list` shows when and why a session ended.
@@ -154,6 +164,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed (breaking)
 
+- Migration 0005 adds `sessions.origin`, `forked_from` and `adopted_ms` and an
+  index on `(driver, driver_session_id)`; after it is applied, older binaries
+  can no longer open the database. Back up `wardex.db` first.
 - Migration 0004 adds `sessions.ended_reason`; after it is applied, older
   binaries can no longer open the database. Back up `wardex.db` first.
 - After migration 0003 is applied, older binaries can no longer open this

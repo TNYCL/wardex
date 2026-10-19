@@ -88,8 +88,9 @@ and, one at a time, while `MemAvailable` is below
 `sessions.min_mem_available_mb` (default 1024 MiB). Sessions with a running
 turn or an open question are never closed. Each ended session records an `ended_reason`
 (`done`, `stopped`, `idle_shutdown`, `idle_evicted`, `memory_pressure`,
-`error`, `drain`, `shutdown`, `daemon_lost`), also sent as `reason` on the
-`ended` event.
+`error`, `drain`, `shutdown`, `daemon_lost`; `adopted` for a record created
+from an external session that has not run in Wardex yet), also sent as
+`reason` on the `ended` event.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.

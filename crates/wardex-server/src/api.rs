@@ -11,7 +11,7 @@ use wardex_core::external::{
 };
 use wardex_core::manager::{AnswerInput, Manager, ManagerError, drain_next_steps};
 use wardex_core::time::now_ms;
-use wardex_core::{DriverKind, Event, EventKind, ListFilter, RunSpec};
+use wardex_core::{AdoptSpec, DriverKind, Event, EventKind, ListFilter, RunSpec, SessionOrigin};
 
 /// Default number of events `tail` shows.
 pub const DEFAULT_TAIL: i64 = 20;
@@ -39,6 +39,8 @@ pub enum Request {
         ended: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         resumable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<SessionOrigin>,
     },
     Status {
         id: String,
@@ -166,6 +168,29 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         via_mcp: bool,
     },
+    /// Link an external session to a new Wardex session (see `AdoptSpec`).
+    Adopt {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver: Option<DriverKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        readonly: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Adopt a `recent`/`unknown` session anyway. Refused over MCP.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        via_mcp: bool,
+    },
 }
 
 impl Request {
@@ -177,6 +202,7 @@ impl Request {
             task: None,
             ended: false,
             resumable: false,
+            origin: None,
         }
     }
 
@@ -321,6 +347,7 @@ pub async fn handle(manager: &Manager, req: Request) -> Response {
             | Request::Resume { .. }
             | Request::Stop { .. }
             | Request::Interrupt { .. }
+            | Request::Adopt { .. }
     );
     match handle_inner(manager, req).await {
         Ok(v) => {
@@ -353,6 +380,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             task,
             ended,
             resumable,
+            origin,
         } => to_value(
             &m.list_filtered(&ListFilter {
                 all,
@@ -360,6 +388,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
                 task,
                 ended,
                 resumable,
+                origin,
             })
             .await?,
         ),
@@ -514,6 +543,31 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
                 redact: true,
             };
             to_value(&m.history(&id, driver, query, via_mcp).await?)
+        }
+        Request::Adopt {
+            id,
+            driver,
+            agent,
+            task,
+            model,
+            reasoning,
+            readonly,
+            message,
+            force,
+            via_mcp,
+        } => {
+            let spec = AdoptSpec {
+                id,
+                driver,
+                agent,
+                task,
+                model,
+                reasoning,
+                readonly,
+                message,
+                force,
+            };
+            to_value(&m.adopt(spec, via_mcp).await?)
         }
     })
 }

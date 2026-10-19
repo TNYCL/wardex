@@ -19,4 +19,7 @@ pub use event::{
     Answer, DriverKind, Event, EventKind, GitState, QuestionItem, QuestionOption, StuckReason,
     ToolStatus,
 };
-pub use session::{EndReason, ListFilter, RunSpec, SessionId, SessionRecord, SessionState};
+pub use session::{
+    AdoptSpec, EndReason, ListFilter, RunSpec, SessionId, SessionOrigin, SessionRecord,
+    SessionState,
+};

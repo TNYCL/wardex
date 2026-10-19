@@ -105,6 +105,13 @@ pub fn status(st: &SessionStatus) -> String {
     if s.readonly {
         let _ = writeln!(out, "mode      read-only");
     }
+    if s.origin != wardex_core::SessionOrigin::Wardex {
+        let mut origin = s.origin.as_str().to_string();
+        if let Some(from) = &s.forked_from {
+            origin.push_str(&format!(" from {from}"));
+        }
+        let _ = writeln!(out, "origin    {origin}");
+    }
     let end = s.ended_ms.unwrap_or_else(now_ms);
     let _ = writeln!(out, "age       {}", human_duration(end - s.created_ms));
     let _ = writeln!(out, "resume id {}", opt(&s.driver_session_id));

@@ -110,10 +110,13 @@ pub enum EndReason {
     Shutdown,
     /// Found live after the daemon stopped unexpectedly (crash or kill).
     DaemonLost,
+    /// No Wardex process has run yet: the record was created from an
+    /// external session (`adopt`).
+    Adopted,
 }
 
 impl EndReason {
-    pub const ALL: [EndReason; 9] = [
+    pub const ALL: [EndReason; 10] = [
         Self::Done,
         Self::Stopped,
         Self::IdleShutdown,
@@ -123,6 +126,7 @@ impl EndReason {
         Self::Drain,
         Self::Shutdown,
         Self::DaemonLost,
+        Self::Adopted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -136,6 +140,7 @@ impl EndReason {
             Self::Drain => "drain",
             Self::Shutdown => "shutdown",
             Self::DaemonLost => "daemon_lost",
+            Self::Adopted => "adopted",
         }
     }
 
@@ -150,6 +155,35 @@ impl EndReason {
             self,
             Self::IdleShutdown | Self::IdleEvicted | Self::MemoryPressure
         )
+    }
+}
+
+/// Where a session came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    /// Started by Wardex.
+    #[default]
+    Wardex,
+    /// An external CLI session linked as-is (`adopt`).
+    Adopted,
+    /// A fork of an external session (`adopt --fork`, `run --fork-from`).
+    Forked,
+}
+
+impl SessionOrigin {
+    pub const ALL: [SessionOrigin; 3] = [Self::Wardex, Self::Adopted, Self::Forked];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wardex => "wardex",
+            Self::Adopted => "adopted",
+            Self::Forked => "forked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.as_str() == s)
     }
 }
 
@@ -172,6 +206,9 @@ pub struct ListFilter {
     /// scope cleanup is pending and the working directory still exists.
     #[serde(default)]
     pub resumable: bool,
+    /// Only sessions of this origin.
+    #[serde(default)]
+    pub origin: Option<SessionOrigin>,
 }
 
 impl ListFilter {
@@ -192,6 +229,7 @@ impl ListFilter {
             && (!self.resumable || (record.driver_session_id.is_some() && !record.cleanup_failed))
             && label_ok(&self.agent, &record.agent)
             && label_ok(&self.task, &record.task)
+            && self.origin.is_none_or(|o| o == record.origin)
     }
 }
 
@@ -260,6 +298,39 @@ pub struct SessionRecord {
     /// ended before this was recorded).
     #[serde(default)]
     pub ended_reason: Option<EndReason>,
+    #[serde(default)]
+    pub origin: SessionOrigin,
+    /// Native id of the external session a forked session branched from.
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    /// When the session was adopted (`None` for Wardex-started ones).
+    #[serde(default)]
+    pub adopted_ms: Option<i64>,
+}
+
+/// Link an external session to a new Wardex session (`adopt`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdoptSpec {
+    /// `claude:<uuid>`, `codex:<uuid>`, a uuid or a unique prefix.
+    pub id: String,
+    #[serde(default)]
+    pub driver: Option<DriverKind>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub readonly: bool,
+    /// Resume the session with this message at once.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Adopt a `recent` or `unknown` session anyway (CLI only).
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[cfg(test)]
@@ -296,6 +367,9 @@ mod tests {
             resume_with_prompt: false,
             cleanup_failed: false,
             ended_reason: None,
+            origin: SessionOrigin::Wardex,
+            forked_from: None,
+            adopted_ms: None,
         }
     }
 
@@ -339,6 +413,28 @@ mod tests {
         let mut quarantined = record(SessionState::Orphaned, None, None);
         quarantined.cleanup_failed = true;
         assert!(!resumable.matches(&quarantined));
+    }
+
+    #[test]
+    fn list_filter_origin() {
+        let mut adopted = record(SessionState::Stopped, None, None);
+        adopted.origin = SessionOrigin::Adopted;
+        let by = |origin| ListFilter {
+            all: true,
+            origin: Some(origin),
+            ..Default::default()
+        };
+        assert!(by(SessionOrigin::Adopted).matches(&adopted));
+        assert!(!by(SessionOrigin::Wardex).matches(&adopted));
+        assert_eq!(SessionOrigin::parse("forked"), Some(SessionOrigin::Forked));
+        // Records from older versions are Wardex-started.
+        let mut json = serde_json::to_value(&adopted).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("origin");
+        obj.remove("forked_from");
+        obj.remove("adopted_ms");
+        let old: SessionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(old.origin, SessionOrigin::Wardex);
     }
 
     #[test]

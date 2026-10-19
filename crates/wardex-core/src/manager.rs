@@ -15,15 +15,15 @@ use crate::config::SessionsConfig;
 use crate::driver::{Driver, DriverCommand, DriverError, DriverEvent, READONLY_PREFIX, SpawnSpec};
 use crate::external::{
     ExternalError, ExternalFilter, ExternalSession, ExternalSource, HistoryPage, HistoryQuery,
-    cwd_matches, normalize_cwd,
+    LiveEvidence, Liveness, cwd_matches, normalize_cwd,
 };
 use crate::process::{self, Launcher};
 use crate::procscan::{ProbeConfig, ProcSnapshot};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
-    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter, RunSpec,
-    SessionId, SessionRecord, SessionState, StuckReason, ToolStatus, git,
+    AdoptSpec, Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter,
+    RunSpec, SessionId, SessionOrigin, SessionRecord, SessionState, StuckReason, ToolStatus, git,
 };
 
 const BROADCAST_CAPACITY: usize = 8192;
@@ -107,6 +107,17 @@ pub enum AnswerInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub session: SessionRecord,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptOutcome {
+    pub session: SessionRecord,
+    /// False when this daemon already managed the session.
+    pub adopted: bool,
+    /// The session was resumed with the given message.
+    pub resumed: bool,
+    pub source: ExternalSession,
     pub warnings: Vec<String>,
 }
 
@@ -382,6 +393,8 @@ struct Inner {
     launcher: Launcher,
     external: Vec<Arc<dyn ExternalSource>>,
     probe: ProbeConfig,
+    /// One adopt at a time, so a native id gets one Wardex session.
+    adopt_lock: tokio::sync::Mutex<()>,
     live: Mutex<HashMap<SessionId, Live>>,
     records: Mutex<HashMap<SessionId, SessionRecord>>,
     read_warning: Mutex<Option<String>>,
@@ -544,6 +557,7 @@ impl Manager {
                 launcher,
                 external: external.sources,
                 probe,
+                adopt_lock: tokio::sync::Mutex::new(()),
                 live: Mutex::new(HashMap::new()),
                 records: Mutex::new(HashMap::new()),
                 read_warning: Mutex::new(None),
@@ -924,6 +938,9 @@ impl Manager {
             resume_with_prompt: false,
             cleanup_failed: false,
             ended_reason: None,
+            origin: SessionOrigin::Wardex,
+            forked_from: None,
+            adopted_ms: None,
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
@@ -2145,6 +2162,9 @@ impl Manager {
                 "session {id} cannot be resumed: the agent never reported a session id"
             ))
         })?;
+        if record.origin != SessionOrigin::Wardex {
+            self.check_not_open_elsewhere(&record, &resume_id).await?;
+        }
         record.last_seq = record.last_seq.max(self.inner.store.max_seq(id).await?);
         record.last_error = None;
         record.resume_pending = false;
@@ -2160,6 +2180,218 @@ impl Manager {
         }
         self.finish_action().await;
         self.record(id).await
+    }
+
+    /// Refuse to continue a session that came from outside Wardex while a CLI
+    /// process has it open (registry or command-line evidence; the cwd
+    /// heuristic alone does not block a resume). The user may have reopened
+    /// it in a terminal since it was adopted.
+    async fn check_not_open_elsewhere(&self, record: &SessionRecord, native: &str) -> Result<()> {
+        let session = ExternalSession::probe_only(record.driver, native, &record.cwd);
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let liveness = Self::blocking(move || {
+            Ok(ProcSnapshot::take(&probe, &pids).liveness(&session, now_ms()))
+        })
+        .await?;
+        match liveness {
+            Liveness::Live {
+                pid,
+                evidence: LiveEvidence::Registry | LiveEvidence::Cmdline,
+            } => Err(ManagerError::Conflict(format!(
+                "session {} cannot be resumed: {} session {native} is open in process {pid}; \
+                 close it there first (nothing was started)",
+                record.id,
+                record.driver.as_str()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Link an external session to a new Wardex session (state `stopped`,
+    /// `ended_reason: adopted`), so `send`/`resume` continue it under the
+    /// same native id. Refused while the session is `live`; `recent` and
+    /// `unknown` need `force` (never over MCP). A session this daemon
+    /// already manages returns its Wardex session.
+    pub async fn adopt(&self, spec: AdoptSpec, via_mcp: bool) -> Result<AdoptOutcome> {
+        self.external_allowed(via_mcp)?;
+        if via_mcp && spec.force {
+            return Err(ManagerError::Invalid(
+                "force is only available in the CLI".into(),
+            ));
+        }
+        if spec.message.as_ref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(ManagerError::Invalid("message is empty".into()));
+        }
+        self.accepting_work()?;
+        self.inner.store.check_admission(None)?;
+        let _one_at_a_time = self.inner.adopt_lock.lock().await;
+        let source = self.resolve_external(&spec.id, spec.driver).await?;
+        let driver = source.driver;
+        if !self.inner.drivers.contains_key(&driver) {
+            return Err(ManagerError::Invalid(format!(
+                "driver {} is not available",
+                driver.as_str()
+            )));
+        }
+        let qualified = source.qualified_id();
+        let existing = match &source.managed_by {
+            Some(id) => Some(id.clone()),
+            None => {
+                self.inner
+                    .store
+                    .find_by_driver_session(driver, &source.native_id)
+                    .await?
+            }
+        };
+        if let Some(id) = existing {
+            let mut resumed = false;
+            if let Some(message) = spec.message {
+                resumed = self.send(&id, message).await?;
+            }
+            return Ok(AdoptOutcome {
+                session: self.record(&id).await?,
+                adopted: false,
+                resumed,
+                source,
+                warnings: vec![format!("{qualified} is already managed as session {id}")],
+            });
+        }
+        match &source.liveness {
+            Liveness::Live { pid, .. } => {
+                return Err(ManagerError::Conflict(format!(
+                    "{qualified} is open in process {pid}; continue it there, or fork it \
+                     (adopt --fork) to branch off without touching the original"
+                )));
+            }
+            Liveness::Recent {
+                modified_secs_ago, ..
+            } if !spec.force => {
+                return Err(ManagerError::Conflict(format!(
+                    "{qualified} was written {modified_secs_ago}s ago and may still be open; \
+                     close it first, fork it (--fork), or adopt anyway with --force (CLI only)"
+                )));
+            }
+            Liveness::Unknown { reason } if !spec.force => {
+                return Err(ManagerError::Conflict(format!(
+                    "cannot tell whether {qualified} is open ({reason}); close it first, fork it \
+                     (--fork), or adopt anyway with --force (CLI only)"
+                )));
+            }
+            _ => {}
+        }
+
+        let mut warnings = source.warnings.clone();
+        if !spec.readonly {
+            warnings.push(
+                "the session continues with Wardex's full permissions (bypassPermissions / \
+                 danger-full-access), whatever mode it was started in; adopt with --readonly \
+                 to keep it read-only"
+                    .into(),
+            );
+        }
+        if let Some(entry) = source
+            .entrypoint
+            .as_deref()
+            .filter(|e| driver == DriverKind::Claude && !matches!(*e, "cli" | "sdk-cli"))
+        {
+            warnings.push(format!(
+                "started from {entry}; resuming it in the CLI may not work"
+            ));
+        }
+        if !source.cwd.is_dir() {
+            warnings.push(format!(
+                "its working directory {} no longer exists; resume will fail",
+                source.cwd.display()
+            ));
+        }
+
+        let mut id = SessionId::generate();
+        while self.inner.store.session_exists(id.as_str()).await? {
+            id = SessionId::generate();
+        }
+        let reservation = self.reserve_start(&id)?;
+        let drivers_cfg = &self.inner.config.drivers;
+        let (default_model, default_reasoning) = match driver {
+            DriverKind::Claude => (
+                drivers_cfg.claude.default_model.clone(),
+                drivers_cfg.claude.default_reasoning.clone(),
+            ),
+            DriverKind::Codex => (
+                drivers_cfg.codex.default_model.clone(),
+                drivers_cfg.codex.default_reasoning.clone(),
+            ),
+        };
+        let now = now_ms();
+        let mut record = SessionRecord {
+            id: id.clone(),
+            driver,
+            driver_session_id: Some(source.native_id.clone()),
+            state: SessionState::Stopped,
+            agent: spec.agent,
+            task: spec.task,
+            model: spec.model.or(default_model),
+            reasoning: spec.reasoning.or(default_reasoning),
+            cwd: source.cwd.clone(),
+            origin_cwd: None,
+            worktree: None,
+            branch: None,
+            remove_worktree: false,
+            readonly: spec.readonly,
+            slice: None,
+            unit: None,
+            pid: None,
+            created_ms: now,
+            updated_ms: now,
+            ended_ms: Some(now),
+            last_seq: 0,
+            last_result: None,
+            last_error: None,
+            spawn_count: 0,
+            resume_pending: false,
+            resume_with_prompt: false,
+            cleanup_failed: false,
+            ended_reason: Some(EndReason::Adopted),
+            origin: SessionOrigin::Adopted,
+            forked_from: None,
+            adopted_ms: Some(now),
+        };
+        let publication = self.inner.store.reserve_publication()?;
+        self.inner.store.insert_session(&record).await?;
+        let event = make_event(
+            &mut record,
+            EventKind::Adopted {
+                source_driver_session_id: source.native_id.clone(),
+                forked: false,
+                cli_version: source.cli_version.clone(),
+                liveness: source.liveness.as_str().into(),
+                path_hint: source.path_hint.clone(),
+            },
+        );
+        self.publish_reserved(&event, &record, publication);
+        drop(reservation);
+        tracing::info!(session = %id, driver = driver.as_str(), "external session adopted");
+        let mut resumed = false;
+        if let Some(message) = spec.message {
+            if let Err(e) = self.resume(&id, Some(message)).await {
+                return Err(match e {
+                    ManagerError::Conflict(m) => {
+                        ManagerError::Conflict(format!("adopted as session {id}, but {m}"))
+                    }
+                    other => other,
+                });
+            }
+            resumed = true;
+        } else {
+            self.finish_action().await;
+        }
+        Ok(AdoptOutcome {
+            session: self.record(&id).await?,
+            adopted: true,
+            resumed,
+            source,
+            warnings,
+        })
     }
 
     /// Stop a live session: close stdin, then kill after the grace period.

@@ -479,7 +479,7 @@ fn run_prints_only_the_id_on_stdout() {
 fn external_config(mcp: bool) -> String {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wardex-drivers/tests/fixtures");
     format!(
-        "[external]\nenabled = true\nmcp = {mcp}\nclaude_home = \"{}\"\ncodex_home = \"{}\"\n",
+        "[external]\nenabled = true\nmcp = {mcp}\nquiet_secs = 0\nclaude_home = \"{}\"\ncodex_home = \"{}\"\n",
         fixtures.join("claude/store").display(),
         fixtures.join("codex/store").display()
     )
@@ -542,6 +542,32 @@ fn external_sessions_from_the_cli() {
     );
     let out = env.run(&["history", "0199a1b2"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("several"));
+
+    // Adopt prints only the Wardex id; a second adopt returns the same one.
+    let out = env.run(&["adopt", "claude:33333333", "--agent", "me"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(id.len(), 8, "{id}");
+    let notes = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        notes.contains("adopted") && notes.contains("full permissions"),
+        "{notes}"
+    );
+    let again = env.json(&["adopt", "33333333-3333-4333-8333-333333333333"]);
+    assert_eq!(again["adopted"], false);
+    assert_eq!(again["session"]["id"], id.as_str());
+    let adopted = env.json(&["list", "-a", "--origin", "adopted"]);
+    assert_eq!(adopted.as_array().unwrap().len(), 1);
+    assert_eq!(adopted[0]["ended_reason"], "adopted");
+    let out = env.run(&["list", "-a"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("stopped (adopted)"));
+    // The transcript is still read through the Wardex id.
+    let page = env.json(&["history", &id]);
+    assert_eq!(page["items"][0]["text"], "What is in this directory?");
     env.stop_daemon(daemon);
 }
 
@@ -551,7 +577,7 @@ fn mcp_over_stdio_lists_external_tools_only_when_exposed() {
     use rmcp::ServiceExt;
     use rmcp::transport::TokioChildProcess;
 
-    for (mcp, expected) in [(false, 13), (true, 15)] {
+    for (mcp, expected) in [(false, 13), (true, 16)] {
         let env = Env::with_config("question", &external_config(mcp));
         let daemon = env.start_daemon();
         let rt = tokio::runtime::Runtime::new().unwrap();

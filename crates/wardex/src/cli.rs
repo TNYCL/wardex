@@ -44,6 +44,9 @@ pub enum Command {
         /// Only ended sessions that `send` can continue.
         #[arg(long)]
         resumable: bool,
+        /// Only sessions started by Wardex, adopted or forked.
+        #[arg(long, value_enum)]
+        origin: Option<Origin>,
     },
     /// Show a session's state, pending questions and resource usage.
     Status { id: String },
@@ -145,6 +148,45 @@ pub enum Command {
     /// transcript. ID: a Wardex session id, or an external session id
     /// (`claude:<uuid>`, `codex:<uuid>`, a uuid or a prefix of 8+ characters).
     History(HistoryArgs),
+    /// Take over a session started outside Wardex: a Wardex session bound to
+    /// the same native id, continued by `send`/`resume`. Prints its id.
+    Adopt(AdoptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdoptArgs {
+    /// `claude:<uuid>`, `codex:<uuid>`, a uuid or a unique prefix.
+    pub id: String,
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub task: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub reasoning: Option<String>,
+    /// Continue read-only (otherwise with Wardex's full permissions).
+    #[arg(long)]
+    pub readonly: bool,
+    /// Resume the session with this message right away.
+    #[arg(long, conflicts_with = "prompt_file")]
+    pub message: Option<String>,
+    /// Read the message from a file (`-` for stdin).
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    /// Adopt even if the session was written recently or its liveness is
+    /// unknown (never when it is live).
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Origin {
+    Wardex,
+    Adopted,
+    Forked,
 }
 
 #[derive(Debug, Subcommand)]
@@ -377,6 +419,7 @@ mod tests {
                 ended,
                 resumable,
                 all,
+                ..
             } => {
                 assert_eq!(agent.as_deref(), Some("agent-*"));
                 assert_eq!(task.as_deref(), Some("t?"));
@@ -447,6 +490,48 @@ mod tests {
         }
         assert_eq!(parse_age("90"), Ok(90));
         assert_eq!(parse_age("30m"), Ok(1800));
+    }
+
+    #[test]
+    fn adopt_and_origin_filter() {
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "adopt",
+            "claude:abcd1234",
+            "--readonly",
+            "--message",
+            "go on",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Adopt(a) => {
+                assert_eq!(a.id, "claude:abcd1234");
+                assert!(a.readonly && a.force);
+                assert_eq!(a.message.as_deref(), Some("go on"));
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "wardex",
+                "adopt",
+                "x",
+                "--message",
+                "m",
+                "--prompt-file",
+                "f"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(["wardex", "list", "-a", "--origin", "adopted"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::List {
+                origin: Some(Origin::Adopted),
+                ..
+            }
+        ));
     }
 
     #[test]

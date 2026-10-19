@@ -8,10 +8,10 @@ use clap::Parser;
 use serde_json::Value;
 use wardex_core::external::{ExternalSession, HistoryPage, ToolDetail};
 use wardex_core::manager::{
-    AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
+    AdoptOutcome, AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
 };
 use wardex_core::store::QuestionRow;
-use wardex_core::{Config, DriverKind, Event, RunSpec, SessionRecord};
+use wardex_core::{Config, DriverKind, Event, RunSpec, SessionOrigin, SessionRecord};
 use wardex_server::Client;
 use wardex_server::api::{Request, Response};
 use wardex_server::daemon::{Exit, Source};
@@ -134,13 +134,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Run(args) => {
             let prompt = match (&args.prompt, &args.prompt_file) {
                 (Some(p), _) => p.clone(),
-                (None, Some(path)) if path.as_os_str() == "-" => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    s
-                }
-                (None, Some(path)) => std::fs::read_to_string(path)
-                    .with_context(|| format!("cannot read {}", path.display()))?,
+                (None, Some(path)) => read_prompt_file(path)?,
                 (None, None) => bail!("--prompt or --prompt-file is required"),
             };
             let cwd = match &args.cwd {
@@ -183,6 +177,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             task,
             ended,
             resumable,
+            origin,
         } => {
             let resp = client
                 .request(&Request::List {
@@ -191,6 +186,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     task,
                     ended,
                     resumable,
+                    origin: origin.map(|o| match o {
+                        cli::Origin::Wardex => SessionOrigin::Wardex,
+                        cli::Origin::Adopted => SessionOrigin::Adopted,
+                        cli::Origin::Forked => SessionOrigin::Forked,
+                    }),
                 })
                 .await?;
             finish(json, resp, |v| {
@@ -447,6 +447,46 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 },
             )
         }
+        Command::Adopt(a) => {
+            let message = match (a.message, &a.prompt_file) {
+                (Some(m), _) => Some(m),
+                (None, Some(path)) => Some(read_prompt_file(path)?),
+                (None, None) => None,
+            };
+            let resp = client
+                .request(&Request::Adopt {
+                    id: a.id,
+                    driver: a.driver.map(driver_kind),
+                    agent: a.agent,
+                    task: a.task,
+                    model: a.model,
+                    reasoning: a.reasoning,
+                    readonly: a.readonly,
+                    message,
+                    force: a.force,
+                    via_mcp: false,
+                })
+                .await?;
+            finish(json, resp, |v| {
+                match serde_json::from_value::<AdoptOutcome>(v.clone()) {
+                    // Only the id goes to stdout, like `run`.
+                    Ok(out) => {
+                        for w in &out.warnings {
+                            eprintln!("warning: {w}");
+                        }
+                        let what = match (out.adopted, out.resumed) {
+                            (true, true) => "adopted and resumed",
+                            (true, false) => "adopted",
+                            (false, true) => "already managed; message sent",
+                            (false, false) => "already managed",
+                        };
+                        eprintln!("{} {what}", out.source.qualified_id());
+                        format!("{}\n", out.session.id)
+                    }
+                    Err(_) => output::json(v),
+                }
+            })
+        }
         Command::Overview { events } => {
             let resp = client
                 .request(&Request::Overview {
@@ -461,6 +501,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
     }
+}
+
+/// A prompt from a file, or from stdin for `-`.
+fn read_prompt_file(path: &std::path::Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        return Ok(s);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 fn driver_kind(d: cli::Driver) -> DriverKind {

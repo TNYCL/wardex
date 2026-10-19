@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use wardex_core::external::ToolDetail;
 use wardex_core::manager::{AnswerInput, Manager};
-use wardex_core::{DriverKind, RunSpec};
+use wardex_core::{DriverKind, RunSpec, SessionOrigin};
 
 use crate::Client;
 use crate::api::{self, DEFAULT_OVERVIEW_EVENTS, Request, Response};
@@ -38,7 +38,7 @@ so poll only when you have no webhook.";
 
 /// Tools for sessions started outside Wardex; listed only with
 /// `external.enabled` and `external.mcp`.
-const EXTERNAL_TOOLS: &[&str] = &["external_list", "history"];
+const EXTERNAL_TOOLS: &[&str] = &["external_list", "history", "adopt"];
 
 /// Inlined in the schema: some MCP clients do not resolve `$ref`.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -113,6 +113,32 @@ pub struct ListParams {
     /// pending scope cleanup, working directory still there).
     #[serde(default)]
     pub resumable: bool,
+    /// Only sessions of this origin.
+    #[serde(default)]
+    pub origin: Option<OriginArg>,
+}
+
+/// Inlined in the schema: some MCP clients do not resolve `$ref`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum OriginArg {
+    /// Started by Wardex.
+    Wardex,
+    /// An external session linked with `adopt`.
+    Adopted,
+    /// A fork of an external session.
+    Forked,
+}
+
+impl From<OriginArg> for SessionOrigin {
+    fn from(o: OriginArg) -> Self {
+        match o {
+            OriginArg::Wardex => SessionOrigin::Wardex,
+            OriginArg::Adopted => SessionOrigin::Adopted,
+            OriginArg::Forked => SessionOrigin::Forked,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -259,6 +285,31 @@ pub struct HistoryParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AdoptParams {
+    /// External session id: `claude:<uuid>`, `codex:<uuid>`, a uuid or a
+    /// unique prefix of 8+ characters (see `external_list`).
+    pub id: String,
+    #[serde(default)]
+    pub driver: Option<DriverArg>,
+    /// Label: who adopted the session.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Label: what the session is for.
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Continue read-only (otherwise with Wardex's full permissions).
+    #[serde(default)]
+    pub readonly: bool,
+    /// Resume the session with this message right away.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct OverviewParams {
     /// Latest events per live session. Default: 3.
     #[serde(default)]
@@ -392,6 +443,7 @@ impl WardexMcp {
             task: p.task,
             ended: p.ended,
             resumable: p.resumable,
+            origin: p.origin.map(Into::into),
         })
         .await
     }
@@ -548,6 +600,29 @@ impl WardexMcp {
             before: p.before,
             tools: p.tools.map(Into::into),
             max_bytes: p.max_bytes,
+            via_mcp: true,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Take over a session started outside Wardex: creates a Wardex session \
+                       (state stopped, origin adopted) bound to the same native id; `send` or \
+                       `message` continues it in a Wardex process. Refused while the session is \
+                       open elsewhere (live) or was written very recently (recent). Unless \
+                       `readonly`, it continues with full permissions."
+    )]
+    async fn adopt(&self, Parameters(p): Parameters<AdoptParams>) -> CallToolResult {
+        self.call(Request::Adopt {
+            id: p.id,
+            driver: p.driver.map(Into::into),
+            agent: p.agent,
+            task: p.task,
+            model: p.model,
+            reasoning: p.reasoning,
+            readonly: p.readonly,
+            message: p.message,
+            force: false,
             via_mcp: true,
         })
         .await

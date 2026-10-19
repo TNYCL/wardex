@@ -407,6 +407,8 @@ async fn external_sessions_over_mcp() {
     let mut config = Config::default();
     config.external.enabled = true;
     config.external.mcp = true;
+    // The fixtures may have been checked out moments ago.
+    config.external.quiet_secs = 0;
     let d = daemon(config).await;
     let client = connect(&d.url).await;
     let names = tool_names(&client).await;
@@ -438,6 +440,28 @@ async fn external_sessions_over_mcp() {
     let older = data(&call(&client, "history", json!({"id": "11111111", "before": "7"})).await);
     assert_eq!(older["items"][0]["text"], "Add a health check endpoint");
     assert!(error_text(&call(&client, "history", json!({"id": "1111"})).await).contains("invalid"));
+
+    // Adopt over MCP has no `force`; the session record is created.
+    let adopted = data(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "agent": "bot"}),
+        )
+        .await,
+    );
+    assert_eq!(adopted["adopted"], true);
+    assert_eq!(adopted["session"]["origin"], "adopted");
+    assert_eq!(adopted["session"]["state"], "stopped");
+    let tools = client.list_all_tools().await.unwrap();
+    let adopt = tools.iter().find(|t| t.name == "adopt").unwrap();
+    let props = adopt.input_schema.get("properties");
+    assert!(
+        props.and_then(|p| p.get("force")).is_none(),
+        "no force over MCP"
+    );
+    let listed = data(&call(&client, "list", json!({"all": true, "origin": "adopted"})).await);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
     client.cancel().await.unwrap();
     d.cancel.cancel();
 }

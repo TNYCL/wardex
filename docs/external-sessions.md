@@ -159,8 +159,10 @@ Admission rules:
 | `inactive` | allowed | allowed | allowed |
 
 An adopted session is probed again on every `resume` and implicit `send`
-resume, because the user may have opened it in a terminal in the meantime: a
-`live` result refuses the resume. The reverse (opening a session in a terminal
+resume, because the user may have opened it in a terminal in the meantime:
+registry or command-line evidence refuses the resume and nothing is started.
+The cwd heuristic alone does not block a resume (another Codex thread may be
+open in the same directory). The reverse (opening a session in a terminal
 while Wardex runs it) cannot be prevented; do not do it.
 
 ## History
