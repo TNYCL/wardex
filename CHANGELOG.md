@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-19
+
+First functional release (Phases 1 and 2 of `docs/SCOPE.md`). 0.0.1 was a
+skeleton with stub commands.
+
 ### Added
 
 - External sessions (`docs/external-sessions.md`, off by default): with
@@ -188,6 +193,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- README rewritten for first-time users: requirements, install, quick start,
+  MCP client setup and an architecture diagram, with absolute links so it
+  renders on crates.io. Published crates contain only sources, migrations
+  and license files.
 - `sessions.idle_shutdown_secs` now defaults to 43200 (12 h) instead of 900,
   so a follow-up `send` usually reaches a process that still has its context
   loaded. Each idle agent process keeps its memory meanwhile (roughly
