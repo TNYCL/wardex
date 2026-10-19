@@ -9,6 +9,7 @@ pub mod git;
 pub mod glob;
 pub mod manager;
 pub mod process;
+pub mod procscan;
 pub mod session;
 pub mod store;
 pub mod time;
