@@ -475,6 +475,150 @@ fn run_prints_only_the_id_on_stdout() {
     env.stop_daemon(daemon);
 }
 
+/// `[external]` pointing at the synthetic store fixtures.
+fn external_config(mcp: bool) -> String {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wardex-drivers/tests/fixtures");
+    format!(
+        "[external]\nenabled = true\nmcp = {mcp}\nquiet_secs = 0\nclaude_home = \"{}\"\ncodex_home = \"{}\"\n",
+        fixtures.join("claude/store").display(),
+        fixtures.join("codex/store").display()
+    )
+}
+
+#[test]
+fn external_sessions_from_the_cli() {
+    let off = Env::new("question");
+    let daemon = off.start_daemon();
+    let out = off.run(&["external", "list"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("external.enabled"));
+    off.stop_daemon(daemon);
+
+    let env = Env::with_config("question", &external_config(false));
+    let daemon = env.start_daemon();
+    let list = env.json(&["external", "list"]);
+    let ids: Vec<&str> = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["native_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 7, "{ids:?}");
+    let list = env.json(&[
+        "external",
+        "list",
+        "--driver",
+        "codex",
+        "--cwd",
+        "/work/svc",
+        "--under",
+    ]);
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 3);
+
+    let out = env.run(&["external", "list", "--cwd", "/work/app"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("11111111") && text.contains("Health check"),
+        "{text}"
+    );
+    assert!(!text.contains("22222222"), "{text}");
+
+    let page = env.json(&["history", "claude:11111111", "--turns", "1"]);
+    assert_eq!(page["items"][0]["text"], "Run the tests");
+    let out = env.run(&["history", "11111111", "--format", "markdown"]);
+    let md = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        md.starts_with("# Conversation context: claude session"),
+        "{md}"
+    );
+    assert!(md.contains("**User:** Add a health check endpoint"), "{md}");
+    assert!(md.contains("- Tool Bash: cargo test -> failed"), "{md}");
+    let out = env.run(&["history", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a01"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("> Fix the flaky login test"), "{text}");
+    assert!(
+        text.contains("$ shell: cargo test login -> failed"),
+        "{text}"
+    );
+    let out = env.run(&["history", "0199a1b2"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("several"));
+
+    // Adopt prints only the Wardex id; a second adopt returns the same one.
+    let out = env.run(&["adopt", "claude:33333333", "--agent", "me"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(id.len(), 8, "{id}");
+    let notes = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        notes.contains("adopted") && notes.contains("full permissions"),
+        "{notes}"
+    );
+    let again = env.json(&["adopt", "33333333-3333-4333-8333-333333333333"]);
+    assert_eq!(again["adopted"], false);
+    assert_eq!(again["session"]["id"], id.as_str());
+    let adopted = env.json(&["list", "-a", "--origin", "adopted"]);
+    assert_eq!(adopted.as_array().unwrap().len(), 1);
+    assert_eq!(adopted[0]["ended_reason"], "adopted");
+    let out = env.run(&["list", "-a"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("stopped (adopted)"));
+    // The transcript is still read through the Wardex id.
+    let page = env.json(&["history", &id]);
+    assert_eq!(page["items"][0]["text"], "What is in this directory?");
+
+    // Forks are new sessions every time; the fork runs on the next send.
+    let out = env.run(&["adopt", "--fork", "claude:33333333"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("fork created"));
+    let fork = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_ne!(fork, id);
+    let status = env.json(&["status", &fork]);
+    assert_eq!(status["origin"], "forked");
+    assert_eq!(
+        status["forked_from"],
+        "33333333-3333-4333-8333-333333333333"
+    );
+    // The fixture's cwd does not exist here, so starting the fork fails
+    // after the record is created, and says so.
+    let out = env.run(&["run", "--fork-from", "claude:33333333", "--prompt", "go"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("adopted as session") && err.contains("no longer exists"),
+        "{err}"
+    );
+    env.stop_daemon(daemon);
+}
+
+/// The stdio MCP server asks the daemon whether to list the external tools.
+#[test]
+fn mcp_over_stdio_lists_external_tools_only_when_exposed() {
+    use rmcp::ServiceExt;
+    use rmcp::transport::TokioChildProcess;
+
+    for (mcp, expected) in [(false, 13), (true, 16)] {
+        let env = Env::with_config("question", &external_config(mcp));
+        let daemon = env.start_daemon();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let cmd = tokio::process::Command::from(env.cmd(&["mcp", "--stdio"]));
+        let client = rt
+            .block_on(().serve(TokioChildProcess::new(cmd).unwrap()))
+            .expect("mcp handshake");
+        let tools = rt.block_on(client.list_all_tools()).unwrap();
+        assert_eq!(tools.len(), expected, "mcp = {mcp}");
+        rt.block_on(client.cancel()).unwrap();
+        env.stop_daemon(daemon);
+    }
+}
+
 /// `wardex mcp --stdio` as an MCP client would spawn it (e.g. over ssh):
 /// tools forward to the daemon; without a daemon they report it.
 #[test]

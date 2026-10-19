@@ -93,6 +93,7 @@ pub fn spawn_with<P: Protocol>(
     Ok(DriverHandle {
         pid,
         unit,
+        driver_session_id: None,
         commands: cmd_tx,
         events: ev_rx,
     })

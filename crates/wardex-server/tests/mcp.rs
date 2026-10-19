@@ -19,11 +19,11 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use wardex_core::manager::Manager;
+use wardex_core::manager::{ExternalSetup, Manager};
 use wardex_core::process::Launcher;
 use wardex_core::store::Store;
 use wardex_core::{Config, SessionState};
-use wardex_drivers::ClaudeDriver;
+use wardex_drivers::{ClaudeDriver, ClaudeStore};
 use wardex_server::http;
 use wardex_server::webhook::{Target, spawn_target};
 
@@ -65,7 +65,14 @@ async fn daemon(config: Config) -> Daemon {
         "sh",
         vec![script.to_string_lossy().into_owned()],
     ));
-    let manager = Manager::new(config, store, vec![driver], Launcher::direct());
+    // The synthetic transcript fixtures as the external Claude store.
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../wardex-drivers/tests/fixtures/claude/store");
+    let external = ExternalSetup {
+        sources: vec![Arc::new(ClaudeStore::new(fixtures, 16 * 1024 * 1024))],
+        ..Default::default()
+    };
+    let manager = Manager::with_external(config, store, vec![driver], Launcher::direct(), external);
     let cancel = CancellationToken::new();
     let app = http::router(manager.clone(), TOKEN, cancel.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -357,6 +364,129 @@ fn run_id(id: &str) -> wardex_core::SessionId {
 
 /// Clients on an older protocol version use plain JSON-RPC POSTs without a
 /// session id.
+async fn tool_names(client: &RunningService<RoleClient, ()>) -> Vec<String> {
+    client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn external_tools_need_both_switches() {
+    let mut only_enabled = Config::default();
+    only_enabled.external.enabled = true;
+    for config in [Config::default(), only_enabled] {
+        let d = daemon(config).await;
+        let client = connect(&d.url).await;
+        let names = tool_names(&client).await;
+        assert!(names.contains(&"overview".to_string()));
+        assert!(
+            !names.iter().any(|n| n == "external_list" || n == "history"),
+            "{names:?}"
+        );
+        let refused = client
+            .call_tool(
+                CallToolRequestParams::new("history")
+                    .with_arguments(json!({"id": "11111111"}).as_object().unwrap().clone()),
+            )
+            .await;
+        assert!(
+            refused.is_err() || refused.unwrap().is_error == Some(true),
+            "hidden tools are not callable"
+        );
+        client.cancel().await.unwrap();
+        d.cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn external_sessions_over_mcp() {
+    let mut config = Config::default();
+    config.external.enabled = true;
+    config.external.mcp = true;
+    // The fixtures may have been checked out moments ago.
+    config.external.quiet_secs = 0;
+    let d = daemon(config).await;
+    let client = connect(&d.url).await;
+    let names = tool_names(&client).await;
+    assert!(names.contains(&"external_list".to_string()));
+    assert!(names.contains(&"history".to_string()));
+
+    let list = data(&call(&client, "external_list", json!({"cwd": "/work/app"})).await);
+    let sessions = list["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0]["native_id"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(sessions[0]["liveness"]["state"], "inactive");
+    assert!(sessions[0].get("path").is_none());
+
+    let page = data(
+        &call(
+            &client,
+            "history",
+            json!({"id": "claude:11111111", "turns": 1, "tools": "full"}),
+        )
+        .await,
+    );
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items[0]["text"], "Run the tests");
+    assert_eq!(page["next_before"], "7");
+    assert!(page.to_string().contains("API_KEY=[REDACTED]"));
+    let older = data(&call(&client, "history", json!({"id": "11111111", "before": "7"})).await);
+    assert_eq!(older["items"][0]["text"], "Add a health check endpoint");
+    assert!(error_text(&call(&client, "history", json!({"id": "1111"})).await).contains("invalid"));
+
+    // Adopt over MCP has no `force`; the session record is created.
+    let adopted = data(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "agent": "bot"}),
+        )
+        .await,
+    );
+    assert_eq!(adopted["adopted"], true);
+    assert_eq!(adopted["session"]["origin"], "adopted");
+    assert_eq!(adopted["session"]["state"], "stopped");
+    let tools = client.list_all_tools().await.unwrap();
+    let adopt = tools.iter().find(|t| t.name == "adopt").unwrap();
+    let props = adopt.input_schema.get("properties");
+    assert!(
+        props.and_then(|p| p.get("force")).is_none(),
+        "no force over MCP"
+    );
+    let listed = data(&call(&client, "list", json!({"all": true, "origin": "adopted"})).await);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let forked = data(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "fork": true}),
+        )
+        .await,
+    );
+    assert_eq!(forked["session"]["origin"], "forked");
+    assert_ne!(forked["session"]["id"], adopted["session"]["id"]);
+    // With a message the fork starts at once; the fixture's cwd does not
+    // exist here, so that fails after the record is created.
+    let err = error_text(
+        &call(
+            &client,
+            "adopt",
+            json!({"id": "claude:33333333", "fork": true, "message": "go"}),
+        )
+        .await,
+    );
+    assert!(err.contains("adopted as session"), "{err}");
+    client.cancel().await.unwrap();
+    d.cancel.cancel();
+}
+
 #[tokio::test]
 async fn stateless_json_rpc_with_older_protocol() {
     let d = daemon(Config::default()).await;

@@ -1,0 +1,4 @@
+{"type":"user","uuid":"v1","parentUuid":null,"timestamp":"2026-10-01T10:00:00.000Z","isSidechain":false,"message":{"role":"user","content":"Explain the build"},"sessionId":"22222222-2222-4222-8222-222222222222","cwd":"/work/app-b","version":"2.1.999","entrypoint":"claude-desktop","gitBranch":"main","userType":"external"}
+{"type":"assistant","uuid":"w1","parentUuid":"v1","timestamp":"2026-10-01T10:01:00.000Z","isSidechain":false,"requestId":"req_synthetic","message":{"id":"msg_w1","role":"assistant","model":"claude-synthetic","content":[{"type":"text","text":"It uses cargo."}],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}},"sessionId":"22222222-2222-4222-8222-222222222222","cwd":"/work/app-b/sub","version":"2.1.999","entrypoint":"cli","gitBranch":"main","userType":"external"}
+{"type":"continued-in","continuedInSessionId":"44444444-4444-4444-8444-444444444444","sessionId":"22222222-2222-4222-8222-222222222222"}
+{"type":"user","uuid":"v2","parentUu

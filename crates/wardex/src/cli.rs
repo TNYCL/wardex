@@ -44,6 +44,9 @@ pub enum Command {
         /// Only ended sessions that `send` can continue.
         #[arg(long)]
         resumable: bool,
+        /// Only sessions started by Wardex, adopted or forked.
+        #[arg(long, value_enum)]
+        origin: Option<Origin>,
     },
     /// Show a session's state, pending questions and resource usage.
     Status { id: String },
@@ -136,6 +139,149 @@ pub enum Command {
         #[arg(short = 'n', long, default_value_t = 3)]
         events: i64,
     },
+    /// Sessions started outside Wardex (needs `external.enabled`).
+    External {
+        #[command(subcommand)]
+        action: ExternalAction,
+    },
+    /// Print a session's native conversation, read from the CLI's
+    /// transcript. ID: a Wardex session id, or an external session id
+    /// (`claude:<uuid>`, `codex:<uuid>`, a uuid or a prefix of 8+ characters).
+    History(HistoryArgs),
+    /// Take over a session started outside Wardex: a Wardex session bound to
+    /// the same native id, continued by `send`/`resume`. Prints its id.
+    Adopt(AdoptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdoptArgs {
+    /// `claude:<uuid>`, `codex:<uuid>`, a uuid or a unique prefix.
+    pub id: String,
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub task: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub reasoning: Option<String>,
+    /// Continue read-only (otherwise with Wardex's full permissions).
+    #[arg(long)]
+    pub readonly: bool,
+    /// Resume the session with this message right away.
+    #[arg(long, conflicts_with = "prompt_file")]
+    pub message: Option<String>,
+    /// Read the message from a file (`-` for stdin).
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    /// Adopt even if the session was written recently or its liveness is
+    /// unknown (never when it is live).
+    #[arg(long, conflicts_with = "fork")]
+    pub force: bool,
+    /// Branch a new session off it instead; the original is only read, so
+    /// this works while it is open elsewhere.
+    #[arg(long)]
+    pub fork: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Origin {
+    Wardex,
+    Adopted,
+    Forked,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExternalAction {
+    /// List sessions found in the Claude Code and Codex stores, newest first.
+    List(ExternalListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExternalListArgs {
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    /// Only sessions that started in DIR.
+    #[arg(long, value_name = "DIR", conflicts_with = "here")]
+    pub cwd: Option<PathBuf>,
+    /// Only sessions that started in the current directory.
+    #[arg(long)]
+    pub here: bool,
+    /// With --cwd or --here: also sessions in directories below it.
+    #[arg(long)]
+    pub under: bool,
+    /// Only sessions written within AGE (e.g. 90s, 30m, 12h, 7d).
+    #[arg(long, value_name = "AGE", value_parser = parse_age)]
+    pub since: Option<u64>,
+    /// Maximum number of sessions.
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub limit: usize,
+    /// Also sessions this Wardex already manages.
+    #[arg(long)]
+    pub include_managed: bool,
+    /// Also archived sessions (Codex).
+    #[arg(long)]
+    pub archived: bool,
+    /// Also subagent threads (Codex).
+    #[arg(long)]
+    pub include_subagents: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    pub id: String,
+    #[arg(long, value_enum)]
+    pub driver: Option<Driver>,
+    /// Turns (prompts) to show.
+    #[arg(long, default_value_t = 20)]
+    pub turns: usize,
+    /// Show the turns before this cursor (`next_before` of a page).
+    #[arg(long, value_name = "CURSOR")]
+    pub before: Option<String>,
+    /// How much of each tool call to show.
+    #[arg(long, value_enum, default_value_t = ToolsArg::Summary)]
+    pub tools: ToolsArg,
+    /// `markdown` is a context summary another agent can take as a prompt.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+    /// Byte budget for the shown items (default 64 KiB).
+    #[arg(long, value_name = "BYTES")]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ToolsArg {
+    None,
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    Text,
+    Markdown,
+    Json,
+}
+
+/// `90`, `90s`, `30m`, `12h` or `7d` as seconds.
+fn parse_age(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("invalid age {s:?}"))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Err(format!("invalid age {s:?}; use s, m, h, d or w")),
+    };
+    Ok(n.saturating_mul(mult))
 }
 
 #[derive(Debug, Args)]
@@ -177,8 +323,16 @@ pub enum DaemonAction {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    #[arg(long, value_enum)]
-    pub driver: Driver,
+    #[arg(long, value_enum, required_unless_present = "fork_from")]
+    pub driver: Option<Driver>,
+    /// Fork this external session (`wardex external list`) and continue
+    /// the fork with the prompt; same as `adopt --fork --message`.
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["cwd", "worktree", "slice"]
+    )]
+    pub fork_from: Option<String>,
     #[arg(long)]
     pub model: Option<String>,
     /// Reasoning effort (passed through to the driver).
@@ -240,6 +394,41 @@ mod tests {
         assert!(
             Cli::try_parse_from(["wardex", "run", "--driver", "codex", "--prompt", "hi"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["wardex", "run", "--prompt", "hi"]).is_err());
+    }
+
+    #[test]
+    fn run_fork_from() {
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "run",
+            "--fork-from",
+            "claude:abcd1234",
+            "--prompt",
+            "go",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(r) => {
+                assert_eq!(r.fork_from.as_deref(), Some("claude:abcd1234"));
+                assert!(r.driver.is_none());
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "wardex",
+                "run",
+                "--fork-from",
+                "x",
+                "--prompt",
+                "go",
+                "--worktree",
+                "w"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["wardex", "adopt", "x", "--fork", "--force"]).is_err());
     }
 
     #[test]
@@ -277,6 +466,7 @@ mod tests {
                 ended,
                 resumable,
                 all,
+                ..
             } => {
                 assert_eq!(agent.as_deref(), Some("agent-*"));
                 assert_eq!(task.as_deref(), Some("t?"));
@@ -304,6 +494,91 @@ mod tests {
         assert!(Cli::try_parse_from(["wardex", "send", "ab12", "next"]).is_ok());
         // Label patterns select a session only with --latest.
         assert!(Cli::try_parse_from(["wardex", "send", "--agent", "a", "ab12", "next"]).is_err());
+    }
+
+    #[test]
+    fn external_list_and_history() {
+        let cli = Cli::try_parse_from([
+            "wardex", "external", "list", "--here", "--under", "--since", "7d", "-n", "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::External {
+                action: ExternalAction::List(a),
+            } => {
+                assert!(a.here && a.under);
+                assert_eq!(a.since, Some(7 * 86_400));
+                assert_eq!(a.limit, 5);
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wardex", "external", "list", "--here", "--cwd", "/x"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["wardex", "external", "list", "--since", "3y"]).is_err());
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "history",
+            "claude:abcd1234",
+            "--tools",
+            "full",
+            "--format",
+            "markdown",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::History(h) => {
+                assert_eq!(h.id, "claude:abcd1234");
+                assert_eq!(h.tools, ToolsArg::Full);
+                assert_eq!(h.format, Format::Markdown);
+                assert_eq!(h.turns, 20);
+            }
+            c => panic!("{c:?}"),
+        }
+        assert_eq!(parse_age("90"), Ok(90));
+        assert_eq!(parse_age("30m"), Ok(1800));
+    }
+
+    #[test]
+    fn adopt_and_origin_filter() {
+        let cli = Cli::try_parse_from([
+            "wardex",
+            "adopt",
+            "claude:abcd1234",
+            "--readonly",
+            "--message",
+            "go on",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Adopt(a) => {
+                assert_eq!(a.id, "claude:abcd1234");
+                assert!(a.readonly && a.force);
+                assert_eq!(a.message.as_deref(), Some("go on"));
+            }
+            c => panic!("{c:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "wardex",
+                "adopt",
+                "x",
+                "--message",
+                "m",
+                "--prompt-file",
+                "f"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(["wardex", "list", "-a", "--origin", "adopted"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::List {
+                origin: Some(Origin::Adopted),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -13,12 +13,17 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::config::SessionsConfig;
 use crate::driver::{Driver, DriverCommand, DriverError, DriverEvent, READONLY_PREFIX, SpawnSpec};
+use crate::external::{
+    ExternalError, ExternalFilter, ExternalSession, ExternalSource, HistoryPage, HistoryQuery,
+    LiveEvidence, Liveness, cwd_matches, normalize_cwd,
+};
 use crate::process::{self, Launcher};
+use crate::procscan::{ProbeConfig, ProcSnapshot};
 use crate::store::{Persistence, PublicationPermit, QuestionRow, Store, StoreError};
 use crate::time::now_ms;
 use crate::{
-    Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter, RunSpec,
-    SessionId, SessionRecord, SessionState, StuckReason, ToolStatus, git,
+    AdoptSpec, Answer, Config, DriverKind, EndReason, Event, EventKind, GitState, ListFilter,
+    RunSpec, SessionId, SessionOrigin, SessionRecord, SessionState, StuckReason, ToolStatus, git,
 };
 
 const BROADCAST_CAPACITY: usize = 8192;
@@ -50,9 +55,43 @@ pub enum ManagerError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Driver(#[from] DriverError),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<ExternalError> for ManagerError {
+    fn from(e: ExternalError) -> Self {
+        match e {
+            ExternalError::NotFound(id) => Self::NotFound(id),
+            ExternalError::Ambiguous(id) => Self::Ambiguous(id),
+            other => Self::Invalid(other.to_string()),
+        }
+    }
 }
 
 pub type Result<T, E = ManagerError> = std::result::Result<T, E>;
+
+/// Stores of sessions started outside Wardex, and where to look for live
+/// processes (`docs/external-sessions.md`).
+pub struct ExternalSetup {
+    pub sources: Vec<Arc<dyn ExternalSource>>,
+    /// Usually `/proc`.
+    pub proc_root: PathBuf,
+}
+
+impl Default for ExternalSetup {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            proc_root: PathBuf::from("/proc"),
+        }
+    }
+}
+
+const DEFAULT_EXTERNAL_LIMIT: usize = 50;
+const MAX_EXTERNAL_LIMIT: usize = 500;
+/// Shortest native id prefix accepted for external sessions.
+const MIN_EXTERNAL_PREFIX: usize = 8;
 
 /// How a caller answers a pending question or approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +107,17 @@ pub enum AnswerInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub session: SessionRecord,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptOutcome {
+    pub session: SessionRecord,
+    /// False when this daemon already managed the session.
+    pub adopted: bool,
+    /// The session was resumed with the given message.
+    pub resumed: bool,
+    pub source: ExternalSession,
     pub warnings: Vec<String>,
 }
 
@@ -341,6 +391,10 @@ struct Inner {
     store: Store,
     drivers: HashMap<DriverKind, Arc<dyn Driver>>,
     launcher: Launcher,
+    external: Vec<Arc<dyn ExternalSource>>,
+    probe: ProbeConfig,
+    /// One adopt at a time, so a native id gets one Wardex session.
+    adopt_lock: tokio::sync::Mutex<()>,
     live: Mutex<HashMap<SessionId, Live>>,
     records: Mutex<HashMap<SessionId, SessionRecord>>,
     read_warning: Mutex<Option<String>>,
@@ -473,14 +527,37 @@ impl Manager {
         drivers: Vec<Arc<dyn Driver>>,
         launcher: Launcher,
     ) -> Self {
+        Self::with_external(config, store, drivers, launcher, ExternalSetup::default())
+    }
+
+    /// A manager that can also read sessions started outside Wardex.
+    pub fn with_external(
+        config: Config,
+        store: Store,
+        drivers: Vec<Arc<dyn Driver>>,
+        launcher: Launcher,
+        external: ExternalSetup,
+    ) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let drivers = drivers.into_iter().map(|d| (d.kind(), d)).collect();
+        let probe = ProbeConfig {
+            proc_root: external.proc_root,
+            claude_root: external
+                .sources
+                .iter()
+                .find(|s| s.kind() == DriverKind::Claude)
+                .map(|s| s.root().to_path_buf()),
+            quiet_secs: config.external.quiet_secs,
+        };
         Self {
             inner: Arc::new(Inner {
                 config,
                 store,
                 drivers,
                 launcher,
+                external: external.sources,
+                probe,
+                adopt_lock: tokio::sync::Mutex::new(()),
                 live: Mutex::new(HashMap::new()),
                 records: Mutex::new(HashMap::new()),
                 read_warning: Mutex::new(None),
@@ -861,10 +938,13 @@ impl Manager {
             resume_with_prompt: false,
             cleanup_failed: false,
             ended_reason: None,
+            origin: SessionOrigin::Wardex,
+            forked_from: None,
+            adopted_ms: None,
         };
         let initial_publication = self.inner.store.reserve_publication()?;
         self.inner.store.insert_session(&record).await?;
-        if let Err(e) = self.spawn_process(&mut record, None) {
+        if let Err(e) = self.spawn_process(&mut record, None, false) {
             record.state = SessionState::Error;
             record.ended_ms = Some(now_ms());
             record.ended_reason = Some(EndReason::Error);
@@ -886,7 +966,12 @@ impl Manager {
     }
 
     /// Spawn a process for `record` and register it as live.
-    fn spawn_process(&self, record: &mut SessionRecord, resume: Option<String>) -> Result<()> {
+    fn spawn_process(
+        &self,
+        record: &mut SessionRecord,
+        resume: Option<String>,
+        fork: bool,
+    ) -> Result<()> {
         // Serialize process registration with the daemon shutdown gate.
         let _starting = self
             .inner
@@ -911,10 +996,14 @@ impl Manager {
             reasoning: record.reasoning.clone(),
             readonly: record.readonly,
             resume,
+            fork,
             slice: record.slice.clone(),
             unit: format!("wardex-{}-{}", record.id, record.spawn_count),
         };
         let handle = driver.spawn(spec, &self.inner.launcher)?;
+        if handle.driver_session_id.is_some() {
+            record.driver_session_id = handle.driver_session_id.clone();
+        }
         record.pid = handle.pid;
         record.unit = handle.unit.clone();
         record.state = SessionState::Starting;
@@ -1346,6 +1435,236 @@ impl Manager {
         {
             tracing::warn!(session = %id, error = %e, "worktree kept");
         }
+    }
+
+    /// External sessions are enabled, and over MCP only when allowed.
+    fn external_allowed(&self, via_mcp: bool) -> Result<()> {
+        let e = &self.inner.config.external;
+        if !e.enabled {
+            return Err(ManagerError::Invalid(
+                "external sessions are disabled; set external.enabled = true in the config".into(),
+            ));
+        }
+        if via_mcp && !e.mcp {
+            return Err(ManagerError::Invalid(
+                "external sessions are not exposed over MCP; set external.mcp = true in the config"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Pids of this daemon's agent processes; never evidence of an
+    /// external writer.
+    fn own_pids(&self) -> HashSet<u32> {
+        self.live().values().filter_map(|l| l.record.pid).collect()
+    }
+
+    /// Run blocking store and `/proc` reads off the async workers.
+    async fn blocking<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| ManagerError::Internal(format!("external store task failed: {e}")))?
+    }
+
+    fn external_source(&self, kind: DriverKind) -> Result<Arc<dyn ExternalSource>> {
+        self.inner
+            .external
+            .iter()
+            .find(|s| s.kind() == kind)
+            .cloned()
+            .ok_or_else(|| {
+                ManagerError::Invalid(format!("no {} session store is configured", kind.as_str()))
+            })
+    }
+
+    /// `external.cwd_allow` admits sessions in `cwd` (normalized).
+    fn cwd_allowed(allow: &[String], cwd: &Path) -> bool {
+        let cwd = cwd.to_string_lossy();
+        allow.is_empty() || allow.iter().any(|p| crate::glob::glob(p, &cwd))
+    }
+
+    /// Mark sessions this daemon manages and flag Codex threads another
+    /// Wardex daemon started.
+    async fn mark_managed(&self, sessions: &mut [ExternalSession]) -> Result<()> {
+        let managed = self.inner.store.managed_driver_ids().await?;
+        for s in sessions {
+            s.managed_by = managed.get(&(s.driver, s.native_id.clone())).cloned();
+            if s.managed_by.is_none() && s.entrypoint.as_deref() == Some("wardex") {
+                s.warnings
+                    .push("started by a Wardex daemon that does not manage it".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sessions started outside Wardex, newest first, with their liveness.
+    pub async fn external_list(
+        &self,
+        filter: ExternalFilter,
+        via_mcp: bool,
+    ) -> Result<Vec<ExternalSession>> {
+        self.external_allowed(via_mcp)?;
+        let sources = self.inner.external.clone();
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let allow = self.inner.config.external.cwd_allow.clone();
+        let f = filter.clone();
+        let (mut sessions, snapshot) = Self::blocking(move || {
+            let want = f.cwd.as_deref().map(normalize_cwd);
+            let mut out = Vec::new();
+            for source in sources
+                .iter()
+                .filter(|s| f.driver.is_none_or(|d| d == s.kind()))
+            {
+                out.extend(source.discover(&f)?.into_iter().filter(|s| {
+                    let cwd = normalize_cwd(&s.cwd);
+                    Self::cwd_allowed(&allow, &cwd)
+                        && want
+                            .as_deref()
+                            .is_none_or(|w| cwd_matches(&cwd, w, f.under))
+                }));
+            }
+            Ok((out, ProcSnapshot::take(&probe, &pids)))
+        })
+        .await?;
+        self.mark_managed(&mut sessions).await?;
+        if !filter.include_managed {
+            sessions.retain(|s| s.managed_by.is_none());
+        }
+        sessions.sort_by(|a, b| {
+            b.updated_ms
+                .cmp(&a.updated_ms)
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        });
+        sessions.truncate(
+            filter
+                .limit
+                .unwrap_or(DEFAULT_EXTERNAL_LIMIT)
+                .clamp(1, MAX_EXTERNAL_LIMIT),
+        );
+        let now = now_ms();
+        for s in &mut sessions {
+            s.liveness = snapshot.liveness(s, now);
+        }
+        Ok(sessions)
+    }
+
+    /// Resolve `claude:<id>`, `codex:<id>`, a full id or a unique prefix of
+    /// at least 8 characters to an external session, with fresh metadata
+    /// and liveness.
+    pub async fn resolve_external(
+        &self,
+        id: &str,
+        driver: Option<DriverKind>,
+    ) -> Result<ExternalSession> {
+        let id = id.trim();
+        let (driver, prefix) = match id.split_once(':') {
+            Some((d, rest)) => {
+                let kind = DriverKind::parse(d).ok_or_else(|| {
+                    ManagerError::Invalid(format!("unknown driver prefix in {id:?}"))
+                })?;
+                if driver.is_some_and(|other| other != kind) {
+                    return Err(ManagerError::Invalid(format!(
+                        "{id:?} does not match the requested driver"
+                    )));
+                }
+                (Some(kind), rest)
+            }
+            None => (driver, id),
+        };
+        if prefix.len() < MIN_EXTERNAL_PREFIX {
+            return Err(ManagerError::Invalid(format!(
+                "external session ids need at least {MIN_EXTERNAL_PREFIX} characters"
+            )));
+        }
+        if !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Err(ManagerError::NotFound(id.into()));
+        }
+        let sources = self.inner.external.clone();
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let allow = self.inner.config.external.cwd_allow.clone();
+        let prefix = prefix.to_string();
+        let wanted = id.to_string();
+        let (mut session, snapshot) = Self::blocking(move || {
+            let mut found = Vec::new();
+            for source in sources
+                .iter()
+                .filter(|s| driver.is_none_or(|d| d == s.kind()))
+            {
+                found.extend(source.find(&prefix)?);
+            }
+            found.retain(|s| Self::cwd_allowed(&allow, &normalize_cwd(&s.cwd)));
+            let session = match found.len() {
+                0 => return Err(ManagerError::NotFound(wanted)),
+                1 => found.remove(0),
+                _ => {
+                    let exact: Vec<_> = found
+                        .into_iter()
+                        .filter(|s| s.native_id == prefix)
+                        .collect();
+                    match <[ExternalSession; 1]>::try_from(exact) {
+                        Ok([s]) => s,
+                        Err(_) => return Err(ManagerError::Ambiguous(wanted)),
+                    }
+                }
+            };
+            Ok((session, ProcSnapshot::take(&probe, &pids)))
+        })
+        .await?;
+        self.mark_managed(std::slice::from_mut(&mut session))
+            .await?;
+        session.liveness = snapshot.liveness(&session, now_ms());
+        Ok(session)
+    }
+
+    /// The native session behind a Wardex session id, if `id` is one.
+    async fn native_of(&self, id: &str) -> Result<Option<(DriverKind, String)>> {
+        let id = SessionId(id.trim().to_string());
+        let record = match self.record(&id).await {
+            Ok(r) => r,
+            Err(ManagerError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // A fork that has not run yet shows its source.
+        let native = record
+            .driver_session_id
+            .clone()
+            .or_else(|| record.forked_from.clone())
+            .ok_or_else(|| {
+                ManagerError::Conflict(format!("session {id} has no native session id yet"))
+            })?;
+        Ok(Some((record.driver, native)))
+    }
+
+    /// A page of a session's native conversation, read from its transcript.
+    /// `id` is a Wardex session id (exact) or an external session id.
+    pub async fn history(
+        &self,
+        id: &str,
+        driver: Option<DriverKind>,
+        mut query: HistoryQuery,
+        via_mcp: bool,
+    ) -> Result<HistoryPage> {
+        self.external_allowed(via_mcp)?;
+        let session = match self.native_of(id).await? {
+            Some((kind, native)) => self.resolve_external(&native, Some(kind)).await?,
+            None => self.resolve_external(id, driver).await?,
+        };
+        query.redact = self.inner.config.external.redact;
+        let source = self.external_source(session.driver)?;
+        let mut page = Self::blocking(move || {
+            let history = source.read_history(&session)?;
+            Ok(crate::external::page(session, history, &query)?)
+        })
+        .await?;
+        if page.session.liveness.is_live() {
+            page.warnings.push("live".into());
+        }
+        Ok(page)
     }
 
     pub async fn list(&self, all: bool) -> Result<Vec<SessionView>> {
@@ -1849,11 +2168,22 @@ impl Manager {
                 record.cwd.display()
             )));
         }
-        let resume_id = record.driver_session_id.clone().ok_or_else(|| {
-            ManagerError::Conflict(format!(
-                "session {id} cannot be resumed: the agent never reported a session id"
-            ))
-        })?;
+        // A fork that has not run yet branches off its source; the source is
+        // only read, so it may be open elsewhere.
+        let (resume_id, fork) = match (&record.driver_session_id, &record.forked_from) {
+            (Some(native), _) => (native.clone(), false),
+            (None, Some(source)) if record.origin == SessionOrigin::Forked => {
+                (source.clone(), true)
+            }
+            _ => {
+                return Err(ManagerError::Conflict(format!(
+                    "session {id} cannot be resumed: the agent never reported a session id"
+                )));
+            }
+        };
+        if record.origin != SessionOrigin::Wardex && !fork {
+            self.check_not_open_elsewhere(&record, &resume_id).await?;
+        }
         record.last_seq = record.last_seq.max(self.inner.store.max_seq(id).await?);
         record.last_error = None;
         record.resume_pending = false;
@@ -1863,12 +2193,239 @@ impl Manager {
         } else {
             None
         };
-        self.spawn_process(&mut record, Some(resume_id))?;
+        self.spawn_process(&mut record, Some(resume_id), fork)?;
         if let Some(text) = message {
             self.deliver(id, text, true, publication)?;
         }
         self.finish_action().await;
         self.record(id).await
+    }
+
+    /// Refuse to continue a session that came from outside Wardex while a CLI
+    /// process has it open (registry or command-line evidence; the cwd
+    /// heuristic alone does not block a resume). The user may have reopened
+    /// it in a terminal since it was adopted.
+    async fn check_not_open_elsewhere(&self, record: &SessionRecord, native: &str) -> Result<()> {
+        let session = ExternalSession::probe_only(record.driver, native, &record.cwd);
+        let probe = self.inner.probe.clone();
+        let pids = self.own_pids();
+        let liveness = Self::blocking(move || {
+            Ok(ProcSnapshot::take(&probe, &pids).liveness(&session, now_ms()))
+        })
+        .await?;
+        match liveness {
+            Liveness::Live {
+                pid,
+                evidence: LiveEvidence::Registry | LiveEvidence::Cmdline,
+            } => Err(ManagerError::Conflict(format!(
+                "session {} cannot be resumed: {} session {native} is open in process {pid}; \
+                 close it there first (nothing was started)",
+                record.id,
+                record.driver.as_str()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Link an external session to a new Wardex session (state `stopped`,
+    /// `ended_reason: adopted`), so `send`/`resume` continue it under the
+    /// same native id. Refused while the session is `live`; `recent` and
+    /// `unknown` need `force` (never over MCP). A session this daemon
+    /// already manages returns its Wardex session. With `fork`, the new
+    /// session branches off instead (`origin: forked`) when it first runs;
+    /// the source is only read, so it may be live.
+    pub async fn adopt(&self, spec: AdoptSpec, via_mcp: bool) -> Result<AdoptOutcome> {
+        self.external_allowed(via_mcp)?;
+        if via_mcp && spec.force {
+            return Err(ManagerError::Invalid(
+                "force is only available in the CLI".into(),
+            ));
+        }
+        if spec.message.as_ref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(ManagerError::Invalid("message is empty".into()));
+        }
+        self.accepting_work()?;
+        self.inner.store.check_admission(None)?;
+        let _one_at_a_time = self.inner.adopt_lock.lock().await;
+        let source = self.resolve_external(&spec.id, spec.driver).await?;
+        let driver = source.driver;
+        if !self.inner.drivers.contains_key(&driver) {
+            return Err(ManagerError::Invalid(format!(
+                "driver {} is not available",
+                driver.as_str()
+            )));
+        }
+        let qualified = source.qualified_id();
+        let fork = spec.fork;
+        let existing = match &source.managed_by {
+            _ if fork => None,
+            Some(id) => Some(id.clone()),
+            None => {
+                self.inner
+                    .store
+                    .find_by_driver_session(driver, &source.native_id)
+                    .await?
+            }
+        };
+        if let Some(id) = existing {
+            let mut resumed = false;
+            if let Some(message) = spec.message {
+                resumed = self.send(&id, message).await?;
+            }
+            return Ok(AdoptOutcome {
+                session: self.record(&id).await?,
+                adopted: false,
+                resumed,
+                source,
+                warnings: vec![format!("{qualified} is already managed as session {id}")],
+            });
+        }
+        match &source.liveness {
+            _ if fork => {}
+            Liveness::Live { pid, .. } => {
+                return Err(ManagerError::Conflict(format!(
+                    "{qualified} is open in process {pid}; continue it there, or fork it \
+                     (adopt --fork) to branch off without touching the original"
+                )));
+            }
+            Liveness::Recent {
+                modified_secs_ago, ..
+            } if !spec.force => {
+                return Err(ManagerError::Conflict(format!(
+                    "{qualified} was written {modified_secs_ago}s ago and may still be open; \
+                     close it first, fork it (--fork), or adopt anyway with --force (CLI only)"
+                )));
+            }
+            Liveness::Unknown { reason } if !spec.force => {
+                return Err(ManagerError::Conflict(format!(
+                    "cannot tell whether {qualified} is open ({reason}); close it first, fork it \
+                     (--fork), or adopt anyway with --force (CLI only)"
+                )));
+            }
+            _ => {}
+        }
+
+        let mut warnings = source.warnings.clone();
+        if fork && source.liveness.is_live() {
+            warnings.push(format!(
+                "{qualified} is open elsewhere; the fork starts from what it has written so far"
+            ));
+        }
+        if !spec.readonly {
+            warnings.push(
+                "the session continues with Wardex's full permissions (bypassPermissions / \
+                 danger-full-access), whatever mode it was started in; adopt with --readonly \
+                 to keep it read-only"
+                    .into(),
+            );
+        }
+        if let Some(entry) = source
+            .entrypoint
+            .as_deref()
+            .filter(|e| driver == DriverKind::Claude && !matches!(*e, "cli" | "sdk-cli"))
+        {
+            warnings.push(format!(
+                "started from {entry}; resuming it in the CLI may not work"
+            ));
+        }
+        if !source.cwd.is_dir() {
+            warnings.push(format!(
+                "its working directory {} no longer exists; resume will fail",
+                source.cwd.display()
+            ));
+        }
+
+        let mut id = SessionId::generate();
+        while self.inner.store.session_exists(id.as_str()).await? {
+            id = SessionId::generate();
+        }
+        let reservation = self.reserve_start(&id)?;
+        let drivers_cfg = &self.inner.config.drivers;
+        let (default_model, default_reasoning) = match driver {
+            DriverKind::Claude => (
+                drivers_cfg.claude.default_model.clone(),
+                drivers_cfg.claude.default_reasoning.clone(),
+            ),
+            DriverKind::Codex => (
+                drivers_cfg.codex.default_model.clone(),
+                drivers_cfg.codex.default_reasoning.clone(),
+            ),
+        };
+        let now = now_ms();
+        let mut record = SessionRecord {
+            id: id.clone(),
+            driver,
+            // A fork gets its own id when it first runs.
+            driver_session_id: (!fork).then(|| source.native_id.clone()),
+            state: SessionState::Stopped,
+            agent: spec.agent,
+            task: spec.task,
+            model: spec.model.or(default_model),
+            reasoning: spec.reasoning.or(default_reasoning),
+            cwd: source.cwd.clone(),
+            origin_cwd: None,
+            worktree: None,
+            branch: None,
+            remove_worktree: false,
+            readonly: spec.readonly,
+            slice: None,
+            unit: None,
+            pid: None,
+            created_ms: now,
+            updated_ms: now,
+            ended_ms: Some(now),
+            last_seq: 0,
+            last_result: None,
+            last_error: None,
+            spawn_count: 0,
+            resume_pending: false,
+            resume_with_prompt: false,
+            cleanup_failed: false,
+            ended_reason: Some(EndReason::Adopted),
+            origin: if fork {
+                SessionOrigin::Forked
+            } else {
+                SessionOrigin::Adopted
+            },
+            forked_from: fork.then(|| source.native_id.clone()),
+            adopted_ms: Some(now),
+        };
+        let publication = self.inner.store.reserve_publication()?;
+        self.inner.store.insert_session(&record).await?;
+        let event = make_event(
+            &mut record,
+            EventKind::Adopted {
+                source_driver_session_id: source.native_id.clone(),
+                forked: fork,
+                cli_version: source.cli_version.clone(),
+                liveness: source.liveness.as_str().into(),
+                path_hint: source.path_hint.clone(),
+            },
+        );
+        self.publish_reserved(&event, &record, publication);
+        drop(reservation);
+        tracing::info!(session = %id, driver = driver.as_str(), fork, "external session adopted");
+        let mut resumed = false;
+        if let Some(message) = spec.message {
+            if let Err(e) = self.resume(&id, Some(message)).await {
+                return Err(match e {
+                    ManagerError::Conflict(m) => {
+                        ManagerError::Conflict(format!("adopted as session {id}, but {m}"))
+                    }
+                    other => other,
+                });
+            }
+            resumed = true;
+        } else {
+            self.finish_action().await;
+        }
+        Ok(AdoptOutcome {
+            session: self.record(&id).await?,
+            adopted: true,
+            resumed,
+            source,
+            warnings,
+        })
     }
 
     /// Stop a live session: close stdin, then kill after the grace period.
@@ -2498,6 +3055,7 @@ mod tests {
                 Ok(crate::driver::DriverHandle {
                     pid: None,
                     unit: None,
+                    driver_session_id: None,
                     commands,
                     events,
                 })

@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use serde_json::Value;
+use wardex_core::external::{ExternalSession, HistoryItem, HistoryKind, HistoryPage, Liveness};
 use wardex_core::manager::{Overview, SessionStatus, SessionSummary, SessionView};
 use wardex_core::store::QuestionRow;
 use wardex_core::time::{clock, human_duration, now_ms};
@@ -103,6 +104,13 @@ pub fn status(st: &SessionStatus) -> String {
     }
     if s.readonly {
         let _ = writeln!(out, "mode      read-only");
+    }
+    if s.origin != wardex_core::SessionOrigin::Wardex {
+        let mut origin = s.origin.as_str().to_string();
+        if let Some(from) = &s.forked_from {
+            origin.push_str(&format!(" from {from}"));
+        }
+        let _ = writeln!(out, "origin    {origin}");
     }
     let end = s.ended_ms.unwrap_or_else(now_ms);
     let _ = writeln!(out, "age       {}", human_duration(end - s.created_ms));
@@ -317,6 +325,174 @@ pub fn overview(o: &Overview) -> String {
                 ago,
                 truncate(text.map(String::as_str).unwrap_or("-"), 100).replace('\n', " ")
             );
+        }
+    }
+    out
+}
+
+fn liveness(l: &Liveness) -> String {
+    match l {
+        Liveness::Live { pid, .. } => format!("live({pid})"),
+        other => other.as_str().to_string(),
+    }
+}
+
+pub fn external_list(sessions: &[ExternalSession]) -> String {
+    if sessions.is_empty() {
+        return "no external sessions\n".into();
+    }
+    let mut out = format!(
+        "{:<9} {:<7} {:<16} {:>7}  {:<30} {}\n",
+        "ID", "DRIVER", "STATE", "UPDATED", "CWD", "TITLE"
+    );
+    let now = now_ms();
+    for s in sessions {
+        let state = match &s.managed_by {
+            Some(id) => format!("managed:{id}"),
+            None => liveness(&s.liveness),
+        };
+        let mut title = s.title.clone().unwrap_or_else(|| "-".into());
+        if !s.warnings.is_empty() {
+            title.push_str(&format!(" [{}]", s.warnings.join("; ")));
+        }
+        let _ = writeln!(
+            out,
+            "{:<9} {:<7} {:<16} {:>7}  {:<30} {}",
+            s.native_id.chars().take(8).collect::<String>(),
+            s.driver.as_str(),
+            state,
+            human_duration(now - s.updated_ms),
+            truncate(&short_path(&s.cwd), 30),
+            truncate(&title, 80)
+        );
+    }
+    out
+}
+
+fn history_header(page: &HistoryPage) -> String {
+    let s = &page.session;
+    let mut out = format!(
+        "{} {} {}",
+        s.qualified_id(),
+        liveness(&s.liveness),
+        short_path(&s.cwd)
+    );
+    if let Some(t) = &s.title {
+        out.push_str(&format!(" \u{2014} {t}"));
+    }
+    out
+}
+
+fn tool_line(item: &HistoryItem) -> Option<String> {
+    let t = item.tool.as_ref()?;
+    let mut line = format!("{}: {}", t.name, t.input_summary);
+    let status = match t.status {
+        wardex_core::ToolStatus::Started => "no result",
+        wardex_core::ToolStatus::Completed => "completed",
+        wardex_core::ToolStatus::Failed => "failed",
+    };
+    line.push_str(&format!(" -> {status}"));
+    if let Some(r) = t.result_summary.as_deref().filter(|r| !r.is_empty()) {
+        line.push_str(&format!(": {r}"));
+    }
+    Some(line)
+}
+
+fn history_footer(page: &HistoryPage, out: &mut String) {
+    if page.truncated {
+        let _ = writeln!(out, "(cut to the byte budget)");
+    }
+    if let Some(before) = &page.next_before {
+        let _ = writeln!(out, "(older turns: --before {before})");
+    }
+}
+
+pub fn history_text(page: &HistoryPage) -> String {
+    let mut out = format!("{}\n", history_header(page));
+    for w in &page.warnings {
+        let _ = writeln!(out, "warning: {w}");
+    }
+    let mut turn = None;
+    for item in &page.items {
+        if turn != Some(item.turn) {
+            turn = Some(item.turn);
+            let _ = writeln!(out, "--- turn {}", item.turn);
+        }
+        let text = item.text.as_deref().unwrap_or_default();
+        match item.kind {
+            HistoryKind::Prompt => {
+                let _ = writeln!(out, "> {}", text.replace('\n', "\n  "));
+            }
+            HistoryKind::Message => {
+                let _ = writeln!(out, "{text}");
+            }
+            HistoryKind::Compaction => {
+                let _ = writeln!(out, "[{text}]");
+            }
+            HistoryKind::ToolCall => {
+                if let Some(line) = tool_line(item) {
+                    let _ = writeln!(out, "  $ {line}");
+                }
+                if let Some(t) = &item.tool {
+                    for (label, body) in [("input", &t.input), ("output", &t.output)] {
+                        if let Some(body) = body {
+                            let _ = writeln!(out, "    --- {label}");
+                            for l in body.lines() {
+                                let _ = writeln!(out, "    {l}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    history_footer(page, &mut out);
+    out
+}
+
+/// A context summary another agent can take as a prompt.
+pub fn history_markdown(page: &HistoryPage) -> String {
+    let s = &page.session;
+    let mut out = format!(
+        "# Conversation context: {} session {}\n\n",
+        s.driver.as_str(),
+        s.native_id
+    );
+    let _ = writeln!(out, "- Working directory: `{}`", s.cwd.display());
+    if let Some(t) = &s.title {
+        let _ = writeln!(out, "- Title: {t}");
+    }
+    if let (Some(first), Some(last)) = (page.items.first(), page.items.last()) {
+        let _ = writeln!(out, "- Turns shown: {} to {}", first.turn, last.turn);
+    }
+    if page.next_before.is_some() {
+        let _ = writeln!(out, "- Earlier turns are omitted.");
+    }
+    if !page.warnings.is_empty() {
+        let _ = writeln!(out, "- Warnings: {}", page.warnings.join(", "));
+    }
+    let mut turn = None;
+    for item in &page.items {
+        if turn != Some(item.turn) {
+            turn = Some(item.turn);
+            let _ = write!(out, "\n## Turn {}\n", item.turn);
+        }
+        let text = item.text.as_deref().unwrap_or_default();
+        match item.kind {
+            HistoryKind::Prompt => {
+                let _ = write!(out, "\n**User:** {text}\n");
+            }
+            HistoryKind::Message => {
+                let _ = write!(out, "\n**Assistant:** {text}\n");
+            }
+            HistoryKind::Compaction => {
+                let _ = write!(out, "\n_(The conversation was compacted here.)_\n");
+            }
+            HistoryKind::ToolCall => {
+                if let Some(line) = tool_line(item) {
+                    let _ = write!(out, "\n- Tool {line}\n");
+                }
+            }
         }
     }
     out

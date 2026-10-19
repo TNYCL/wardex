@@ -8,6 +8,33 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- External sessions (`docs/external-sessions.md`, off by default): with
+  `[external] enabled = true`, `wardex external list [--cwd DIR [--under] |
+  --here]` lists Claude Code and Codex sessions started outside Wardex from
+  the CLIs' own stores, with liveness (`live`, `recent`, `inactive`,
+  `unknown`) detected from `/proc` and the CLIs' registry files. `wardex
+  history <id>` prints a session's conversation (prompts, messages, tool
+  calls, compactions) read from its transcript on every call, paged by turns,
+  capped in bytes and with best-effort secret redaction (`text`, `markdown`
+  or `json`). The MCP tools `external_list` and `history` additionally need
+  `external.mcp = true`. Wardex never writes, locks or deletes anything in
+  the CLIs' stores, and history is not copied into its database.
+- `wardex adopt <id> [--readonly] [--message TEXT] [--force]` and the MCP
+  tool `adopt`: link an external session to a new Wardex session (`stopped`,
+  `ended_reason: adopted`, `origin: adopted`) under the same native id, so
+  `send`/`resume` continue it. Refused while the session is open in a process
+  (`live`); `recent` or `unknown` sessions need `--force`, which exists only
+  in the CLI. Adopting again returns the same session. Every resume of an
+  adopted session checks again that no CLI process has it open. New `adopted`
+  event (not sent to webhooks by default), `origin`, `forked_from` and
+  `adopted_ms` on session records, and `list --origin wardex|adopted|forked`
+  (MCP `list` `origin`).
+- Forks: `wardex adopt --fork <id>`, `wardex run --fork-from <id> --prompt …`
+  and MCP `adopt` with `fork` create a session (`origin: forked`) that
+  branches off an external session when it first runs (Claude
+  `--resume <id> --fork-session --session-id <new>`, Codex `thread/fork`); the
+  original is only read, so this works while it is open elsewhere. Every fork
+  is a new session, and later resumes continue the fork.
 - `wardex list --agent GLOB --task GLOB --ended --resumable` and the same
   filters on the MCP `list` tool (`agent`, `task`, `ended`, `resumable`), to
   find a closed session again. `list` shows when and why a session ended.
@@ -99,6 +126,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The Claude session id Wardex chooses with `--session-id` is recorded when
+  the process starts, not only when `system/init` arrives, so a session whose
+  process dies before its first event can still be resumed or inspected.
 - Isolate unverifiable old scopes during recovery so one session cannot
   prevent daemon startup. Persist `cleanup_failed`, keep its scope recorded,
   skip automatic/implicit resume and expose the warning in status/list/overview.
@@ -140,6 +170,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed (breaking)
 
+- Migration 0005 adds `sessions.origin`, `forked_from` and `adopted_ms` and an
+  index on `(driver, driver_session_id)`; after it is applied, older binaries
+  can no longer open the database. Back up `wardex.db` first.
 - Migration 0004 adds `sessions.ended_reason`; after it is applied, older
   binaries can no longer open the database. Back up `wardex.db` first.
 - After migration 0003 is applied, older binaries can no longer open this

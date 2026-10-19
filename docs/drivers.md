@@ -12,6 +12,13 @@ CLI version changes.
 | Claude Code | 2.1.302 | 2026-10-18 |
 | Codex CLI | 0.163.0 | 2026-10-18 |
 
+Fork (`--fork-session`, `thread/fork`) was checked against the same versions'
+help text, argument validation and generated JSON schema (2026-10-19); the
+external session readers were written against transcripts of Claude Code
+2.1.295 – 2.1.302 and Codex 0.162.1 – 0.163.0 and are tested with synthetic
+fixtures (`tests/fixtures/{claude,codex}/store/`, see
+[`external-sessions.md`](external-sessions.md)).
+
 The lifecycle fixes are tested with these recorded versions and temporary
 shell processes; no live Claude/Codex CLI is called. The shared runner handles
 `Drain` by closing stdin without a force-kill deadline for the leader, including
@@ -58,7 +65,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   `AskUserQuestion` is not in the tool list at all in `-p` mode
   (`--permission-prompts host`, `--tools` and `--allowedTools` do not add it).
 - **`--session-id <uuid>`** lets Wardex choose the Claude session id up front,
-  so the resume id is known before the first event.
+  so the resume id is known before the first event. The driver reports it in
+  its spawn handle and the manager records it at once; `system/init` later
+  confirms the same id.
 - The process stays alive between turns as long as stdin is open. Each new
   turn re-emits `system/init`. Closing stdin after a `result` ends it cleanly
   (exit 0).
@@ -155,6 +164,26 @@ reasoning effort; the effort is only known when Wardex passes `--effort`.
 
 Start a new process with `--resume <session_id>`; history is intact (verified
 by asking about the previous turn). The session id stays the same.
+
+### Fork
+
+`--resume <source> --fork-session --session-id <new-uuid>`: a new session
+that starts from the source's history; the source transcript is only read.
+Claude 2.1.302 accepts `--session-id` together with `--resume` only with
+`--fork-session` (its argument check says so), which lets Wardex record the
+fork's id before the process starts, as for new sessions. `system/init` then
+reports the new id. Verified against the 2.1.302 `--help` text and argument
+validation; no fork transcript was recorded (the protocol after `init` is the
+same as for a resume).
+
+### Known limitations
+
+- Because the session id is recorded when the process starts, a Claude
+  session (or fork) whose process dies before its first event still has a
+  resume id. Claude may not have written a transcript for it yet, so a later
+  `resume`/`send` can fail with Claude's own "No conversation found" error
+  instead of Wardex's "the agent never reported a session id". Start a new
+  session (or adopt/fork the source again) in that case.
 
 ## Codex
 
@@ -270,6 +299,18 @@ New process, `initialize`, then
 `thread/resume {threadId, cwd, approvalPolicy, sandbox, excludeTurns:true}`,
 then `turn/start` as usual. History is intact. Without `excludeTurns: true`
 Codex sends a `deprecationNotice` and the full history.
+
+### Fork
+
+`thread/fork {threadId, cwd, approvalPolicy, sandbox, model?,
+excludeTurns:true}` instead of `thread/resume`. The result has the same shape
+as `thread/resume`'s (`thread`, `model`, `reasoningEffort`, …) with the new
+thread in `thread.id` and the source in `thread.forkedFromId`; turns then go
+to the new thread. Only `threadId` is required (0.163.0 schema,
+`ThreadForkParams`; optional `beforeTurnId`/`lastTurnId` are not used).
+`fixtures/codex/fork.jsonl` is **derived** from the recorded `resume.jsonl`
+and that schema by `tools/fixtures/derive_codex_fork.py`, not recorded from a
+live fork.
 
 ## systemd scopes
 

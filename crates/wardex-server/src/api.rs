@@ -1,12 +1,17 @@
 //! The daemon API: requests, responses and their handling. Transport-neutral;
 //! used by the Unix socket server and the MCP tools.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use wardex_core::external::{
+    DEFAULT_HISTORY_BYTES, DEFAULT_HISTORY_TURNS, ExternalFilter, HistoryQuery, ToolDetail,
+};
 use wardex_core::manager::{AnswerInput, Manager, ManagerError, drain_next_steps};
-use wardex_core::{Event, EventKind, ListFilter, RunSpec};
+use wardex_core::time::now_ms;
+use wardex_core::{AdoptSpec, DriverKind, Event, EventKind, ListFilter, RunSpec, SessionOrigin};
 
 /// Default number of events `tail` shows.
 pub const DEFAULT_TAIL: i64 = 20;
@@ -34,6 +39,8 @@ pub enum Request {
         ended: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         resumable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<SessionOrigin>,
     },
     Status {
         id: String,
@@ -119,6 +126,74 @@ pub enum Request {
     },
     /// Re-read the config and env files and apply the webhook settings.
     Reload,
+    /// Sessions started outside Wardex (`external.enabled`), newest first.
+    ExternalList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver: Option<DriverKind>,
+        /// Absolute directory; only sessions that started there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        /// With `cwd`: also sessions in directories below it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        under: bool,
+        /// Only sessions written in the last this many seconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_managed: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        archived: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_subagents: bool,
+        /// Set by the MCP tools; needs `external.mcp`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        via_mcp: bool,
+    },
+    /// A page of a session's native conversation: a Wardex session id or an
+    /// external session id (`claude:<id>`, `codex:<id>`, id or prefix).
+    History {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver: Option<DriverKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turns: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<ToolDetail>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<usize>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        via_mcp: bool,
+    },
+    /// Link an external session to a new Wardex session (see `AdoptSpec`).
+    Adopt {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver: Option<DriverKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        readonly: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Adopt a `recent`/`unknown` session anyway. Refused over MCP.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+        /// Branch a new native session off it instead (`origin: forked`).
+        #[serde(default, skip_serializing_if = "is_false")]
+        fork: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        via_mcp: bool,
+    },
 }
 
 impl Request {
@@ -130,6 +205,7 @@ impl Request {
             task: None,
             ended: false,
             resumable: false,
+            origin: None,
         }
     }
 
@@ -241,7 +317,9 @@ impl From<ManagerError> for Response {
             ManagerError::Invalid(_) => "invalid",
             ManagerError::Conflict(_) => "conflict",
             ManagerError::DrainBlocked { .. } => "conflict",
-            ManagerError::Store(_) | ManagerError::Driver(_) => "internal",
+            ManagerError::Store(_) | ManagerError::Driver(_) | ManagerError::Internal(_) => {
+                "internal"
+            }
         };
         Response::err(code, e.to_string())
     }
@@ -272,6 +350,7 @@ pub async fn handle(manager: &Manager, req: Request) -> Response {
             | Request::Resume { .. }
             | Request::Stop { .. }
             | Request::Interrupt { .. }
+            | Request::Adopt { .. }
     );
     match handle_inner(manager, req).await {
         Ok(v) => {
@@ -295,6 +374,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
             "started_ms": m.started_ms(),
+            "external_mcp": m.config().external.over_mcp(),
         }),
         Request::Run(spec) => to_value(&m.run(spec).await?),
         Request::List {
@@ -303,6 +383,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             task,
             ended,
             resumable,
+            origin,
         } => to_value(
             &m.list_filtered(&ListFilter {
                 all,
@@ -310,6 +391,7 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
                 task,
                 ended,
                 resumable,
+                origin,
             })
             .await?,
         ),
@@ -414,6 +496,83 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             return Err(ManagerError::Invalid(
                 "reload is handled by the daemon's socket server".into(),
             ));
+        }
+        Request::ExternalList {
+            driver,
+            cwd,
+            under,
+            since_secs,
+            limit,
+            include_managed,
+            archived,
+            include_subagents,
+            via_mcp,
+        } => {
+            if cwd.as_ref().is_some_and(|c| !c.is_absolute()) {
+                return Err(ManagerError::Invalid("cwd must be an absolute path".into()));
+            }
+            let filter = ExternalFilter {
+                driver,
+                cwd,
+                under,
+                since_ms: since_secs.map(|s| {
+                    now_ms().saturating_sub(
+                        i64::try_from(s)
+                            .unwrap_or(i64::MAX / 1000)
+                            .saturating_mul(1000),
+                    )
+                }),
+                limit,
+                include_managed,
+                archived,
+                include_subagents,
+            };
+            json!({"sessions": m.external_list(filter, via_mcp).await?})
+        }
+        Request::History {
+            id,
+            driver,
+            turns,
+            before,
+            tools,
+            max_bytes,
+            via_mcp,
+        } => {
+            let query = HistoryQuery {
+                turns: turns.unwrap_or(DEFAULT_HISTORY_TURNS),
+                before,
+                tools: tools.unwrap_or_default(),
+                max_bytes: max_bytes.unwrap_or(DEFAULT_HISTORY_BYTES),
+                redact: true,
+            };
+            to_value(&m.history(&id, driver, query, via_mcp).await?)
+        }
+        Request::Adopt {
+            id,
+            driver,
+            agent,
+            task,
+            model,
+            reasoning,
+            readonly,
+            message,
+            force,
+            fork,
+            via_mcp,
+        } => {
+            let spec = AdoptSpec {
+                fork,
+                id,
+                driver,
+                agent,
+                task,
+                model,
+                reasoning,
+                readonly,
+                message,
+                force,
+            };
+            to_value(&m.adopt(spec, via_mcp).await?)
         }
     })
 }

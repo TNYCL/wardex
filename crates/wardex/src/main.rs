@@ -6,11 +6,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde_json::Value;
+use wardex_core::external::{ExternalSession, HistoryPage, ToolDetail};
 use wardex_core::manager::{
-    AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
+    AdoptOutcome, AnswerInput, Overview, RunOutcome, SessionStatus, SessionSummary, SessionView,
 };
 use wardex_core::store::QuestionRow;
-use wardex_core::{Config, DriverKind, Event, RunSpec, SessionRecord};
+use wardex_core::{Config, DriverKind, Event, RunSpec, SessionOrigin, SessionRecord};
 use wardex_server::Client;
 use wardex_server::api::{Request, Response};
 use wardex_server::daemon::{Exit, Source};
@@ -18,7 +19,7 @@ use wardex_server::daemon::{Exit, Source};
 mod cli;
 mod output;
 
-use cli::{Cli, Command, DaemonAction};
+use cli::{Cli, Command, DaemonAction, ExternalAction};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -133,15 +134,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Run(args) => {
             let prompt = match (&args.prompt, &args.prompt_file) {
                 (Some(p), _) => p.clone(),
-                (None, Some(path)) if path.as_os_str() == "-" => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    s
-                }
-                (None, Some(path)) => std::fs::read_to_string(path)
-                    .with_context(|| format!("cannot read {}", path.display()))?,
+                (None, Some(path)) => read_prompt_file(path)?,
                 (None, None) => bail!("--prompt or --prompt-file is required"),
             };
+            if let Some(source) = args.fork_from {
+                let resp = client
+                    .request(&Request::Adopt {
+                        id: source,
+                        driver: args.driver.map(driver_kind),
+                        agent: args.agent,
+                        task: args.task,
+                        model: args.model,
+                        reasoning: args.reasoning,
+                        readonly: args.readonly,
+                        message: Some(prompt),
+                        force: false,
+                        fork: true,
+                        via_mcp: false,
+                    })
+                    .await?;
+                return finish(json, resp, adopt_message);
+            }
+            let driver = args.driver.ok_or_else(|| anyhow!("--driver is required"))?;
             let cwd = match &args.cwd {
                 Some(c) => c.clone(),
                 None => std::env::current_dir()?,
@@ -149,10 +163,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let cwd = std::fs::canonicalize(&cwd)
                 .with_context(|| format!("cannot use cwd {}", cwd.display()))?;
             let spec = RunSpec {
-                driver: Some(match args.driver {
-                    cli::Driver::Claude => DriverKind::Claude,
-                    cli::Driver::Codex => DriverKind::Codex,
-                }),
+                driver: Some(driver_kind(driver)),
                 prompt,
                 model: args.model,
                 reasoning: args.reasoning,
@@ -185,6 +196,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             task,
             ended,
             resumable,
+            origin,
         } => {
             let resp = client
                 .request(&Request::List {
@@ -193,6 +205,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     task,
                     ended,
                     resumable,
+                    origin: origin.map(|o| match o {
+                        cli::Origin::Wardex => SessionOrigin::Wardex,
+                        cli::Origin::Adopted => SessionOrigin::Adopted,
+                        cli::Origin::Forked => SessionOrigin::Forked,
+                    }),
                 })
                 .await?;
             finish(json, resp, |v| {
@@ -392,6 +409,86 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             wardex_server::mcp::serve_stdio(client).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::External {
+            action: ExternalAction::List(a),
+        } => {
+            let cwd = if a.here {
+                Some(std::fs::canonicalize(std::env::current_dir()?)?)
+            } else {
+                a.cwd.map(|c| absolute_dir(&c)).transpose()?
+            };
+            if a.under && cwd.is_none() {
+                bail!("--under needs --cwd or --here");
+            }
+            let resp = client
+                .request(&Request::ExternalList {
+                    driver: a.driver.map(driver_kind),
+                    cwd,
+                    under: a.under,
+                    since_secs: a.since,
+                    limit: Some(a.limit),
+                    include_managed: a.include_managed,
+                    archived: a.archived,
+                    include_subagents: a.include_subagents,
+                    via_mcp: false,
+                })
+                .await?;
+            finish(json, resp, |v| {
+                let sessions: Vec<ExternalSession> =
+                    serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
+                output::external_list(&sessions)
+            })
+        }
+        Command::History(a) => {
+            let resp = client
+                .request(&Request::History {
+                    id: a.id,
+                    driver: a.driver.map(driver_kind),
+                    turns: Some(a.turns),
+                    before: a.before,
+                    tools: Some(match a.tools {
+                        cli::ToolsArg::None => ToolDetail::None,
+                        cli::ToolsArg::Summary => ToolDetail::Summary,
+                        cli::ToolsArg::Full => ToolDetail::Full,
+                    }),
+                    max_bytes: a.max_bytes,
+                    via_mcp: false,
+                })
+                .await?;
+            let format = a.format;
+            finish(
+                json || format == cli::Format::Json,
+                resp,
+                |v| match serde_json::from_value::<HistoryPage>(v.clone()) {
+                    Ok(page) if format == cli::Format::Markdown => output::history_markdown(&page),
+                    Ok(page) => output::history_text(&page),
+                    Err(_) => output::json(v),
+                },
+            )
+        }
+        Command::Adopt(a) => {
+            let message = match (a.message, &a.prompt_file) {
+                (Some(m), _) => Some(m),
+                (None, Some(path)) => Some(read_prompt_file(path)?),
+                (None, None) => None,
+            };
+            let resp = client
+                .request(&Request::Adopt {
+                    id: a.id,
+                    driver: a.driver.map(driver_kind),
+                    agent: a.agent,
+                    task: a.task,
+                    model: a.model,
+                    reasoning: a.reasoning,
+                    readonly: a.readonly,
+                    message,
+                    force: a.force,
+                    fork: a.fork,
+                    via_mcp: false,
+                })
+                .await?;
+            finish(json, resp, adopt_message)
+        }
         Command::Overview { events } => {
             let resp = client
                 .request(&Request::Overview {
@@ -406,6 +503,56 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
     }
+}
+
+/// `adopt` / `run --fork-from`: only the id goes to stdout, like `run`.
+fn adopt_message(v: &Value) -> String {
+    match serde_json::from_value::<AdoptOutcome>(v.clone()) {
+        Ok(out) => {
+            for w in &out.warnings {
+                eprintln!("warning: {w}");
+            }
+            let forked = out.session.origin == SessionOrigin::Forked;
+            let what = match (out.adopted, out.resumed) {
+                (true, true) if forked => "forked and started",
+                (true, false) if forked => "fork created; the next send starts it",
+                (true, true) => "adopted and resumed",
+                (true, false) => "adopted",
+                (false, true) => "already managed; message sent",
+                (false, false) => "already managed",
+            };
+            eprintln!("{} {what}", out.source.qualified_id());
+            format!("{}\n", out.session.id)
+        }
+        Err(_) => output::json(v),
+    }
+}
+
+/// A prompt from a file, or from stdin for `-`.
+fn read_prompt_file(path: &std::path::Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        return Ok(s);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+fn driver_kind(d: cli::Driver) -> DriverKind {
+    match d {
+        cli::Driver::Claude => DriverKind::Claude,
+        cli::Driver::Codex => DriverKind::Codex,
+    }
+}
+
+/// `dir` as an absolute path, with symlinks resolved when it exists (a
+/// session's directory may be gone, e.g. a removed worktree).
+fn absolute_dir(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    Ok(match std::fs::canonicalize(dir) {
+        Ok(p) => p,
+        Err(_) if dir.is_absolute() => dir.to_path_buf(),
+        Err(_) => std::env::current_dir()?.join(dir),
+    })
 }
 
 /// What `ping` tells about the running daemon.

@@ -74,6 +74,22 @@ systemd_scope = true
 # Slices that `wardex run --slice <name>` may use.
 slices = ["build.slice", "tests.slice"]
 
+# Sessions started outside Wardex (docs/external-sessions.md): list them,
+# read their history and adopt or fork them. Wardex only reads the CLIs'
+# stores. Both switches are off by default.
+[external]
+enabled = false
+# Also over MCP (HTTP and `wardex mcp --stdio`); every MCP client then sees
+# your terminal sessions' history. Needs enabled.
+mcp = false
+# claude_home = "~/.claude"   # default: $CLAUDE_CONFIG_DIR, else ~/.claude
+# codex_home = "~/.codex"     # default: $CODEX_HOME, else ~/.codex
+quiet_secs = 120
+# Only sessions whose cwd matches one of these globs are visible (empty: all).
+cwd_allow = []
+max_file_mb = 128
+redact = true
+
 # Webhooks. Repeat the table for multiple targets; see docs/webhooks.md.
 # URLs, secrets and header values are env var names (set in env_file).
 # After changes: wardex daemon reload (no restart needed).

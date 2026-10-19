@@ -18,6 +18,7 @@ Any event type can be listed in `events`; message deltas are never sent.
 | `stuck` | A question has waited `question_stuck_secs` (`reason: waiting_input`), or a running turn produced nothing for `idle_stuck_secs` while no tool ran (`reason: no_output`; `idle_stuck_secs = 0` turns this off). Idle sessions (no turn running) are never reported stuck. |
 | `done` | A turn finished. Carries the final text, the CLI's turn note and the git state (branch, changed files). |
 | `error` | A turn failed or the agent process died. |
+| `adopted` | A session record was created from an external session (`wardex adopt`, not in the default set). `payload.source_driver_session_id` is the native id, `payload.forked` whether it was forked, `payload.path_hint` the transcript path relative to the CLI's root. |
 | `ended` | The agent process ended (not in the default set). `payload.state` is the session's new state, `payload.reason` why it ended (see [`mcp.md`](mcp.md#session-records-and-summaries)); events recorded by older versions have no `reason`. |
 
 ## Request

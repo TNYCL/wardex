@@ -160,6 +160,7 @@ impl Driver for FakeDriver {
         Ok(DriverHandle {
             pid: None,
             unit: None,
+            driver_session_id: None,
             commands: cmd_tx,
             events: ev_rx,
         })
@@ -1197,6 +1198,7 @@ impl Driver for ScopedProcessDriver {
         Ok(DriverHandle {
             pid: spawned.pid,
             unit: spawned.unit,
+            driver_session_id: None,
             commands,
             events: event_rx,
         })

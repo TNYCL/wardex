@@ -15,10 +15,11 @@ use tokio::signal::unix::{SignalKind, signal};
 use wardex_core::Config;
 use wardex_core::config::{ConfigError, Env};
 use wardex_core::driver::Driver;
-use wardex_core::manager::Manager;
+use wardex_core::external::ExternalSource;
+use wardex_core::manager::{ExternalSetup, Manager};
 use wardex_core::process::Launcher;
 use wardex_core::store::{Store, StoreError};
-use wardex_drivers::{ClaudeDriver, CodexDriver};
+use wardex_drivers::{ClaudeDriver, ClaudeStore, CodexDriver, CodexStore};
 
 use crate::api::Response;
 use crate::socket::Control;
@@ -77,6 +78,16 @@ pub fn drivers(config: &Config) -> Vec<Arc<dyn Driver>> {
     ]
 }
 
+/// Readers of the CLIs' own session stores (used only with
+/// `external.enabled`).
+pub fn external_sources(config: &Config) -> Vec<Arc<dyn ExternalSource>> {
+    let e = &config.external;
+    vec![
+        Arc::new(ClaudeStore::new(e.claude_root(), e.max_file_bytes())),
+        Arc::new(CodexStore::new(e.codex_root(), e.max_file_bytes())),
+    ]
+}
+
 pub async fn run(source: Source) -> Result<Exit, DaemonError> {
     let (config, env) = source.load()?;
     let launcher = Launcher::new(config.resources.systemd_scope);
@@ -96,11 +107,15 @@ pub async fn run_with(
     let _database_lock = lock_database(&db_path)?;
     let listener = socket::bind(&socket_path).await?;
     let store = Store::open(&db_path).await?;
-    let manager = Manager::new(
+    let manager = Manager::with_external(
         config.clone(),
         store.clone(),
         make_drivers(&config),
         launcher.clone(),
+        ExternalSetup {
+            sources: external_sources(&config),
+            ..Default::default()
+        },
     );
 
     let orphaned = manager.recover().await?;
@@ -267,6 +282,7 @@ fn reload(
         ("retention", running.retention != new.retention),
         ("drivers", running.drivers != new.drivers),
         ("resources", running.resources != new.resources),
+        ("external", running.external != new.external),
     ]
     .into_iter()
     .filter_map(|(name, changed)| changed.then_some(name))

@@ -1,7 +1,7 @@
 //! SQLite persistence. Events are written by a single writer task in batches;
 //! everything else goes through the pool directly.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,8 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
-    DriverKind, EndReason, Event, EventKind, ListFilter, SessionId, SessionRecord, SessionState,
+    DriverKind, EndReason, Event, EventKind, ListFilter, SessionId, SessionOrigin, SessionRecord,
+    SessionState,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -402,8 +403,10 @@ impl Store {
             "INSERT INTO sessions (id, driver, driver_session_id, state, agent, task, model,
                 reasoning, cwd, origin_cwd, worktree, branch, remove_worktree, readonly, slice,
                 unit, pid, created_ms, updated_ms, ended_ms, last_seq, last_result, last_error,
-                spawn_count, resume_pending, resume_with_prompt, cleanup_failed, ended_reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                spawn_count, resume_pending, resume_with_prompt, cleanup_failed, ended_reason,
+                origin, forked_from, adopted_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?)",
         )
         .bind(s.id.as_str())
         .bind(s.driver.as_str())
@@ -437,9 +440,29 @@ impl Store {
         .bind(s.resume_with_prompt)
         .bind(s.cleanup_failed)
         .bind(s.ended_reason.map(EndReason::as_str))
+        .bind(s.origin.as_str())
+        .bind(&s.forked_from)
+        .bind(s.adopted_ms)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The newest session bound to this driver session id.
+    pub async fn find_by_driver_session(
+        &self,
+        driver: DriverKind,
+        driver_session_id: &str,
+    ) -> Result<Option<SessionId>> {
+        let row = sqlx::query(
+            "SELECT id FROM sessions WHERE driver = ? AND driver_session_id = ?
+             ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+        )
+        .bind(driver.as_str())
+        .bind(driver_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SessionId(r.get("id"))))
     }
 
     /// Orphaned sessions waiting for an automatic resume, oldest first.
@@ -482,6 +505,28 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         row.map(|r| session_from_row(&r)).transpose()
+    }
+
+    /// Wardex session per driver session id (the newest when several share
+    /// one).
+    pub async fn managed_driver_ids(&self) -> Result<HashMap<(DriverKind, String), SessionId>> {
+        let rows = sqlx::query(
+            "SELECT id, driver, driver_session_id FROM sessions
+             WHERE driver_session_id IS NOT NULL ORDER BY created_ms, rowid",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let driver: String = r.get("driver");
+            if let Some(kind) = DriverKind::parse(&driver) {
+                out.insert(
+                    (kind, r.get::<String, _>("driver_session_id")),
+                    SessionId(r.get("id")),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Session ids starting with `prefix` (at most `limit`).
@@ -527,7 +572,10 @@ impl Store {
             q.push("state IN ('starting','running','idle','waiting_input')");
         }
         if filter.resumable {
-            q.push(" AND driver_session_id IS NOT NULL AND cleanup_failed = 0");
+            q.push(
+                " AND (driver_session_id IS NOT NULL OR forked_from IS NOT NULL) \
+                 AND cleanup_failed = 0",
+            );
         }
         if let Some(pattern) = &filter.agent {
             q.push(" AND agent GLOB ")
@@ -536,6 +584,9 @@ impl Store {
         if let Some(pattern) = &filter.task {
             q.push(" AND task GLOB ")
                 .push_bind(crate::glob::to_sqlite(pattern));
+        }
+        if let Some(origin) = filter.origin {
+            q.push(" AND origin = ").push_bind(origin.as_str());
         }
         // rowid breaks ties between sessions created in the same millisecond.
         q.push(" ORDER BY created_ms DESC, rowid DESC LIMIT ")
@@ -1171,6 +1222,12 @@ fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
         ended_reason: r
             .get::<Option<String>, _>("ended_reason")
             .and_then(|v| EndReason::parse(&v)),
+        // Unknown origins (from a newer binary) read as external, so resume
+        // keeps checking for another writer.
+        origin: SessionOrigin::parse(&r.get::<String, _>("origin"))
+            .unwrap_or(SessionOrigin::Adopted),
+        forked_from: r.get("forked_from"),
+        adopted_ms: r.get("adopted_ms"),
     })
 }
 
@@ -1227,6 +1284,9 @@ mod tests {
             resume_with_prompt: false,
             cleanup_failed: false,
             ended_reason: None,
+            origin: SessionOrigin::Wardex,
+            forked_from: None,
+            adopted_ms: None,
         }
     }
 
@@ -1311,6 +1371,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_0005_defaults_existing_sessions_to_wardex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        // A database as the previous release left it (migrations 1-4).
+        let old = dir.path().join("migrations");
+        std::fs::create_dir(&old).unwrap();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap()
+        {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.as_str() < "0005" {
+                std::fs::copy(entry.path(), old.join(name)).unwrap();
+            }
+        }
+        {
+            let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+            sqlx::migrate::Migrator::new(old.as_path())
+                .await
+                .unwrap()
+                .run(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sessions (id, driver, driver_session_id, state, cwd, created_ms,
+                    updated_ms) VALUES ('old00001', 'claude', 'native-1', 'done', '/w', 1, 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = Store::open(&path).await.unwrap();
+        let s = store
+            .get_session(&SessionId("old00001".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.origin, SessionOrigin::Wardex);
+        assert_eq!(s.forked_from, None);
+        assert_eq!(s.adopted_ms, None);
+        assert_eq!(
+            store
+                .find_by_driver_session(DriverKind::Claude, "native-1")
+                .await
+                .unwrap(),
+            Some(s.id.clone())
+        );
+        assert_eq!(
+            store
+                .find_by_driver_session(DriverKind::Codex, "native-1")
+                .await
+                .unwrap(),
+            None
+        );
+        let mut adopted = record("new00001", SessionState::Stopped);
+        adopted.origin = SessionOrigin::Forked;
+        adopted.forked_from = Some("native-2".into());
+        adopted.adopted_ms = Some(5);
+        store.insert_session(&adopted).await.unwrap();
+        let back = store.get_session(&adopted.id).await.unwrap().unwrap();
+        assert_eq!(back, adopted);
+        let forked = ListFilter {
+            all: true,
+            origin: Some(SessionOrigin::Forked),
+            ..Default::default()
+        };
+        let rows = store.list_sessions_matching(&forked, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, adopted.id);
+    }
+
+    #[tokio::test]
     async fn list_filters_run_in_sql() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("w.db")).await.unwrap();
@@ -1383,6 +1521,7 @@ mod tests {
             task: task.map(String::from),
             ended,
             resumable,
+            origin: None,
         };
         assert_eq!(ids(f(None, None, false, false, false)).await, ["s1"]);
         assert_eq!(

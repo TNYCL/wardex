@@ -21,7 +21,10 @@ on tmux, `send-keys` and output scraping.
 - **Hands off CLI config:** Wardex only passes per-session flags (`--model`,
   `-c`, `--enable`, …). It never edits `~/.claude*` or `~/.codex/` and does
   not set a separate `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so sessions share the
-  user's existing settings, auth and quota.
+  user's existing settings, auth and quota. Wardex may **read** the CLIs'
+  session stores there (external session discovery and history, §2.4); it
+  never writes, locks or deletes anything in them. When a session is resumed
+  or forked, the CLI itself writes its transcript.
 - **Generic:** nothing deployment-specific in the repo (URLs, keys, paths, bot
   names, host settings). Those live only in config and env. The repo ships
   `deploy/wardex.example.toml`.
@@ -36,7 +39,8 @@ Protocol details and verified behavior: [`drivers.md`](drivers.md).
 stream-json --include-partial-messages --verbose --permission-prompt-tool stdio`
 
 - `--permission-mode bypassPermissions`; model via `--model`.
-- Wardex picks the Claude session id up front with `--session-id <uuid>`.
+- Wardex picks the Claude session id up front with `--session-id <uuid>` and
+  records it before the first event.
 - Questions: with `--permission-prompt-tool stdio`, `AskUserQuestion` arrives
   as a `can_use_tool` control request and the CLI blocks until Wardex answers
   with a `control_response` (verified in M1). Without that flag the tool is not
@@ -84,8 +88,9 @@ and, one at a time, while `MemAvailable` is below
 `sessions.min_mem_available_mb` (default 1024 MiB). Sessions with a running
 turn or an open question are never closed. Each ended session records an `ended_reason`
 (`done`, `stopped`, `idle_shutdown`, `idle_evicted`, `memory_pressure`,
-`error`, `drain`, `shutdown`, `daemon_lost`), also sent as `reason` on the
-`ended` event.
+`error`, `drain`, `shutdown`, `daemon_lost`; `adopted` for a record created
+from an external session that has not run in Wardex yet), also sent as
+`reason` on the `ended` event.
 
 - `tool_call` is emitted when a tool starts and when it finishes (same
   `call_id`). `question` carries one or more question items with options.
@@ -354,6 +359,33 @@ webhook receiver acting as a bot:
 Also verified over MCP with real agents: `send` to an idle session,
 `interrupt` of a running Codex command, `stop` then `resume` with context,
 token rejection, and a `tools/call` from plain `curl` without `initialize`.
+
+### 2.4 External sessions (Phase 2.x)
+
+Claude Code and Codex sessions started outside Wardex can be listed, read and
+continued. Details: [`external-sessions.md`](external-sessions.md).
+
+- `wardex external list` / MCP `external_list`: sessions from the CLIs' own
+  transcript stores, filtered by cwd (`--cwd DIR [--under]`, `--here`), with
+  liveness (`live`, `recent`, `inactive`, `unknown`) from `/proc` and the CLIs'
+  registry files. Nothing is signalled, locked or written.
+- `wardex history <id>` / MCP `history`: the native conversation, normalized
+  (`prompt`, `message`, `tool_call`, `compaction`), paged by turns, capped in
+  bytes, with best-effort secret redaction. Read from the transcript on every
+  call; never copied into the Wardex database.
+- `wardex adopt <id>` / MCP `adopt`: a new session record (`stopped`,
+  `ended_reason: adopted`, `origin: adopted`) bound to the native id, so `send`
+  and `resume` continue it. Refused while the session is `live`; `recent` or
+  `unknown` need `--force` (CLI only). Re-checked on every resume.
+- `adopt --fork` / `run --fork-from <id>` / MCP `adopt` with `fork`: a new
+  native session branched from the external one (`origin: forked`; Claude
+  `--fork-session`, Codex `thread/fork`); allowed while the source is live.
+- Off by default: `[external] enabled` gates the feature and `mcp` its MCP
+  exposure separately.
+
+| | Milestone |
+|---|---|
+| M10 | External sessions: discovery, history, liveness, adopt, fork |
 
 ## 3. Out of scope (Phase 3)
 

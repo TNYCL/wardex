@@ -43,7 +43,9 @@ impl ClaudeDriver {
         }
     }
 
-    pub fn args(&self, spec: &SpawnSpec) -> Vec<String> {
+    /// Arguments for `spec`. A new session or a fork gets `new_id` as its
+    /// `--session-id`.
+    pub fn args(&self, spec: &SpawnSpec, new_id: &str) -> Vec<String> {
         let mut a: Vec<String> = self.prefix_args.clone();
         a.extend(
             [
@@ -69,13 +71,22 @@ impl ClaudeDriver {
             .into(),
         );
         match &spec.resume {
+            Some(id) if spec.fork => {
+                // Claude accepts --session-id with --resume only together
+                // with --fork-session, so the fork's id is known up front.
+                a.push("--resume".into());
+                a.push(id.clone());
+                a.push("--fork-session".into());
+                a.push("--session-id".into());
+                a.push(new_id.to_string());
+            }
             Some(id) => {
                 a.push("--resume".into());
                 a.push(id.clone());
             }
             None => {
                 a.push("--session-id".into());
-                a.push(uuid::Uuid::new_v4().to_string());
+                a.push(new_id.to_string());
             }
         }
         if let Some(m) = &spec.model {
@@ -97,7 +108,8 @@ impl Driver for ClaudeDriver {
     }
 
     fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError> {
-        let args = self.args(&spec);
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let args = self.args(&spec, &new_id);
         let req = LaunchRequest {
             unit: &spec.unit,
             slice: spec.slice.as_deref(),
@@ -105,7 +117,11 @@ impl Driver for ClaudeDriver {
             args: &args,
             cwd: &spec.cwd,
         };
-        spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))
+        let mut handle = spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))?;
+        if spec.resume.is_none() || spec.fork {
+            handle.driver_session_id = Some(new_id);
+        }
+        Ok(handle)
     }
 }
 
@@ -453,7 +469,7 @@ pub fn input_summary(tool: &str, input: &Value) -> String {
     summarize(&text, INPUT_SUMMARY)
 }
 
-fn content_text(content: &Value) -> String {
+pub(crate) fn content_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
