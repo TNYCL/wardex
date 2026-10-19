@@ -81,6 +81,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Reject duplicate daemons before opening the database or recovering sessions
+  by holding an exclusive database lock for the daemon's lifetime and checking
+  the socket first. A second start, even with a different socket, no longer
+  orphans live sessions or cancels their pending questions.
 - `wardex daemon stop` returned before the daemon had exited, so an
   immediate `systemctl --user start wardex` could fail on the still-bound
   socket. It now waits for the process to exit.

@@ -111,6 +111,12 @@ transparently.
 
 - SQLite (WAL, single writer task, batched writes): `sessions`, `events`,
   `questions`. History and state survive daemon restarts.
+- Before opening SQLite or recovering sessions, the daemon takes a
+  non-blocking exclusive file lock on `<database>.lock` and binds its Unix
+  socket, rejecting a live socket and replacing a stale one. The lock is held
+  until shutdown completes, so another daemon using the same database is
+  rejected even with a different socket. The lock file stays on disk; the
+  operating system releases the lock when the daemon exits, including crashes.
 - Agent stdio pipes are owned by the daemon, so a daemon restart loses live
   sessions. On start, sessions whose process is gone are marked
   `error: orphaned` and can be continued with `wardex resume` (driver resume

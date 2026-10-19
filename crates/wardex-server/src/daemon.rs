@@ -3,11 +3,13 @@
 //! SIGHUP or a `reload` request re-reads the config and env files and
 //! applies the webhook settings without a restart.
 
+use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde_json::json;
 use tokio::signal::unix::{SignalKind, signal};
 use wardex_core::Config;
@@ -30,6 +32,8 @@ pub enum DaemonError {
     Socket(#[from] socket::SocketError),
     #[error(transparent)]
     Manager(#[from] wardex_core::manager::ManagerError),
+    #[error("another daemon is already using this database: {0}")]
+    DatabaseInUse(PathBuf),
     #[error("invalid daemon.http_listen {0:?}")]
     Listen(String),
     #[error(transparent)]
@@ -89,6 +93,8 @@ pub async fn run_with(
 ) -> Result<Exit, DaemonError> {
     let socket_path = config.socket_path();
     let db_path = config.database_path();
+    let _database_lock = lock_database(&db_path)?;
+    let listener = socket::bind(&socket_path).await?;
     let store = Store::open(&db_path).await?;
     let manager = Manager::new(
         config.clone(),
@@ -105,7 +111,6 @@ pub async fn run_with(
         );
     }
 
-    let listener = socket::bind(&socket_path).await?;
     let resumed = manager.auto_resume().await?;
     if !resumed.is_empty() {
         tracing::info!(count = resumed.len(), "resumed orphaned sessions");
@@ -195,6 +200,30 @@ pub async fn run_with(
         Exit::Stopped
     };
     Ok(exit)
+}
+
+/// Keep this file open until the store is closed. Never unlink it: another
+/// daemon must lock the same inode, including after a stop or crash.
+fn lock_database(path: &Path) -> Result<File, DaemonError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.try_lock_exclusive().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            DaemonError::DatabaseInUse(path.to_path_buf())
+        } else {
+            DaemonError::Io(e)
+        }
+    })?;
+    Ok(file)
 }
 
 /// Re-read the config and env files. Webhooks switch over at once; other
