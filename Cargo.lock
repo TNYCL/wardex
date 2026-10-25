@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "wardex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2728,8 +2728,9 @@ dependencies = [
 
 [[package]]
 name = "wardex-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "chrono",
  "regex",
  "serde",
  "serde_json",
@@ -2744,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "wardex-drivers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ruzstd",
  "serde_json",
@@ -2757,9 +2758,10 @@ dependencies = [
 
 [[package]]
 name = "wardex-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "fs2",
  "hex",
  "hmac",
@@ -2776,6 +2778,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "wardex-core",
  "wardex-drivers",
 ]

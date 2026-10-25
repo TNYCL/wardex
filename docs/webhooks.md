@@ -132,3 +132,10 @@ def valid(secret: bytes, body: bytes, header: str) -> bool:
     expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header)
 ```
+
+## MCP Events is a separate adapter
+
+The optional [`MCP Events`](mcp-events.md) feature uses platform-managed
+subscriptions and Standard Webhooks. This document's configured targets,
+headers, payload and `X-Wardex-Signature` remain unchanged. Enabling Events
+does not register a bot, migrate these targets or disable any of them.

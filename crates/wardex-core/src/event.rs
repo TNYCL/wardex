@@ -96,6 +96,10 @@ pub enum EventKind {
         kind: String,
         summary: String,
     },
+    /// The native request was resolved or cancelled without a Wardex answer.
+    Resolved {
+        question_id: String,
+    },
     /// A question or approval was answered.
     Answered {
         question_id: String,
@@ -210,6 +214,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "question",
     "approval",
     "answered",
+    "resolved",
     "reminder",
     "done",
     "error",
@@ -232,6 +237,7 @@ impl EventKind {
             Self::Question { .. } => "question",
             Self::Approval { .. } => "approval",
             Self::Answered { .. } => "answered",
+            Self::Resolved { .. } => "resolved",
             Self::Reminder { .. } => "reminder",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
@@ -305,6 +311,7 @@ impl EventKind {
                 kind,
                 summary,
             } => format!("approval {request_id} ({kind}): {summary}"),
+            Self::Resolved { question_id } => format!("resolved {question_id}"),
             Self::Answered {
                 question_id,
                 answer,

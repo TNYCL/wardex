@@ -12,6 +12,8 @@ homepage.workspace = true
 include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
+uuid.workspace = true
+base64.workspace = true
 wardex-core.workspace = true
 wardex-drivers.workspace = true
 axum.workspace = true

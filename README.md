@@ -8,7 +8,7 @@ and resume them from the CLI or from any MCP client.**
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](https://github.com/TNYCL/wardex#license)
 [![MSRV: 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://github.com/TNYCL/wardex/blob/main/Cargo.toml)
 
-> **Status: early release (0.1).** Linux only. Interfaces, config and the
+> **Status: early release (0.2).** Linux only. Interfaces, config and the
 > database schema may still change between minor versions; see the
 > [changelog](https://github.com/TNYCL/wardex/blob/main/CHANGELOG.md) before
 > upgrading.
@@ -63,6 +63,9 @@ agents on one machine and has been tested with 21 live sessions.
   worktree; `summary` reports touched files, branch and uncommitted changes.
 - **Stuck detection.** A reminder after 3 min on an unanswered question,
   `stuck` after 8 min of silence while no tool is running. All configurable.
+- **Optional MCP Events.** Native platform subscriptions, verified callbacks,
+  Standard Webhooks signatures and durable delivery; disabled by default.
+  See [MCP Events](docs/mcp-events.md).
 - **Webhooks.** Important events are POSTed with retries and an optional
   HMAC-SHA256 signature, routed per agent and task, and reloaded without a
   restart.
@@ -81,6 +84,9 @@ agents on one machine and has been tested with 21 live sessions.
 - Rust 1.88 or newer to build.
 
 ## Install
+
+The GitHub source release may precede crates.io. MCP Events requires 0.2 or
+newer; build that tag from source if it is not published to the registry yet.
 
 From crates.io:
 

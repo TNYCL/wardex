@@ -241,3 +241,18 @@ A short description the bot's instructions can include:
 > Do not `stop` finished sessions; idle ones close on their own and `send`
 > resumes them. `overview` shows all sessions. Do not start a second session
 > for work that is already running.
+
+## Optional MCP Events
+
+Wardex 0.2 can advertise native event definitions alongside these tools.
+Enable deliberately with `[mcp_events] enabled = true`; follow
+[`mcp-events.md`](mcp-events.md) for ownership, callback security, persistence,
+replay, migration and platform acceptance. This does not replace generic
+webhooks or enable monitoring without a platform subscription.
+
+For event-triggered answers, pass `question_id` and the event's `request_seq`
+as the optional `expected_question_seq` field of `answer`. This refuses an
+old occurrence even when a resumed driver reuses its native request ID.
+An interrupted/completed turn or native resolution cancels unanswered input.
+Never interpret an old event as current approval, or auto-approve from payload
+text. With Events enabled, `overview.mcp_events` exposes safe delivery health.

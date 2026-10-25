@@ -44,9 +44,11 @@ pub fn router(manager: Manager, token: &str, shutdown: CancellationToken) -> Rou
         Arc::new(LocalSessionManager::default()),
         mcp_config(&http, shutdown),
     );
-    let protected = Router::new()
-        .nest_service("/mcp", mcp)
-        .layer(middleware::from_fn_with_state(state.clone(), require_token));
+    let mut protected = Router::new().nest_service("/mcp", mcp);
+    if state.manager.config().mcp_events.enabled {
+        protected = protected.layer(middleware::from_fn(crate::mcp_compat::http_capabilities));
+    }
+    let protected = protected.layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/healthz", get(healthz))
         .merge(protected)
@@ -169,12 +171,12 @@ pub fn authorized(headers: &HeaderMap, token: &str) -> bool {
     constant_time_eq(given.trim().as_bytes(), token.as_bytes())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }

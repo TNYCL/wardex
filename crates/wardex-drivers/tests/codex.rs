@@ -408,3 +408,33 @@ async fn end_to_end_tool_turn() {
     assert_eq!(summary.last_result.as_deref(), Some("1 file."));
     assert_eq!(summary.tool_counts.get("shell"), Some(&1));
 }
+
+#[test]
+fn resolved_and_completed_native_requests_cannot_receive_late_answers() {
+    let records = load("codex", "question");
+    let ask = records
+        .iter()
+        .position(|r| r.dir == "out" && r.msg["method"] == "item/tool/requestUserInput")
+        .unwrap();
+    for resolution in [
+        json!({"method":"serverRequest/resolved","params":{"requestId":0}}),
+        json!({"method":"turn/completed","params":{"turn":{"status":"interrupted"}}}),
+    ] {
+        let mut p = CodexProtocol::new(&spec(false, None));
+        drive(&mut p, &records[..=ask]);
+        let resolved = p.on_line(&resolution.to_string());
+        if resolution["method"] == "serverRequest/resolved" {
+            assert_eq!(resolved.events[0].name(), "resolved");
+        }
+        let response = p.on_command(DriverCommand::Answer {
+            question_id: "0".into(),
+            answer: Answer::Question {
+                items: BTreeMap::new(),
+            },
+        });
+        assert!(
+            response.writes.is_empty(),
+            "late native response must not be emitted"
+        );
+    }
+}

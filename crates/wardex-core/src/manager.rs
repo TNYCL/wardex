@@ -435,6 +435,7 @@ struct Live {
 
 struct Pending {
     question_id: String,
+    seq: u64,
     request: EventKind,
     asked_ms: i64,
     reminded: bool,
@@ -538,6 +539,7 @@ impl Manager {
         launcher: Launcher,
         external: ExternalSetup,
     ) -> Self {
+        store.configure_mcp_events(config.mcp_events.clone());
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let drivers = drivers.into_iter().map(|d| (d.kind(), d)).collect();
         let probe = ProbeConfig {
@@ -1206,6 +1208,7 @@ impl Manager {
                         _ => unreachable!(),
                     };
                     let pending = Pending {
+                        seq: entry.record.last_seq + 1,
                         question_id: question_id.clone(),
                         request: k.clone(),
                         asked_ms: now,
@@ -1216,12 +1219,17 @@ impl Manager {
                     entry.pending.push(pending);
                     k
                 }
+                EventKind::Resolved { question_id } => {
+                    entry.pending.retain(|p| p.question_id != question_id);
+                    EventKind::Resolved { question_id }
+                }
                 EventKind::Done {
                     result,
                     interrupted,
                     note,
                     git,
                 } => {
+                    entry.pending.clear();
                     let interrupted = interrupted || entry.interrupt_requested;
                     entry.interrupt_requested = false;
                     entry.turn_active = false;
@@ -1238,6 +1246,7 @@ impl Manager {
                     }
                 }
                 EventKind::Error { message } => {
+                    entry.pending.clear();
                     // Drivers report errors when a turn ends with a failure.
                     entry.turn_active = false;
                     entry.running_tools.clear();
@@ -2061,6 +2070,17 @@ impl Manager {
         question_id: Option<&str>,
         input: AnswerInput,
     ) -> Result<String> {
+        self.answer_checked(id, question_id, input, None).await
+    }
+
+    /// Refuse a stale event, including a native id reused after resume.
+    pub async fn answer_checked(
+        &self,
+        id: &SessionId,
+        question_id: Option<&str>,
+        input: AnswerInput,
+        expected_question_seq: Option<u64>,
+    ) -> Result<String> {
         let publication = self.inner.store.reserve_publication()?;
         let qid = {
             let mut live = self.live();
@@ -2087,6 +2107,11 @@ impl Manager {
                     0
                 }
             };
+            if expected_question_seq.is_some_and(|seq| entry.pending[idx].seq != seq) {
+                return Err(ManagerError::Conflict(
+                    "stale question occurrence; no answer was sent".into(),
+                ));
+            }
             let answer = build_answer(&entry.pending[idx].request, input)?;
             let pending = &entry.pending[idx];
             entry

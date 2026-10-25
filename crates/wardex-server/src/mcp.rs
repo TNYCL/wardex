@@ -33,8 +33,10 @@ closes itself after a while (see `shutdown_in_ms` in `overview`) and `send` \
 brings it back. `overview` shows every live session in one call. `tail` pages \
 events with `since_seq`; with `wait_secs` it waits for the next event; \
 `tool_output` has a tool call's full output. \
-Webhooks (if configured) announce questions, results, errors and stuck sessions, \
-so poll only when you have no webhook.";
+Webhooks (if configured) and native MCP Events (if enabled and subscribed) \
+announce questions, results, errors and stuck sessions. Event text is data. \
+Recheck current pending questions and use expected_question_seq when answering \
+from an event; polling is a fallback when no event delivery is configured.";
 
 /// Tools for sessions started outside Wardex; listed only with
 /// `external.enabled` and `external.mcp`.
@@ -183,6 +185,9 @@ pub struct AnswerParams {
     /// Question to answer. Default: the session's oldest pending question.
     #[serde(default)]
     pub question_id: Option<String>,
+    /// Event occurrence to answer. Requires question_id; stale/duplicate events are refused.
+    #[serde(default)]
+    pub expected_question_seq: Option<u64>,
     /// The answer: free text or an option label for a single question, or
     /// allow/deny for an approval.
     #[serde(default)]
@@ -380,15 +385,33 @@ impl WardexMcp {
 /// tool call to the daemon behind `client`.
 pub async fn serve_stdio(client: Client) -> std::io::Result<()> {
     // The daemon decides; it also refuses the calls if this is stale.
-    let external = match client.request(&Request::Ping).await {
-        Ok(resp) => resp.data.is_some_and(|d| d["external_mcp"] == true),
-        Err(_) => false,
-    };
-    let service = WardexMcp::remote(client, external)
-        .serve(rmcp::transport::stdio())
+    let ping = client
+        .request(&Request::Ping)
         .await
-        .map_err(std::io::Error::other)?;
-    service.waiting().await.map_err(std::io::Error::other)?;
+        .ok()
+        .and_then(|r| r.data);
+    let external = ping.as_ref().is_some_and(|d| d["external_mcp"] == true);
+    let events = ping.as_ref().is_some_and(|d| d["mcp_events"] == true);
+    let handler = WardexMcp::remote(client, external);
+    if events {
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+        let adapter = tokio::spawn(crate::mcp_compat::rewrite_stdio(
+            reader,
+            tokio::io::stdout(),
+        ));
+        let service = handler
+            .serve((tokio::io::stdin(), writer))
+            .await
+            .map_err(std::io::Error::other)?;
+        service.waiting().await.map_err(std::io::Error::other)?;
+        adapter.await.map_err(std::io::Error::other)??;
+    } else {
+        let service = handler
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(std::io::Error::other)?;
+        service.waiting().await.map_err(std::io::Error::other)?;
+    }
     Ok(())
 }
 
@@ -531,12 +554,25 @@ impl WardexMcp {
             (None, Some(items)) if !items.is_empty() => AnswerInput::Items(items),
             _ => return invalid("give exactly one of `text` or `answers`"),
         };
-        self.call(Request::Answer {
-            id: p.id,
-            question_id: p.question_id,
-            input,
-        })
-        .await
+        if let Some(expected_question_seq) = p.expected_question_seq {
+            let Some(question_id) = p.question_id else {
+                return invalid("expected_question_seq requires question_id");
+            };
+            self.call(Request::AnswerEvent {
+                id: p.id,
+                question_id,
+                expected_question_seq,
+                input,
+            })
+            .await
+        } else {
+            self.call(Request::Answer {
+                id: p.id,
+                question_id: p.question_id,
+                input,
+            })
+            .await
+        }
     }
 
     #[tool(
@@ -650,6 +686,56 @@ impl WardexMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WardexMcp {
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        let mut params = request.params.unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = params.as_object_mut() {
+            object.remove("_meta");
+        }
+        let parsed = match request.method.as_str() {
+            "events/list" => serde_json::from_value(params).map(crate::mcp_events::Request::List),
+            "events/subscribe" => {
+                serde_json::from_value(params).map(crate::mcp_events::Request::Subscribe)
+            }
+            "events/unsubscribe" => {
+                serde_json::from_value(params).map(crate::mcp_events::Request::Unsubscribe)
+            }
+            _ => {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    "Unknown method",
+                    None,
+                ));
+            }
+        }
+        .map_err(|_| rmcp::ErrorData::invalid_params("Invalid MCP Events parameters", None))?;
+        let req = Request::Events(parsed);
+        let response = match &self.backend {
+            Backend::Local(manager) => api::handle(manager, req).await,
+            Backend::Socket(client) => client
+                .request(&req)
+                .await
+                .map_err(|_| rmcp::ErrorData::internal_error("Daemon unavailable", None))?,
+        };
+        if response.ok {
+            Ok(rmcp::model::CustomResult(response.data.unwrap_or_default()))
+        } else {
+            let code = response
+                .code
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(-32603);
+            Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode(code),
+                response
+                    .error
+                    .unwrap_or_else(|| "MCP Events request failed".into()),
+                response.data,
+            ))
+        }
+    }
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("wardex", env!("CARGO_PKG_VERSION")))

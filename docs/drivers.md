@@ -335,3 +335,14 @@ systemd-run --user --scope --quiet --expand-environment=no
   and kills the whole scope when a session ends.
 - `cargo test -p wardex-core -- --ignored systemd` checks all of the above on
   a host with a systemd user manager.
+
+### Input request resolution (0.2)
+
+The recorded baseline remains Codex CLI 0.163.0; no additional live CLI
+version is claimed. Synthetic protocol tests supplement that baseline:
+`serverRequest/resolved` removes a request handle, and `turn/completed`
+invalidates the remaining handles. Manager completion/interruption cancels
+unanswered questions. `answer.expected_question_seq` can fence a native ID
+reused in a later occurrence. The resolution message follows the current
+[App Server guide](https://learn.chatgpt.com/docs/app-server); validate it
+against generated schemas/recordings before changing supported CLI versions.
