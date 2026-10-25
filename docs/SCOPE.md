@@ -319,7 +319,8 @@ interrupts (`done` interrupted on both drivers).
   comparison and a rate limit on failed authentications
   (`http.auth_failures_per_minute`). `/mcp` checks the `Host` header against
   localhost and `http.allowed_hosts` (DNS rebinding protection).
-- MCP is pull-based. Webhooks wake clients; clients pull details over MCP.
+- Tools pull details over MCP. Generic webhooks or optional MCP Events wake
+  clients; see `mcp-events.md` for durable platform subscriptions.
 
 ### 2.2 Exposure
 
@@ -386,6 +387,15 @@ continued. Details: [`external-sessions.md`](external-sessions.md).
 | | Milestone |
 |---|---|
 | M10 | External sessions: discovery, history, liveness, adopt, fork |
+
+### 2.5 Optional MCP Events (0.2)
+
+Native event discovery/subscription methods, verified Standard Webhooks
+callbacks and a transactional journal/outbox are opt-in. They retain the
+single-owner model and generic webhook compatibility. Safe lifecycle payloads,
+scoped replay, duplicate delivery and current-question occurrence checks are
+documented in [`mcp-events.md`](mcp-events.md). Platform setup and live
+acceptance remain deployment work. Fast and reboot persistence are separate.
 
 ## 3. Out of scope (Phase 3)
 

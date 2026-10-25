@@ -59,6 +59,10 @@ struct Daemon {
 
 async fn daemon(config: Config) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
+    if config.mcp_events.enabled {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let store = Store::open(&dir.path().join("w.db")).await.unwrap();
     let script = replay_script(dir.path(), "question.jsonl");
     let driver = Arc::new(ClaudeDriver::with_command(
@@ -616,4 +620,103 @@ async fn host_header_is_checked() {
     assert_eq!(host_status(d.url.clone(), "wardex.example.com").await, 200);
     assert_eq!(host_status(d.url.clone(), "other.example.com").await, 403);
     d.cancel.cancel();
+}
+
+#[tokio::test]
+async fn events_discovery_capability_is_opt_in_and_authenticated() {
+    for enabled in [false, true] {
+        let mut config = Config::default();
+        config.mcp_events.enabled = enabled;
+        let d = daemon(config).await;
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientInfo":{"name":"contract-test","version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }}});
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/mcp", d.url))
+            .header("accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "server/discover")
+            .bearer_auth(TOKEN)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        let data: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            data["result"]["capabilities"].get("events").is_some(),
+            enabled,
+            "{data}"
+        );
+        assert!(data["result"]["capabilities"]["tools"].is_object());
+        let denied = client
+            .post(format!("{}/mcp", d.url))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        d.cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn native_events_methods_use_mcp_errors_and_keep_tools_compatible() {
+    for enabled in [false, true] {
+        let mut config = Config::default();
+        config.mcp_events.enabled = enabled;
+        let d = daemon(config).await;
+        let client = reqwest::Client::new();
+        for (method, arguments) in [
+            ("events/list", json!({})),
+            (
+                "events/subscribe",
+                json!({
+                    "name":"wardex.done","arguments":{"session_id":"test"},
+                    "delivery":{"mode":"webhook","url":"https://127.0.0.1/callback","secret":"invalid"}
+                }),
+            ),
+        ] {
+            let mut params = arguments;
+            params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"contract-test","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities":{}});
+            let request = json!({"jsonrpc":"2.0","id":2,"method":method,"params":params});
+            let response = client
+                .post(format!("{}/mcp", d.url))
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", method)
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let body: Value = response.json().await.unwrap();
+            if !enabled {
+                assert_eq!(body["error"]["code"], -32601, "{body}");
+            } else if method == "events/list" {
+                assert_eq!(body["result"]["events"].as_array().unwrap().len(), 8);
+            } else {
+                assert_eq!(body["error"]["code"], -32602, "{body}");
+            }
+        }
+        // Legacy initialize and tools still work with the feature enabled.
+        let connected = connect(&d.url).await;
+        assert!(
+            connected
+                .list_all_tools()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "run")
+        );
+        connected.cancel().await.unwrap();
+        d.cancel.cancel();
+    }
 }

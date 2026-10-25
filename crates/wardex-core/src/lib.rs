@@ -23,3 +23,5 @@ pub use session::{
     AdoptSpec, EndReason, ListFilter, RunSpec, SessionId, SessionOrigin, SessionRecord,
     SessionState,
 };
+
+pub mod mcp_events;

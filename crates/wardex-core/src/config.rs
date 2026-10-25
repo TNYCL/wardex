@@ -40,6 +40,7 @@ pub struct Config {
     pub resources: ResourcesConfig,
     pub external: ExternalConfig,
     pub webhooks: Vec<WebhookConfig>,
+    pub mcp_events: McpEventsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,6 +333,37 @@ impl ExternalConfig {
     }
 }
 
+/// Optional MCP Events webhook delivery. Independent of generic webhooks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpEventsConfig {
+    pub enabled: bool,
+    pub authorization_epoch: u64,
+    pub ttl_secs: u64,
+    pub max_subscriptions: u32,
+    pub max_pending: u32,
+    pub retention_days: u64,
+    pub max_attempts: u32,
+    pub retry_window_secs: u64,
+    pub timeout_secs: u64,
+}
+
+impl Default for McpEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            authorization_epoch: 0,
+            ttl_secs: 3600,
+            max_subscriptions: 128,
+            max_pending: 4096,
+            retention_days: 7,
+            max_attempts: 8,
+            retry_window_secs: 900,
+            timeout_secs: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
@@ -535,6 +567,20 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let events = &self.mcp_events;
+        if !(60..=86400).contains(&events.ttl_secs)
+            || !(1..=1024).contains(&events.max_subscriptions)
+            || !(1..=65536).contains(&events.max_pending)
+            || !(1..=365).contains(&events.retention_days)
+            || !(1..=32).contains(&events.max_attempts)
+            || !(60..=86400).contains(&events.retry_window_secs)
+            || !(1..=30).contains(&events.timeout_secs)
+        {
+            return Err(ConfigError::Invalid(
+                "invalid MCP Events lifetime, capacity or retry limits".into(),
+            ));
+        }
+
         for (i, hook) in self.webhooks.iter().enumerate() {
             if hook.url_env.is_empty() {
                 return Err(ConfigError::Invalid(format!(

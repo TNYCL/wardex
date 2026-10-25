@@ -1197,3 +1197,33 @@ fn tool_output_is_stored_in_full() {
     );
     env.stop_daemon(daemon);
 }
+
+#[test]
+fn mcp_events_discovery_and_methods_forward_over_real_stdio_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let env = Env::with_config("question", "\n[mcp_events]\nenabled = true\n");
+    let state = env.dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = env.start_daemon();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut command=tokio::process::Command::from(env.cmd(&["mcp","--stdio"]));
+        let mut proxy=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let mut input=proxy.stdin.take().unwrap();let mut output=BufReader::new(proxy.stdout.take().unwrap());
+        for (id,method) in [(1,"server/discover"),(2,"events/list")] {
+            let request=serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"stdio-contract","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities":{}}}});
+            input.write_all(format!("{request}\n").as_bytes()).await.unwrap();input.flush().await.unwrap();
+            let mut line=String::new();tokio::time::timeout(Duration::from_secs(5),output.read_line(&mut line)).await.unwrap().unwrap();
+            let response:Value=serde_json::from_str(&line).unwrap();assert_eq!(response["id"],id,"{response}");
+            if id==1 {assert!(response["result"]["capabilities"]["events"].is_object(),"{response}");}
+            else {assert_eq!(response["result"]["events"].as_array().unwrap().len(),8);}
+        }
+        drop(input);
+        let status=tokio::time::timeout(Duration::from_secs(5),proxy.wait()).await.unwrap().unwrap();assert!(status.success());
+    });
+    env.stop_daemon(daemon);
+}

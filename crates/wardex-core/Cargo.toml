@@ -12,6 +12,7 @@ homepage.workspace = true
 include = ["src/**/*", "migrations/**/*", "LICENSE-*"]
 
 [dependencies]
+chrono.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

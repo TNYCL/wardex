@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
+### Added
+
+- Optional native MCP Events, disabled by default: event discovery, scoped
+  subscriptions, callback verification, Standard Webhooks signatures and
+  transactional SQLite journal/outbox delivery over HTTP or stdio proxies.
+- Durable retry/claim recovery, finite TTL, bounded replay and retention,
+  secret rotation, explicit owner authorization-epoch revocation, safe lifecycle
+  payloads and delivery health in `overview`.
+- `answer.expected_question_seq` to refuse stale or duplicate input events,
+  including a native request ID reused after resume.
+- HTTP/stdio wire contract, callback/signature/SSRF, crash recovery, replay,
+  duplicate delivery and question/approval regression tests.
+
+### Fixed
+
+- Cancel pending input on turn completion/interruption and handle Codex
+  native request resolution so obsolete requests cannot be answered later.
+
+### Compatibility and operations
+
+- Generic configured webhooks, their payload/signature and existing clients
+  remain supported. No webhook target is migrated or removed automatically.
+- Migration 0006 is additive but older embedded sqlx migrators may reject the
+  newer database. Follow `docs/mcp-events.md` before deployment or rollback.
+- Events persist sensitive callback secrets in owner-only SQLite storage;
+  existing database/directory permissions are checked rather than changed.
+- Platform event arrival requires separate deployment acceptance with an
+  approved plugin/subscription. No production installation or runtime change
+  is part of the source release. Fast and reboot persistence are separate.
+
 ## [0.1.0] - 2026-10-20
 
 First functional release (Phases 1 and 2 of `docs/SCOPE.md`). 0.0.1 was a

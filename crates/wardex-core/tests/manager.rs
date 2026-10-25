@@ -2206,3 +2206,108 @@ async fn explicit_reasoning_is_kept() {
     assert_eq!(status.session.reasoning.as_deref(), Some("low"));
     assert_eq!(status.session.model.as_deref(), Some("fake-model-1"));
 }
+
+#[tokio::test]
+async fn event_answer_refuses_duplicates_and_reused_native_request_ids() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "ask")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::WaitingInput).await;
+    let seq = h
+        .manager
+        .events(&id, 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind.name() == "question")
+        .unwrap()
+        .seq;
+    assert!(
+        h.manager
+            .answer_checked(
+                &id,
+                Some("q1"),
+                AnswerInput::Text("blue".into()),
+                Some(seq + 1)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(h.manager.status(&id).await.unwrap().pending.len(), 1);
+    h.manager
+        .answer_checked(&id, Some("q1"), AnswerInput::Text("blue".into()), Some(seq))
+        .await
+        .unwrap();
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    h.manager.send(&id, "ask".into()).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::WaitingInput).await;
+    assert!(
+        h.manager
+            .answer_checked(&id, Some("q1"), AnswerInput::Text("red".into()), Some(seq))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.manager.status(&id).await.unwrap().pending.len(),
+        1,
+        "old duplicate must not answer the new q1"
+    );
+    h.manager.interrupt(&id).await.unwrap();
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    assert!(h.manager.pending_questions().await.unwrap().is_empty());
+    assert!(
+        h.manager
+            .answer_checked(&id, Some("q1"), AnswerInput::Text("red".into()), Some(seq))
+            .await
+            .is_err()
+    );
+    h.manager
+        .shutdown(Duration::from_millis(100))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_approval_requires_the_current_request_occurrence() {
+    let h = harness().await;
+    let id = h.manager.run(spec(&h, "approve")).await.unwrap().session.id;
+    wait_state(&h.manager, &id, SessionState::WaitingInput).await;
+    let seq = h
+        .manager
+        .events(&id, 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind.name() == "approval")
+        .unwrap()
+        .seq;
+    assert!(
+        h.manager
+            .answer_checked(
+                &id,
+                Some("r1"),
+                AnswerInput::Text("allow".into()),
+                Some(seq + 1)
+            )
+            .await
+            .is_err()
+    );
+    h.manager
+        .answer_checked(&id, Some("r1"), AnswerInput::Text("deny".into()), Some(seq))
+        .await
+        .unwrap();
+    wait_state(&h.manager, &id, SessionState::Idle).await;
+    assert_eq!(
+        h.manager
+            .status(&id)
+            .await
+            .unwrap()
+            .session
+            .last_result
+            .as_deref(),
+        Some("answered allow=false")
+    );
+    h.manager
+        .shutdown(Duration::from_millis(100))
+        .await
+        .unwrap();
+}

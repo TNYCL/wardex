@@ -107,3 +107,18 @@ agents = ["bot-a"]
 hmac_secret_env = "WARDEX_WEBHOOK_SECRET"
 # Optional extra headers; values are env var names.
 # headers = { "Authorization" = "WARDEX_WEBHOOK_AUTH" }
+
+# Optional native MCP Events; independent of [[webhooks]]. See docs/mcp-events.md.
+# Before enabling, protect the database (0600), its directory (0700) and backups.
+# Existing permissions are checked, never silently changed. Subscription secrets
+# are sensitive plaintext in SQLite. No platform subscription is created here.
+[mcp_events]
+enabled = false
+authorization_epoch = 0     # bump on credential/access revocation; restart required
+ttl_secs = 3600            # finite grant, 60..86400; minimum requested TTL is 60 s
+max_subscriptions = 128     # 1..1024 per daemon owner
+max_pending = 4096          # 1..65536 per subscription; overflow suspends it
+retention_days = 7          # 1..365; replay is bounded by retained history
+max_attempts = 8            # 1..32
+retry_window_secs = 900     # 60..86400
+timeout_secs = 10           # 1..30; includes DNS, connection and bounded response

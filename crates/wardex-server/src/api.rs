@@ -26,6 +26,13 @@ const MAX_OVERVIEW_EVENTS: i64 = 50;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    Events(crate::mcp_events::Request),
+    AnswerEvent {
+        id: String,
+        question_id: String,
+        expected_question_seq: u64,
+        input: AnswerInput,
+    },
     Run(RunSpec),
     /// Without filters, live sessions; see [`ListFilter`].
     List {
@@ -342,11 +349,15 @@ fn to_value<T: Serialize>(v: &T) -> Value {
 /// Handle a request that produces a single response. `Tail` with `follow`
 /// and `Shutdown` are handled by the transport.
 pub async fn handle(manager: &Manager, req: Request) -> Response {
+    if let Request::Events(request) = &req {
+        return crate::mcp_events::handle(manager, request.clone()).await;
+    }
     let action = matches!(
         &req,
         Request::Run(_)
             | Request::Send { .. }
             | Request::Answer { .. }
+            | Request::AnswerEvent { .. }
             | Request::Resume { .. }
             | Request::Stop { .. }
             | Request::Interrupt { .. }
@@ -370,11 +381,29 @@ pub async fn handle(manager: &Manager, req: Request) -> Response {
 
 async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> {
     Ok(match req {
+        Request::Events(_) => {
+            return Err(ManagerError::Invalid(
+                "events require the dedicated handler".into(),
+            ));
+        }
+        Request::AnswerEvent {
+            id,
+            question_id,
+            expected_question_seq,
+            input,
+        } => {
+            let id = m.resolve(&id).await?;
+            let question_id = m
+                .answer_checked(&id, Some(&question_id), input, Some(expected_question_seq))
+                .await?;
+            json!({"session_id":id,"question_id":question_id})
+        }
         Request::Ping => json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
             "started_ms": m.started_ms(),
             "external_mcp": m.config().external.over_mcp(),
+            "mcp_events": m.config().mcp_events.enabled,
         }),
         Request::Run(spec) => to_value(&m.run(spec).await?),
         Request::List {
@@ -479,14 +508,26 @@ async fn handle_inner(m: &Manager, req: Request) -> Result<Value, ManagerError> 
             to_value(&m.resume(&id, message).await?)
         }
         Request::Pending => to_value(&m.pending_questions().await?),
-        Request::Overview { events } => to_value(
-            &m.overview(
-                events
-                    .unwrap_or(DEFAULT_OVERVIEW_EVENTS)
-                    .clamp(0, MAX_OVERVIEW_EVENTS),
-            )
-            .await?,
-        ),
+        Request::Overview { events } => {
+            let mut result = to_value(
+                &m.overview(
+                    events
+                        .unwrap_or(DEFAULT_OVERVIEW_EVENTS)
+                        .clamp(0, MAX_OVERVIEW_EVENTS),
+                )
+                .await?,
+            );
+            if m.config().mcp_events.enabled {
+                result["mcp_events"] = m
+                    .store()
+                    .event_delivery_health(&wardex_core::mcp_events::owner_principal(
+                        &m.config().mcp_events,
+                    ))
+                    .await
+                    .unwrap_or_else(|_| json!({"unavailable":true}));
+            }
+            result
+        }
         Request::Shutdown { .. } => {
             return Err(ManagerError::Invalid(
                 "shutdown is handled by the daemon's socket server".into(),

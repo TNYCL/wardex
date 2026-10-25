@@ -19,6 +19,12 @@ use crate::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("MCP Events requires owner-only database and parent directory permissions")]
+    McpEventPermissions,
+    #[error("MCP Events subscription limit reached")]
+    McpEventLimit,
+    #[error("MCP Events cursor is ahead of retained history")]
+    McpEventCursor,
     #[error(
         "database error: {0}; inspect database access and disk space; use list/status or stop/interrupt, and daemon stop without --drain to exit"
     )]
@@ -65,7 +71,8 @@ pub struct QuestionRow {
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
+    pub(crate) event_config: Arc<Mutex<crate::config::McpEventsConfig>>,
     path: PathBuf,
     writer: mpsc::Sender<QueuedItem>,
     state: Arc<Mutex<WriterState>>,
@@ -149,6 +156,23 @@ impl Store {
                 source,
             })?;
         }
+        // New databases are owner-only. Existing permissions are never changed.
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
         let url = format!("sqlite://{}", path.display());
         let options = SqliteConnectOptions::from_str(&url)?
             .create_if_missing(true)
@@ -166,14 +190,17 @@ impl Store {
         let state = Arc::new(Mutex::new(WriterState::default()));
         let changed = Arc::new(Notify::new());
         let capacity = Arc::new(Semaphore::new(QUEUE_LIMIT));
+        let event_config = Arc::new(Mutex::new(crate::config::McpEventsConfig::default()));
         tokio::spawn(writer_loop(
             pool.clone(),
             rx,
             state.clone(),
             changed.clone(),
+            event_config.clone(),
         ));
         Ok(Self {
             pool,
+            event_config,
             path: path.to_path_buf(),
             writer: tx,
             state,
@@ -867,6 +894,7 @@ async fn writer_loop(
     mut rx: mpsc::Receiver<QueuedItem>,
     state: Arc<Mutex<WriterState>>,
     changed: Arc<Notify>,
+    event_config: Arc<Mutex<crate::config::McpEventsConfig>>,
 ) {
     let mut ready = VecDeque::new();
     let mut quarantine: VecDeque<QueuedItem> = VecDeque::new();
@@ -900,7 +928,11 @@ async fn writer_loop(
                 continue;
             }
             let refs: Vec<_> = batch.iter().map(|q| &q.item).collect();
-            match write_batch(&pool, &refs).await {
+            let event_options = event_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match write_batch(&pool, &refs, &event_options).await {
                 Ok(()) => complete(&state, &changed, &batch),
                 Err(error) if record_error(&error) => {
                     // Split a failed transaction. Isolate only the poisoned
@@ -911,7 +943,7 @@ async fn writer_loop(
                             quarantine.push_back(item);
                             continue;
                         }
-                        match write_batch(&pool, &[&item.item]).await {
+                        match write_batch(&pool, &[&item.item], &event_options).await {
                             Ok(()) => complete(&state, &changed, std::slice::from_ref(&item)),
                             Err(error) if record_error(&error) => {
                                 let id = item.item.session().clone();
@@ -1017,19 +1049,25 @@ fn record_error(error: &StoreError) -> bool {
     }
 }
 
-async fn write_batch(pool: &SqlitePool, batch: &[&Item]) -> Result<()> {
+async fn write_batch(
+    pool: &SqlitePool,
+    batch: &[&Item],
+    event_options: &crate::config::McpEventsConfig,
+) -> Result<()> {
     let mut tx = pool.begin().await?;
     for item in batch {
         match *item {
             Item::Exit { events, record } => {
                 for event in events {
                     insert_event_query(event)?.execute(&mut *tx).await?;
+                    crate::mcp_events::journal(&mut tx, event, event_options).await?;
                 }
                 update_session_query(record).execute(&mut *tx).await?;
                 cancel_questions_query(&record.id).execute(&mut *tx).await?;
             }
             Item::Publish { event, record } => {
                 insert_event_query(event)?.execute(&mut *tx).await?;
+                crate::mcp_events::journal(&mut tx, event, event_options).await?;
                 update_session_query(record).execute(&mut *tx).await?;
                 match &event.kind {
                     kind @ (EventKind::Question { .. } | EventKind::Approval { .. }) => {
@@ -1061,7 +1099,11 @@ async fn write_batch(pool: &SqlitePool, batch: &[&Item]) -> Result<()> {
                             .execute(&mut *tx)
                             .await?;
                     }
-                    EventKind::Ended { .. } => {
+                    EventKind::Resolved { question_id } => {
+                        sqlx::query("UPDATE questions SET cancelled=1 WHERE session_id=? AND question_id=? AND answered_ms IS NULL")
+                            .bind(event.session_id.as_str()).bind(question_id).execute(&mut *tx).await?;
+                    }
+                    EventKind::Done { .. } | EventKind::Error { .. } | EventKind::Ended { .. } => {
                         cancel_questions_query(&event.session_id)
                             .execute(&mut *tx)
                             .await?;
@@ -1071,6 +1113,7 @@ async fn write_batch(pool: &SqlitePool, batch: &[&Item]) -> Result<()> {
             }
             Item::Event(ev) => {
                 insert_event_query(ev)?.execute(&mut *tx).await?;
+                crate::mcp_events::journal(&mut tx, ev, event_options).await?;
             }
             Item::Session(s) => {
                 update_session_query(s).execute(&mut *tx).await?;

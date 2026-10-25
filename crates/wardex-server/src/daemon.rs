@@ -118,6 +118,9 @@ pub async fn run_with(
         },
     );
 
+    if config.mcp_events.enabled {
+        store.check_event_permissions()?;
+    }
     let orphaned = manager.recover().await?;
     if !orphaned.is_empty() {
         tracing::warn!(
@@ -144,6 +147,7 @@ pub async fn run_with(
         let m = manager.clone();
         tokio::spawn(async move { m.supervise().await });
     }
+    let event_dispatcher = crate::mcp_events::spawn(manager.clone()).await?;
     let webhooks = webhook::spawn(
         webhook::resolve_all(&config, |k| env.get(k)),
         manager.clone(),
@@ -206,6 +210,7 @@ pub async fn run_with(
     let grace = Duration::from_secs(config.sessions.stop_grace_secs + 5);
     let shutdown_result = manager.shutdown(grace).await;
     let _ = std::fs::remove_file(&socket_path);
+    event_dispatcher.shutdown().await;
     let close_result = store.close().await;
     match shutdown_result {
         Ok(report) => {
@@ -283,6 +288,7 @@ fn reload(
         ("drivers", running.drivers != new.drivers),
         ("resources", running.resources != new.resources),
         ("external", running.external != new.external),
+        ("mcp_events", running.mcp_events != new.mcp_events),
     ]
     .into_iter()
     .filter_map(|(name, changed)| changed.then_some(name))

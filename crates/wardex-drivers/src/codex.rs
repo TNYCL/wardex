@@ -387,7 +387,19 @@ impl CodexProtocol {
                     });
                 }
             }
+            "serverRequest/resolved" => {
+                if let Some(id) = params.get("requestId") {
+                    let key = id
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| id.to_string());
+                    if self.requests.remove(&key).is_some() {
+                        out.events.push(EventKind::Resolved { question_id: key });
+                    }
+                }
+            }
             "turn/completed" => {
+                self.requests.clear();
                 let turn = &params["turn"];
                 self.turn_active = false;
                 self.turn_id = None;
