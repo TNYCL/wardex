@@ -77,6 +77,7 @@ impl Driver for GrokDriver {
             program: &self.config.bin,
             args: &args,
             cwd: &spec.cwd,
+            env: &[],
         };
         spawn_with(
             launcher,

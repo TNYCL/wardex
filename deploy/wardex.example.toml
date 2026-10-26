@@ -78,6 +78,16 @@ bin = "grok"
 # (--always-approve). Wardex never answers a prompt on its own.
 approval = "inherit"
 
+[drivers.agy]
+bin = "agy"
+# default_model = "..."
+# default_reasoning = "high"   # passed as --effort
+# Actions that need review: "inherit" (the user's Antigravity settings;
+# headless agy denies what it would ask about, and Wardex reports that turn
+# as an error) or "always_approve" (--dangerously-skip-permissions).
+approval = "inherit"
+# extra_args = ["--sandbox"]
+
 [resources]
 systemd_scope = true
 # Slices that `wardex run --slice <name>` may use.

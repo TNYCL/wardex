@@ -14,6 +14,8 @@ pub enum DriverKind {
     Codex,
     /// Grok Build (`grok agent stdio`, ACP).
     Grok,
+    /// Google Antigravity CLI (`agy`, stream-json).
+    Agy,
 }
 
 impl DriverKind {
@@ -22,6 +24,7 @@ impl DriverKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Agy => "agy",
         }
     }
 
@@ -30,6 +33,7 @@ impl DriverKind {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "grok" => Some(Self::Grok),
+            "agy" => Some(Self::Agy),
             _ => None,
         }
     }

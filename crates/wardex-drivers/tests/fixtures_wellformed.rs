@@ -42,4 +42,5 @@ fn fixtures_are_wellformed() {
     assert!(check_dir(&root.join("claude")) > 0);
     assert!(check_dir(&root.join("codex")) > 0);
     assert!(check_dir(&root.join("grok")) > 0);
+    assert!(check_dir(&root.join("agy")) > 0);
 }

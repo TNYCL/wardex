@@ -59,7 +59,7 @@ impl Driver for FakeDriver {
                         if !ignore_eof { std::future::pending::<()>().await; }
                         while !release_eof.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
                     } => {
-                        let _ = ev_tx.send(DriverEvent::Exited { code: Some(0), stderr_tail: Vec::new() });
+                        let _ = ev_tx.send(DriverEvent::Exited { code: Some(0), stderr_tail: Vec::new(), interrupted: false });
                         return;
                     }
                 };
@@ -104,6 +104,7 @@ impl Driver for FakeDriver {
                                 let _ = ev_tx.send(DriverEvent::Exited {
                                     code: Some(3),
                                     stderr_tail: vec!["boom".into()],
+                                    interrupted: false,
                                 });
                                 return;
                             }
@@ -144,6 +145,7 @@ impl Driver for FakeDriver {
                         let _ = ev_tx.send(DriverEvent::Exited {
                             code: Some(0),
                             stderr_tail: vec![],
+                            interrupted: false,
                         });
                         return;
                     }
@@ -151,6 +153,7 @@ impl Driver for FakeDriver {
                         let _ = ev_tx.send(DriverEvent::Exited {
                             code: None,
                             stderr_tail: vec![],
+                            interrupted: false,
                         });
                         return;
                     }
@@ -1168,7 +1171,7 @@ impl Driver for ScopedProcessDriver {
     }
     fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError> {
         let mut spawned = launcher.spawn(&wardex_core::process::LaunchRequest {
-            unit: &spec.unit, slice: None, program: "sh", cwd: &spec.cwd,
+            unit: &spec.unit, slice: None, program: "sh", cwd: &spec.cwd, env: &[],
             args: &["-c".into(), "sh -c 'trap \"\" TERM; exec sleep 60' </dev/null >/dev/null 2>&1 & echo $! > descendant.pid; exec cat".into()],
         }).map_err(|source| DriverError::Spawn { program: "sh".into(), source })?;
         let (commands, mut rx) = mpsc::unbounded_channel();
@@ -1183,7 +1186,7 @@ impl Driver for ScopedProcessDriver {
             loop {
                 tokio::select! {
                     status = spawned.child.wait() => {
-                        let _ = events.send(DriverEvent::Exited { code: status.ok().and_then(|s| s.code()), stderr_tail: Vec::new() });
+                        let _ = events.send(DriverEvent::Exited { code: status.ok().and_then(|s| s.code()), stderr_tail: Vec::new(), interrupted: false });
                         return;
                     }
                     command = rx.recv() => match command {

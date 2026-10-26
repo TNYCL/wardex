@@ -22,6 +22,9 @@ pub struct Output {
     pub writes: Vec<String>,
     /// Close stdin after writing (graceful end).
     pub close: bool,
+    /// Send SIGINT to the agent process (for CLIs that interrupt a turn only
+    /// that way).
+    pub sigint: bool,
 }
 
 impl Output {
@@ -121,6 +124,7 @@ async fn run_loop<P: Protocol>(
 
     let mut lines = stdout.map(|s| BufReader::new(s).lines());
     let mut commands_open = true;
+    let mut interrupted = false;
     let mut draining = false;
     loop {
         tokio::select! {
@@ -157,6 +161,9 @@ async fn run_loop<P: Protocol>(
                     Some(cmd) => {
                         let mut out = protocol.on_command(cmd);
                         emit(&mut out);
+                        if out.sigint {
+                            interrupted |= sigint(&child);
+                        }
                         write_all(&mut stdin, &mut out).await;
                     }
                     None => {
@@ -206,6 +213,7 @@ async fn run_loop<P: Protocol>(
     let _ = ev_tx.send(DriverEvent::Exited {
         code: status.and_then(|s| s.code()),
         stderr_tail,
+        interrupted,
     });
 }
 
@@ -225,6 +233,15 @@ async fn write_all(stdin: &mut Option<ChildStdin>, out: &mut Output) {
     if out.close {
         *stdin = None;
     }
+}
+
+fn sigint(child: &Child) -> bool {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let Some(pid) = child.id().and_then(|p| i32::try_from(p).ok()) else {
+        return false;
+    };
+    kill(Pid::from_raw(pid), Signal::SIGINT).is_ok()
 }
 
 async fn kill(child: &mut Child, unit: Option<&str>) {

@@ -21,8 +21,8 @@ use crate::Client;
 use crate::api::{self, DEFAULT_OVERVIEW_EVENTS, Request, Response};
 
 const INSTRUCTIONS: &str = "\
-Wardex runs and supervises Claude Code, Codex and Grok Build agent sessions on \
-one host. \
+Wardex runs and supervises Claude Code, Codex, Grok Build and Antigravity (agy) \
+agent sessions on one host. \
 Typical flow: `run` starts a session and returns its id (any unique id prefix \
 works everywhere). The agent works on its own; when it asks something, the \
 session goes to `waiting_input` and the question shows up in `pending_questions`, \
@@ -51,6 +51,7 @@ pub enum DriverArg {
     Claude,
     Codex,
     Grok,
+    Agy,
 }
 
 impl From<DriverArg> for DriverKind {
@@ -59,6 +60,7 @@ impl From<DriverArg> for DriverKind {
             DriverArg::Claude => DriverKind::Claude,
             DriverArg::Codex => DriverKind::Codex,
             DriverArg::Grok => DriverKind::Grok,
+            DriverArg::Agy => DriverKind::Agy,
         }
     }
 }
@@ -69,7 +71,8 @@ pub struct RunParams {
     pub prompt: String,
     /// Absolute working directory on the Wardex host.
     pub cwd: String,
-    /// Agent CLI. `grok` cannot run `readonly` sessions.
+    /// Agent CLI. `grok` and `agy` cannot run `readonly` sessions; `agy` has
+    /// no questions or approvals.
     pub driver: DriverArg,
     /// Model name passed to the CLI. Default: the driver's configured default.
     #[serde(default)]
@@ -439,7 +442,7 @@ fn invalid(message: &str) -> CallToolResult {
 #[tool_router]
 impl WardexMcp {
     #[tool(
-        description = "Start a Claude Code, Codex or Grok Build session. Returns the session record \
+        description = "Start a Claude Code, Codex, Grok Build or Antigravity session. Returns the session record \
                           (its `id` is what every other tool takes) and warnings."
     )]
     async fn run(&self, Parameters(p): Parameters<RunParams>) -> CallToolResult {

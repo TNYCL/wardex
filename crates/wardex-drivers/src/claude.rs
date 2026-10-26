@@ -116,6 +116,7 @@ impl Driver for ClaudeDriver {
             program: &self.config.bin,
             args: &args,
             cwd: &spec.cwd,
+            env: &[],
         };
         let mut handle = spawn_with(launcher, &req, ClaudeProtocol::new(spec.readonly))?;
         if spec.resume.is_none() || spec.fork {

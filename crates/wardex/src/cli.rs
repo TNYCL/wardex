@@ -377,6 +377,8 @@ pub enum Driver {
     Codex,
     /// Grok Build (`grok agent stdio`); no `--readonly`.
     Grok,
+    /// Google Antigravity CLI (`agy`); no `--readonly`, questions or approvals.
+    Agy,
 }
 
 #[cfg(test)]

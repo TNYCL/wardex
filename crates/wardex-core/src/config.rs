@@ -203,6 +203,7 @@ pub struct DriversConfig {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
     pub grok: GrokConfig,
+    pub agy: AgyConfig,
 }
 
 impl DriversConfig {
@@ -212,6 +213,7 @@ impl DriversConfig {
             DriverKind::Claude => (&self.claude.default_model, &self.claude.default_reasoning),
             DriverKind::Codex => (&self.codex.default_model, &self.codex.default_reasoning),
             DriverKind::Grok => (&self.grok.default_model, &self.grok.default_reasoning),
+            DriverKind::Agy => (&self.agy.default_model, &self.agy.default_reasoning),
         };
         (model.clone(), reasoning.clone())
     }
@@ -299,6 +301,44 @@ impl Default for GrokConfig {
             default_model: None,
             default_reasoning: None,
             approval: GrokApproval::Inherit,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// How an Antigravity session handles actions that need review. Chosen by the
+/// operator; Wardex never answers a prompt on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgyApproval {
+    /// Leave it to the user's Antigravity settings. Headless `agy` cannot ask,
+    /// so actions that need review are denied; Wardex reports such a turn as
+    /// an error, not as done.
+    #[default]
+    Inherit,
+    /// `--dangerously-skip-permissions`: run every action without review.
+    AlwaysApprove,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgyConfig {
+    pub bin: String,
+    pub default_model: Option<String>,
+    /// Passed as `--effort` (`low`, `medium`, `high`, `xhigh`, `max`).
+    pub default_reasoning: Option<String>,
+    pub approval: AgyApproval,
+    /// Extra `agy` options, e.g. `["--sandbox"]`.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for AgyConfig {
+    fn default() -> Self {
+        Self {
+            bin: "agy".into(),
+            default_model: None,
+            default_reasoning: None,
+            approval: AgyApproval::Inherit,
             extra_args: Vec::new(),
         }
     }
@@ -618,6 +658,9 @@ impl Config {
         if let Some(v) = get("WARDEX_GROK_BIN") {
             self.drivers.grok.bin = v;
         }
+        if let Some(v) = get("WARDEX_AGY_BIN") {
+            self.drivers.agy.bin = v;
+        }
         if let Some(v) = get("WARDEX_SYSTEMD_SCOPE") {
             self.resources.systemd_scope = matches!(v.as_str(), "1" | "true" | "yes");
         }
@@ -829,6 +872,27 @@ mod tests {
         let mut e = Config::default();
         e.apply_env(env(&[("WARDEX_GROK_BIN", "/x/grok")]));
         assert_eq!(e.drivers.grok.bin, "/x/grok");
+    }
+
+    #[test]
+    fn agy_driver_config() {
+        let d = Config::default().drivers.agy;
+        assert_eq!(d.bin, "agy");
+        assert_eq!(d.approval, AgyApproval::Inherit);
+        let c = Config::parse(
+            "[drivers.agy]\ndefault_model = \"m\"\ndefault_reasoning = \"high\"\napproval = \"always_approve\"\nextra_args = [\"--sandbox\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.drivers.agy.approval, AgyApproval::AlwaysApprove);
+        assert_eq!(c.drivers.agy.extra_args, ["--sandbox"]);
+        assert_eq!(
+            c.drivers.defaults(DriverKind::Agy),
+            (Some("m".into()), Some("high".into()))
+        );
+        assert!(Config::parse("[drivers.agy]\napproval = \"ask\"\n").is_err());
+        let mut e = Config::default();
+        e.apply_env(env(&[("WARDEX_AGY_BIN", "/x/agy")]));
+        assert_eq!(e.drivers.agy.bin, "/x/agy");
     }
 
     #[test]

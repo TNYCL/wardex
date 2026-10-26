@@ -19,6 +19,8 @@ pub struct LaunchRequest<'a> {
     pub program: &'a str,
     pub args: &'a [String],
     pub cwd: &'a Path,
+    /// Extra environment variables for the agent process.
+    pub env: &'a [(&'a str, &'a str)],
 }
 
 pub struct Spawned {
@@ -160,6 +162,7 @@ impl Launcher {
             c
         };
         cmd.current_dir(req.cwd)
+            .envs(req.env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -324,6 +327,7 @@ mod tests {
                 program: "sh",
                 args: &["-c".into(), "echo pid=$$; exec cat".into()],
                 cwd: Path::new("/"),
+                env: &[],
             })
             .unwrap();
         assert_eq!(spawned.unit.as_deref(), Some(&*format!("{unit}.scope")));
@@ -371,6 +375,7 @@ mod tests {
                 program: "cat",
                 args: &[],
                 cwd: Path::new("/"),
+                env: &[],
             })
             .unwrap();
         assert!(spawned.unit.is_none());

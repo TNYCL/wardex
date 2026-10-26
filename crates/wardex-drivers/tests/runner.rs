@@ -36,6 +36,7 @@ async fn drain_without_implicit_kill(close_stdout_first: bool) {
             program: "sh",
             args: &[script_path.to_string_lossy().into_owned()],
             cwd: dir.path(),
+            env: &[],
         },
         EmptyProtocol,
     )

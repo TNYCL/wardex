@@ -12,6 +12,7 @@ CLI version changes.
 | Claude Code | 2.1.302 | 2026-10-18 |
 | Codex CLI | 0.163.0 | 2026-10-18 |
 | Grok Build | 1.0.70 | 2026-10-26 |
+| Antigravity CLI (`agy`) | 1.4.7 | 2026-10-26 |
 
 Fork (`--fork-session`, `thread/fork`) was checked against the same versions'
 help text, argument validation and generated JSON schema (2026-10-19); the
@@ -466,6 +467,107 @@ Wardex 0.2.x and earlier reject session rows with an unknown driver and a
 `[drivers.grok]` config section. Once Grok sessions exist, rolling back means
 restoring a database backup taken before the upgrade (an older daemon's
 startup recovery fails on a Grok session that was live when it stopped).
+
+## Antigravity CLI (`agy`)
+
+Recorded against `agy` 1.4.7 on Linux x86_64 with the recording user's own
+login and settings, with `AGY_CLI_DISABLE_AUTO_UPDATE=1`.
+
+### Invocation
+
+```text
+agy --input-format stream-json --output-format stream-json
+    [--model M] [--effort E] [--conversation ID]
+    [--dangerously-skip-permissions] [extra_args...]
+```
+
+- Headless print mode, one process per Wardex session. No `-p`: stream-json
+  input implies print mode, and `-p` takes a value. `--print-timeout` stays
+  at its default (0, no limit).
+- Wardex sets `AGY_CLI_DISABLE_AUTO_UPDATE=1` for the processes it starts so
+  an update cannot replace the binary during a session. Update `agy`
+  yourself.
+- Authentication is the user's own `agy` login; Wardex never reads its
+  credentials. `agy` reads the user's Antigravity settings, rules and MCP
+  servers like an interactive session.
+
+### Turns
+
+```text
+→ {"event":"user","message":{"content":"..."}}
+← {"event":"init","conversation_id":"…","init":{"cwd","tools","permission_mode","model"?}}
+← {"event":"step_update","step_update":{"step_index","state":"ACTIVE|DONE","step_type", …}}
+← {"event":"result","result":{"status","response","error","denied_actions",…}}
+```
+
+- Nothing is printed before the first prompt; `init` (once per process)
+  becomes `started` with the `conversation_id`.
+- One turn at a time: further messages wait in the driver until `result`.
+- `step_type` `agent_response`: `text_delta` → `message` deltas, plus the
+  full text when the step is `DONE`. `tool`: `ACTIVE` → `tool_call` started
+  (`call_id` `step-<index>`, input from `tool_info.parameters`), `DONE` →
+  completed with `tool_info.output`, or failed with `tool_info.error`. Other
+  step types (`user_input`, `system_message`, `checkpoint`, `unknown`) are
+  ignored.
+- `result` `SUCCESS` → `done` with `response`. Any other status → `error`
+  with agy's `error` text, except after a Wardex interrupt (below).
+
+### Model and effort
+
+- `--model` and `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) are
+  passed as given. Model ids that carry an effort (`…-low`, `…-high`)
+  conflict with `--effort`: agy fails the turn
+  (`--model X conflicts with --effort=high`), so use a base model id with
+  `--reasoning`, or a full id without it.
+- `init.model` is present only when `--model` was given and echoes it; it
+  becomes the `started` model. An unknown model fails the turn.
+- agy never reports the effort it uses, so `started` has no `reasoning` and
+  the session keeps only the requested value.
+
+### Permissions
+
+- `drivers.agy.approval = "inherit"` (default) passes nothing:
+  `permission_mode` is `request-review` with default settings. Headless agy
+  cannot ask, so it **denies** actions that need review and still reports
+  `status: SUCCESS` with `denied_actions` (and exits 0). Wardex turns such a
+  result into an `error` naming the denied actions instead of `done`.
+- `"always_approve"` adds `--dangerously-skip-permissions`
+  (`permission_mode: always-proceed`): every action runs without review.
+- Other modes (`--mode accept-edits|auto`, `--sandbox`) can be set with
+  `drivers.agy.extra_args`; they were not recorded.
+- No permission prompt ever reaches Wardex: agy has no `approval` events.
+
+### Interrupt
+
+- agy has no in-band interrupt. Wardex sends SIGINT to the agy process; agy
+  prints `result` `{status: "ERROR", error: "interrupted"}` and exits 1. The
+  turn ends as `done` with `interrupted: true` and the session ends `done`
+  (not `error`); the next `send` resumes it.
+- Messages queued behind the interrupted turn cannot be delivered to the
+  exiting process; Wardex reports them in an `error` event.
+- A tool command that was running is left behind by agy. With systemd scopes
+  Wardex reaps it when the scope is cleaned up; without scopes it can outlive
+  the session.
+
+### Resume
+
+`--conversation <conversation_id>` continues the conversation with its
+context, also after an interrupt. agy does not replay earlier steps.
+
+### Not supported
+
+- **Questions.** agy's `ask_question` tool is skipped in headless mode (the
+  agent is told no answer came); there are no `question` events.
+- **Approvals.** See Permissions.
+- **Read-only.** `--mode plan` was not shown to block writes; Wardex refuses
+  `--readonly` for agy.
+- **Fork** and **external sessions**: no fork call and no store reader.
+
+### Downgrade
+
+As for Grok: Wardex 0.2.x and earlier reject `agy` session rows and a
+`[drivers.agy]` config section; keep a pre-upgrade database backup if you may
+roll back.
 
 ## systemd scopes
 

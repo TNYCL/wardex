@@ -3,6 +3,7 @@
 //! (`*_store`). Protocol details: `docs/drivers.md`; stores:
 //! `docs/external-sessions.md`.
 
+pub mod agy;
 pub mod claude;
 pub mod claude_store;
 pub mod codex;
@@ -10,6 +11,7 @@ pub mod codex_store;
 pub mod grok;
 pub mod runner;
 
+pub use agy::AgyDriver;
 pub use claude::ClaudeDriver;
 pub use claude_store::ClaudeStore;
 pub use codex::CodexDriver;

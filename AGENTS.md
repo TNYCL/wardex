@@ -46,7 +46,7 @@ what Wardex does and in which milestone.
   macros, no `DATABASE_URL`).
 - Driver tests use mock processes and recorded fixtures of real CLI output
   (`crates/wardex-drivers/tests/fixtures/`). Tests must not call real
-  `claude` / `codex` / `grok` binaries or the network.
+  `claude` / `codex` / `grok` / `agy` binaries or the network.
 - Note the tested CLI versions in `docs/drivers.md` when a driver changes.
 
 ## Layout
@@ -54,7 +54,7 @@ what Wardex does and in which milestone.
 ```text
 crates/wardex-core     event model, config, store (SQLite), session manager,
                        driver interface, process launcher, git helpers
-crates/wardex-drivers  claude, codex, grok
+crates/wardex-drivers  claude, codex, grok, agy
 crates/wardex-server   Unix socket API, HTTP (/healthz, MCP), webhooks
 crates/wardex          the binary (clap CLI)
 deploy/                systemd unit, example config, tunnel guide
