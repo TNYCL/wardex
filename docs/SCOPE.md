@@ -1,7 +1,7 @@
 # Wardex scope (Phase 1 + Phase 2)
 
 Wardex is an open-source orchestrator daemon, written in Rust, that starts,
-watches and manages Claude Code and Codex sessions. Bots and other agents reach
+watches and manages Claude Code, Codex and Grok Build sessions. Bots and other agents reach
 those sessions over MCP; important events are pushed via webhooks. Target
 scale: ~30 concurrent agents on one Linux host. It replaces ad-hoc setups built
 on tmux, `send-keys` and output scraping.
@@ -18,8 +18,9 @@ on tmux, `send-keys` and output scraping.
   Safety is left to prompts and `CLAUDE.md` / `AGENTS.md` rules.
 - **No roles:** one MCP endpoint, one token. Every client sees and manages
   every session. Sessions are told apart by `agent` and `task` labels.
-- **Hands off CLI config:** Wardex only passes per-session flags (`--model`,
-  `-c`, `--enable`, …). It never edits `~/.claude*` or `~/.codex/` and does
+- **Hands off CLI config:** Wardex only passes per-session flags and
+  protocol options (`--model`, `-c`, `--enable`, ACP session options, …). It
+  never edits `~/.claude*`, `~/.codex/` or `~/.grok/` and does
   not set a separate `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so sessions share the
   user's existing settings, auth and quota. Wardex may **read** the CLIs'
   session stores there (external session discovery and history, §2.4); it
@@ -67,8 +68,24 @@ stream-json --include-partial-messages --verbose --permission-prompt-tool stdio`
   the schema the app-server can generate, and keep contract tests against
   recorded JSON-RPC fixtures.
 
+**Grok Build (0.3):** `grok agent --no-leader stdio` (ACP, JSON-RPC over
+stdio).
+
+- Model and effort are applied with `session/set_config_option` and read
+  back; a value Grok does not apply fails the session. `started` carries the
+  values Grok reports.
+- Execution mode is the operator's choice (`drivers.grok.approval`):
+  `inherit` (default, the user's Grok settings), `ask` (always-approve off
+  for the session) or `always_approve`. Grok's own permission modes decide
+  before anything reaches Wardex; ACP permission requests that do arrive
+  become `approval` events and are answered once, never "always".
+- Questions (`_x.ai/ask_user_question`) become `question` events, answered by
+  question text. Interrupt via `session/cancel`; resume via `session/resume`.
+- Not supported: `--readonly` (refused), fork, external sessions.
+
 **Driver trait:** `start`, `send_message`, `answer`, `interrupt`, `stop`,
-`events() -> Stream<Event>`. New CLIs (Gemini etc.) can be added later.
+`events() -> Stream<Event>`, plus whether the CLI can keep a session
+read-only. Drivers that cannot are refused for read-only sessions.
 
 Tested CLI versions are listed in `docs/drivers.md`.
 
@@ -112,7 +129,8 @@ from an external session that has not run in Wardex yet), also sent as
   exits by itself; a worktree closed for idleness or memory is kept so the
   session can be continued).
 - `--readonly`: the driver's plan / read-only mode plus a prompt prefix as a
-  fallback.
+  fallback. Only for drivers whose CLI enforces it (Claude Code, Codex);
+  others refuse read-only sessions.
 - Concurrent sessions in the same cwd are allowed with a warning (no repo
   lock).
 - Each session stores both the Wardex id and the driver's id (Claude
@@ -244,7 +262,7 @@ from an external session that has not run in Wardex yet), also sent as
   with matching labels, live or ended.
 
 - All accept `--json`. The CLI talks to the daemon over a local Unix socket.
-- `run`: `--driver claude|codex`, `--model`, `--reasoning`, `--cwd`,
+- `run`: `--driver claude|codex|grok`, `--model`, `--reasoning`, `--cwd`,
   `--worktree`, `--branch`, `--readonly`, `--agent`, `--task`, `--slice`,
   `--prompt` or `--prompt-file`.
 - `summary`: final result text, touched files, duration, event/tool counts.

@@ -3,12 +3,15 @@
 Usage: python3 -I sanitize.py <in.jsonl> <out.jsonl> <recording-dir>
 
 Input lines are {"t", "dir", "msg"} records written by record_claude.py /
-record_codex.py. The sanitizer:
+record_codex.py / record_grok.py / record_agy.py. The sanitizer:
 - replaces the recording directory, the home directory and their
   dash-mangled forms with fixed placeholders,
 - drops user-specific inventory (skills, plugins, agents, MCP servers, slash
   commands) from Claude's init event,
 - drops Codex notifications that only describe the local account or MCP setup,
+- drops Grok `_x.ai/*` notifications (account, plugins, hooks, telemetry) and
+  `available_commands_update` (the user's skills and plugins), and keeps only
+  the version from the `initialize` result's `_meta` (host name, agent ids),
 - shortens opaque thinking signatures and replaces API ids with placeholders,
 - drops stderr lines.
 
@@ -18,6 +21,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 
 src, dst, rec_dir = sys.argv[1:]
 home = os.path.expanduser("~")
@@ -27,9 +31,14 @@ def mangle(path):
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
+def encode(path):
+    return urllib.parse.quote(path, safe="")
+
+
 REPLACEMENTS = [
     (rec_dir, "/work"),
     (mangle(rec_dir), "-work"),
+    (encode(rec_dir), encode("/work")),
     (home, "/home/user"),
     (mangle(home), "-home-user"),
 ]
@@ -89,10 +98,22 @@ def keep(rec):
     m = rec["msg"]
     if isinstance(m, dict) and str(m.get("method", "")).startswith(CODEX_DROP):
         return False
+    if isinstance(m, dict) and str(m.get("method", "")).startswith("_x.ai/") and "id" not in m:
+        return False
+    if isinstance(m, dict) and isinstance(m.get("id"), str) and "method" not in m:
+        return False  # Grok-internal responses (e.g. `skills-reload`)
+    if isinstance(m, dict) and m.get("method") == "session/update":
+        if m.get("params", {}).get("update", {}).get("sessionUpdate") == "available_commands_update":
+            return False
     return True
 
 
 def clean_init(m):
+    result = m.get("result") if isinstance(m, dict) else None
+    if isinstance(result, dict) and "agentCapabilities" in result:
+        m = dict(m)
+        version = result.get("_meta", {}).get("agentVersion")
+        m["result"] = {**result, "_meta": {"agentVersion": version}}
     if isinstance(m, dict) and m.get("type") == "system" and m.get("subtype") == "init":
         m = dict(m)
         for k in CLAUDE_INIT_EMPTY:

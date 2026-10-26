@@ -1,7 +1,7 @@
 # Wardex
 
-**One daemon for all your Claude Code and Codex sessions: start, watch, answer
-and resume them from the CLI or from any MCP client.**
+**One daemon for all your Claude Code, Codex and Grok Build sessions: start,
+watch, answer and resume them from the CLI or from any MCP client.**
 
 [![CI](https://github.com/TNYCL/wardex/actions/workflows/ci.yml/badge.svg)](https://github.com/TNYCL/wardex/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/wardex)](https://crates.io/crates/wardex)
@@ -15,8 +15,9 @@ and resume them from the CLI or from any MCP client.**
 
 Wardex is a single Rust binary that runs
 [Claude Code](https://docs.claude.com/en/docs/claude-code) and
-[Codex](https://github.com/openai/codex) as managed sessions on one Linux
-host. Instead of tmux panes and scraped terminal output, every session emits
+[Codex](https://github.com/openai/codex) (and, since 0.3,
+[Grok Build](https://docs.x.ai/build/cli/headless-scripting)) as managed
+sessions on one Linux host. Instead of tmux panes and scraped terminal output, every session emits
 structured events, keeps its state in SQLite, and can be driven by you, by
 scripts, or by other agents over MCP. It is built for around 30 concurrent
 agents on one machine and has been tested with 21 live sessions.
@@ -26,19 +27,21 @@ agents on one machine and has been tested with 21 live sessions.
 - **Bots can drive coding agents.** Every CLI capability is an MCP tool. A bot
   starts a session, gets a webhook when it asks a question, answers it, reads
   the result and sends the next instruction.
-- **No terminal scraping.** Claude Code (stream-json control protocol) and
-  Codex (`codex app-server` JSON-RPC) are mapped onto one event model.
+- **No terminal scraping.** Claude Code (stream-json control protocol),
+  Codex (`codex app-server` JSON-RPC) and Grok Build (`grok agent stdio`, ACP)
+  are mapped onto one event model.
 - **Sessions outlive processes.** Daemon restarts, idle timeouts and memory
   pressure close processes, not work: `send` resumes the session with its
   context.
 
 ## Features
 
-- **Claude Code and Codex drivers** behind one event model: `started`,
+- **Claude Code, Codex and Grok Build drivers** behind one event model: `started`,
   `message`, `tool_call`, `question`, `approval`, `reminder`, `done`,
   `error`, `stuck`, `ended`, and more.
 - **Questions as events.** When an agent asks something (Claude
-  `AskUserQuestion`, Codex approvals), the question shows up in `pending` /
+  `AskUserQuestion`, Codex approvals, Grok `ask_user_question`), the question
+  shows up in `pending` /
   `pending_questions` and is answered with `wardex answer` or the MCP `answer`
   tool.
 - **Idle lifecycle.** An idle session closes after 12 h by default, earlier
@@ -78,9 +81,11 @@ agents on one machine and has been tested with 21 live sessions.
 - Linux with a systemd user manager. Run `loginctl enable-linger $USER` to keep
   the daemon running after logout. Scopes can be turned off with
   `resources.systemd_scope = false`.
-- `claude` and/or `codex` installed and logged in. Tested with Claude Code
-  2.1.302 and Codex 0.163.0 (see
-  [`docs/drivers.md`](https://github.com/TNYCL/wardex/blob/main/docs/drivers.md)).
+- `claude`, `codex` and/or `grok` installed and logged in. Tested with
+  Claude Code 2.1.302, Codex 0.163.0 and Grok Build 1.0.70 (see
+  [`docs/drivers.md`](https://github.com/TNYCL/wardex/blob/main/docs/drivers.md),
+  including what each driver does not support: Grok has no read-only mode,
+  fork or external session support).
 - Rust 1.88 or newer to build.
 
 ## Install
@@ -180,8 +185,8 @@ wakes up on `question`, `done`, `error` and `stuck` instead of polling.
 
 ### Prompt for your bot
 
-> Wardex (MCP server `wardex`) runs Claude Code and Codex sessions for you.
-> Start one with `run` (`driver` claude or codex, absolute `cwd`, `agent` set
+> Wardex (MCP server `wardex`) runs Claude Code, Codex and Grok Build sessions
+> for you. Start one with `run` (`driver` claude, codex or grok, absolute `cwd`, `agent` set
 > to your name and `task` to a short label). Sessions work on their own. When
 > one asks a question it shows up in `pending_questions`; reply with `answer`.
 > When a turn is done, read `summary` and continue with `send` if needed.
@@ -228,7 +233,7 @@ wardex daemon                      # run the daemon (see deploy/wardex.service)
 wardex daemon stop [--drain S]     # shut it down and wait; live sessions become resumable
 wardex daemon restart [--drain S]  # same PID, current binary; sessions resume
 wardex daemon reload               # re-read config + env file (webhooks), no restart
-wardex run --driver claude|codex --prompt "..." [--prompt-file F|-]
+wardex run --driver claude|codex|grok --prompt "..." [--prompt-file F|-]
            [--model M] [--reasoning R] [--cwd DIR] [--readonly]
            [--worktree NAME [--branch B] [--rm-worktree]]
            [--agent A] [--task T] [--slice S]

@@ -12,6 +12,8 @@ use crate::{EndReason, SessionId, SessionState};
 pub enum DriverKind {
     Claude,
     Codex,
+    /// Grok Build (`grok agent stdio`, ACP).
+    Grok,
 }
 
 impl DriverKind {
@@ -19,6 +21,7 @@ impl DriverKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
         }
     }
 
@@ -26,6 +29,7 @@ impl DriverKind {
         match s {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "grok" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -54,8 +58,8 @@ pub enum EventKind {
         /// The driver's own session/thread id, used for resume.
         driver_session_id: Option<String>,
         model: Option<String>,
-        /// Reasoning effort the CLI reports it uses (Codex; Claude does not
-        /// report it).
+        /// Reasoning effort the CLI reports it uses (Codex, Grok; Claude does
+        /// not report it). The requested effort stays on the session record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
     },

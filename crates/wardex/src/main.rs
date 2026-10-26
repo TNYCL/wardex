@@ -542,6 +542,7 @@ fn driver_kind(d: cli::Driver) -> DriverKind {
     match d {
         cli::Driver::Claude => DriverKind::Claude,
         cli::Driver::Codex => DriverKind::Codex,
+        cli::Driver::Grok => DriverKind::Grok,
     }
 }
 

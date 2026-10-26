@@ -11,6 +11,7 @@ CLI version changes.
 |---|---|---|
 | Claude Code | 2.1.302 | 2026-10-18 |
 | Codex CLI | 0.163.0 | 2026-10-18 |
+| Grok Build | 1.0.70 | 2026-10-26 |
 
 Fork (`--fork-session`, `thread/fork`) was checked against the same versions'
 help text, argument validation and generated JSON schema (2026-10-19); the
@@ -311,6 +312,160 @@ to the new thread. Only `threadId` is required (0.163.0 schema,
 `fixtures/codex/fork.jsonl` is **derived** from the recorded `resume.jsonl`
 and that schema by `tools/fixtures/derive_codex_fork.py`, not recorded from a
 live fork.
+
+## Grok Build
+
+Recorded against Grok 1.0.70 (`grok agent stdio`) on Linux x86_64 with the
+recording user's own login and settings. Statements marked *not recorded*
+come from the ACP specification or Grok's bundled documentation and are only
+covered by tests built from those schemas.
+
+### Invocation
+
+```text
+grok agent --no-leader [--always-approve] [extra_args...] stdio
+```
+
+- The [Agent Client Protocol](https://agentclientprotocol.com) (ACP v1):
+  JSON-RPC 2.0 over stdio, one agent process per Wardex session.
+- **`--no-leader`**: Grok's config can route `grok agent` through a shared
+  leader process; the session would then run outside its systemd scope.
+- Authentication is Grok's own cached login. `session/new` works without an
+  `authenticate` call when the user is logged in (`initialize` advertises
+  `cached_token`). Wardex never calls `authenticate` and never reads Grok's
+  credentials. Without a login the session fails with Grok's error.
+- Grok reads the user's `~/.grok/config.toml`, plugins, hooks, skills and
+  Claude-compatible settings (`.claude/settings.json`), like an interactive
+  session. Sessions are written to `~/.grok/sessions/` and show up in
+  `grok --resume`.
+
+### Handshake and turns
+
+```text
+→ initialize {protocolVersion:1, clientCapabilities:{fs:{readTextFile:false,
+              writeTextFile:false}, terminal:false}, clientInfo}
+← result {agentCapabilities:{loadSession:true, sessionCapabilities:{resume, list,
+          close}, ...}, authMethods}
+→ session/new {cwd, mcpServers:[], _meta?:{yoloMode:false}}
+← result {sessionId, models, configOptions:[{id:"model", currentValue},
+          {id:"reasoning_effort", category:"thought_level", currentValue}]}
+→ session/set_config_option {sessionId, configId, value}   (only to change one)
+← result {configOptions}                                   (the full new list)
+→ session/prompt {sessionId, prompt:[{type:"text", text}]}
+← session/update notifications ...
+← result {stopReason}
+```
+
+Grok also sends many `_x.ai/*` notifications (session setup phases, hooks,
+models, queue, announcements, `sessions/changed`) and responses to ids it
+made up itself (`skills-reload`). Wardex ignores them.
+
+| `session/update` | Wardex mapping |
+|---|---|
+| `agent_message_chunk` | `message` delta; the text since the last tool call becomes a full `message`, the last one the turn's result |
+| `tool_call` | `tool_call` started; name from `_meta["x.ai/tool"].name` (e.g. `run_terminal_command`), input from `rawInput` |
+| `tool_call_update` with `status` `completed` / `failed` | `tool_call` completed / failed; output from `rawOutput.output_for_prompt` or the text content |
+| `agent_thought_chunk`, `user_message_chunk`, `available_commands_update`, `session_info_update` | ignored |
+| `config_option_update` | updates the observed model / effort |
+
+`session/prompt` `stopReason`: `end_turn` → `done`; `cancelled` → `done`
+(interrupted); anything else (`refusal`, `max_tokens`, `max_turn_requests`)
+→ `error`.
+
+### Model and effort
+
+`--model` and `--reasoning-effort` on `grok agent` are **not** reliable: with
+`--reasoning-effort low` the recorded session reported `xhigh`, the effort
+stored in the user's settings for its default model. Wardex therefore sets
+the requested values with `session/set_config_option` (model first, then
+`reasoning_effort`) and reads the values back from the returned
+`configOptions`. If Grok rejects a value or reports a different one, the
+session fails before the first prompt instead of running with settings that
+were not asked for. The `started` event carries the values Grok reports;
+the session record keeps the requested ones. Effort values come from the
+model (`low`, `medium`, `high`, `xhigh` on the recording host).
+
+### Permissions
+
+`drivers.grok.approval` selects the execution mode; Wardex never answers a
+permission request on its own:
+
+| Value | Passed to Grok |
+|---|---|
+| `inherit` (default) | nothing: the user's Grok settings decide |
+| `ask` | `_meta: {yoloMode: false}` on `session/new` and `session/resume` |
+| `always_approve` | `--always-approve` (deny rules and hooks still apply) |
+
+Recorded behavior: with `yoloMode: false` Grok reports `yolo: false`, but
+its own permission pipeline still decides first. On the recording host the
+auto-review mode was seeded from a Claude-compatible `defaultMode`; Grok's
+classifier allowed a harmless shell command and blocked a force push
+(`tool_call_update` `failed`, "Auto mode blocked this action"), each after an
+`_x.ai/session_notification` `pending_interaction` / `interaction_resolved`
+pair. **No `session/request_permission` reached the client** in any
+recording, and Wardex did not change the user's settings to force one.
+
+*Not recorded:* an ACP `session/request_permission` becomes an `approval`
+event (`kind` from `toolCall.kind`, summary from its title). An answer selects
+the `allow_once` or `reject_once` option (`reject_always` if there is no
+`reject_once`); Wardex never selects an `allow_always` option, and an allow
+without an `allow_once` option is sent as `cancelled`.
+
+### Questions (`ask_user_question`)
+
+Grok's `ask_user_question` tool asks the client with an agent request:
+
+```json
+← {"jsonrpc":"2.0","id":0,"method":"_x.ai/ask_user_question","params":{
+     "sessionId","toolCallId","mode":"default",
+     "questions":[{"question":"Which color do you prefer?","multiSelect":null,
+                   "options":[{"label":"red","description":"..."}, ...]}]}}
+→ {"jsonrpc":"2.0","id":0,"result":{"outcome":"accepted",
+     "answers":{"Which color do you prefer?":"blue"}}}
+```
+
+Answers are keyed by question **text** (verified: the tool completed with
+`picked: ["blue"]` and the model answered `blue`). The result is an
+internally tagged enum; its other outcomes are `cancelled`,
+`chat_about_this` and `skip_interview` (from Grok's parse error). Wardex
+sends `cancelled` when a question is declined; several selected options are
+sent as an array (*not recorded*). A client that does not answer makes the
+tool fail ("Failed to reach the client for user question"). Grok's own
+timeout (`toolset.ask_user_question.timeout_secs`, default 1800 s) still
+applies.
+
+### Interrupt
+
+`session/cancel` (a notification) ends the turn with `stopReason:
+"cancelled"` within milliseconds; the running shell tool gets no completion
+update. Per ACP, Wardex answers pending requests of the cancelled turn with
+`cancelled` (*not recorded*: no request was pending in the recording).
+
+### Resume
+
+`session/resume {sessionId, cwd, mcpServers}` (advertised as
+`sessionCapabilities.resume`) continues with the history intact and replays
+nothing; the session keeps its model and effort. `session/load` would stream
+the whole history again as `user_message_chunk` / `agent_message_chunk`, so
+Wardex does not use it. Closing stdin ends the process with exit code 0.
+
+### Not supported
+
+- **Read-only.** `grok agent` offers no per-session read-only mode over ACP
+  (no session modes are advertised). `--permission-mode plan` and
+  `--sandbox` exist for interactive/headless `grok` but were not verified as
+  write barriers. Wardex refuses `--readonly` for Grok.
+- **Fork.** `--fork-session` is a headless flag; ACP has no fork call. Fork
+  needs an external session reader, which Grok does not have in Wardex.
+- **External sessions.** Grok's store is not read (`external list`,
+  `history`, `adopt`).
+
+### Downgrade
+
+Wardex 0.2.x and earlier reject session rows with an unknown driver and a
+`[drivers.grok]` config section. Once Grok sessions exist, rolling back means
+restoring a database backup taken before the upgrade (an older daemon's
+startup recovery fails on a Grok session that was live when it stopped).
 
 ## systemd scopes
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::{EVENT_NAMES, NOTABLE_EVENTS};
+use crate::event::{DriverKind, EVENT_NAMES, NOTABLE_EVENTS};
 
 /// Upper bound for `sessions.idle_shutdown_secs` (30 days).
 pub const MAX_IDLE_SHUTDOWN_SECS: u64 = 30 * 86_400;
@@ -202,6 +202,19 @@ impl Default for RetentionConfig {
 pub struct DriversConfig {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
+    pub grok: GrokConfig,
+}
+
+impl DriversConfig {
+    /// Configured default model and reasoning effort for `driver`.
+    pub fn defaults(&self, driver: DriverKind) -> (Option<String>, Option<String>) {
+        let (model, reasoning) = match driver {
+            DriverKind::Claude => (&self.claude.default_model, &self.claude.default_reasoning),
+            DriverKind::Codex => (&self.codex.default_model, &self.codex.default_reasoning),
+            DriverKind::Grok => (&self.grok.default_model, &self.grok.default_reasoning),
+        };
+        (model.clone(), reasoning.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -245,6 +258,47 @@ impl Default for CodexConfig {
             default_model: None,
             default_reasoning: None,
             request_user_input: false,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// How a Grok session handles tool permission prompts. Chosen by the
+/// operator; Wardex never answers a prompt on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokApproval {
+    /// Leave it to the user's Grok settings (`permission_mode`, rules,
+    /// Claude-compatible `defaultMode`). Nothing is passed.
+    #[default]
+    Inherit,
+    /// Turn always-approve off for the session (`_meta.yoloMode: false`).
+    /// Prompts Grok still raises become `approval` events; other modes such
+    /// as auto-review keep deciding on their own.
+    Ask,
+    /// `--always-approve`: Grok runs tools without prompting. Deny rules and
+    /// hooks still apply.
+    AlwaysApprove,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GrokConfig {
+    pub bin: String,
+    pub default_model: Option<String>,
+    pub default_reasoning: Option<String>,
+    pub approval: GrokApproval,
+    /// Extra `grok agent` options, placed before `stdio`.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            bin: "grok".into(),
+            default_model: None,
+            default_reasoning: None,
+            approval: GrokApproval::Inherit,
             extra_args: Vec::new(),
         }
     }
@@ -561,6 +615,9 @@ impl Config {
         if let Some(v) = get("WARDEX_CODEX_BIN") {
             self.drivers.codex.bin = v;
         }
+        if let Some(v) = get("WARDEX_GROK_BIN") {
+            self.drivers.grok.bin = v;
+        }
         if let Some(v) = get("WARDEX_SYSTEMD_SCOPE") {
             self.resources.systemd_scope = matches!(v.as_str(), "1" | "true" | "yes");
         }
@@ -752,6 +809,26 @@ mod tests {
         assert_eq!(config.webhooks.len(), 1);
         assert_eq!(config.sessions, SessionsConfig::default());
         assert_eq!(config.external, ExternalConfig::default());
+    }
+
+    #[test]
+    fn grok_driver_config() {
+        let d = Config::default().drivers.grok;
+        assert_eq!(d.bin, "grok");
+        assert_eq!(d.approval, GrokApproval::Inherit);
+        let c = Config::parse(
+            "[drivers.grok]\nbin = \"/opt/grok\"\ndefault_model = \"m\"\ndefault_reasoning = \"low\"\napproval = \"always_approve\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.drivers.grok.approval, GrokApproval::AlwaysApprove);
+        assert_eq!(
+            c.drivers.defaults(DriverKind::Grok),
+            (Some("m".into()), Some("low".into()))
+        );
+        assert!(Config::parse("[drivers.grok]\napproval = \"yes\"\n").is_err());
+        let mut e = Config::default();
+        e.apply_env(env(&[("WARDEX_GROK_BIN", "/x/grok")]));
+        assert_eq!(e.drivers.grok.bin, "/x/grok");
     }
 
     #[test]

@@ -835,12 +835,7 @@ impl Manager {
         let driver = spec
             .driver
             .ok_or_else(|| ManagerError::Invalid("driver is required".into()))?;
-        if !self.inner.drivers.contains_key(&driver) {
-            return Err(ManagerError::Invalid(format!(
-                "driver {} is not available",
-                driver.as_str()
-            )));
-        }
+        self.check_driver(driver, spec.readonly)?;
         if spec.prompt.trim().is_empty() {
             return Err(ManagerError::Invalid("prompt is empty".into()));
         }
@@ -899,17 +894,7 @@ impl Manager {
             }
         }
 
-        let drivers_cfg = &self.inner.config.drivers;
-        let (default_model, default_reasoning) = match driver {
-            DriverKind::Claude => (
-                drivers_cfg.claude.default_model.clone(),
-                drivers_cfg.claude.default_reasoning.clone(),
-            ),
-            DriverKind::Codex => (
-                drivers_cfg.codex.default_model.clone(),
-                drivers_cfg.codex.default_reasoning.clone(),
-            ),
-        };
+        let (default_model, default_reasoning) = self.inner.config.drivers.defaults(driver);
         let now = now_ms();
         let mut record = SessionRecord {
             id: id.clone(),
@@ -965,6 +950,24 @@ impl Manager {
         self.finish_action().await;
         let session = self.record(&id).await?;
         Ok(RunOutcome { session, warnings })
+    }
+
+    /// `driver` is registered and can honor `readonly`.
+    fn check_driver(&self, driver: DriverKind, readonly: bool) -> Result<()> {
+        let Some(d) = self.inner.drivers.get(&driver) else {
+            return Err(ManagerError::Invalid(format!(
+                "driver {} is not available",
+                driver.as_str()
+            )));
+        };
+        if readonly && !d.supports_readonly() {
+            return Err(ManagerError::Invalid(format!(
+                "driver {} cannot enforce read-only sessions; run without --readonly or use \
+                 claude or codex",
+                driver.as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Spawn a process for `record` and register it as live.
@@ -2274,12 +2277,7 @@ impl Manager {
         let _one_at_a_time = self.inner.adopt_lock.lock().await;
         let source = self.resolve_external(&spec.id, spec.driver).await?;
         let driver = source.driver;
-        if !self.inner.drivers.contains_key(&driver) {
-            return Err(ManagerError::Invalid(format!(
-                "driver {} is not available",
-                driver.as_str()
-            )));
-        }
+        self.check_driver(driver, spec.readonly)?;
         let qualified = source.qualified_id();
         let fork = spec.fork;
         let existing = match &source.managed_by {
@@ -2365,17 +2363,7 @@ impl Manager {
             id = SessionId::generate();
         }
         let reservation = self.reserve_start(&id)?;
-        let drivers_cfg = &self.inner.config.drivers;
-        let (default_model, default_reasoning) = match driver {
-            DriverKind::Claude => (
-                drivers_cfg.claude.default_model.clone(),
-                drivers_cfg.claude.default_reasoning.clone(),
-            ),
-            DriverKind::Codex => (
-                drivers_cfg.codex.default_model.clone(),
-                drivers_cfg.codex.default_reasoning.clone(),
-            ),
-        };
+        let (default_model, default_reasoning) = self.inner.config.drivers.defaults(driver);
         let now = now_ms();
         let mut record = SessionRecord {
             id: id.clone(),
