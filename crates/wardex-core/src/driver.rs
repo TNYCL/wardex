@@ -84,6 +84,13 @@ pub enum DriverError {
 pub trait Driver: Send + Sync + 'static {
     fn kind(&self) -> DriverKind;
 
+    /// Whether the CLI itself can keep a session read-only. Drivers that
+    /// cannot are refused for `readonly` sessions rather than relying on the
+    /// prompt prefix alone.
+    fn supports_readonly(&self) -> bool {
+        true
+    }
+
     /// Start the agent process. Must be called inside a Tokio runtime.
     fn spawn(&self, spec: SpawnSpec, launcher: &Launcher) -> Result<DriverHandle, DriverError>;
 }

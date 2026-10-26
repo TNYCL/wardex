@@ -350,7 +350,7 @@ pub struct RunArgs {
     /// Remove the worktree when the session ends cleanly.
     #[arg(long, requires = "worktree")]
     pub rm_worktree: bool,
-    /// Read-only session (plan / read-only sandbox mode).
+    /// Read-only session (plan / read-only sandbox mode; claude and codex).
     #[arg(long)]
     pub readonly: bool,
     #[arg(long)]
@@ -375,6 +375,8 @@ pub struct RunArgs {
 pub enum Driver {
     Claude,
     Codex,
+    /// Grok Build (`grok agent stdio`); no `--readonly`.
+    Grok,
 }
 
 #[cfg(test)]

@@ -69,6 +69,15 @@ bin = "codex"
 # under-development Codex feature `default_mode_request_user_input`.
 request_user_input = false
 
+[drivers.grok]
+bin = "grok"
+# default_model = "..."
+# default_reasoning = "high"
+# Tool permission prompts: "inherit" (the user's Grok settings decide),
+# "ask" (always-approve off for Wardex sessions) or "always_approve"
+# (--always-approve). Wardex never answers a prompt on its own.
+approval = "inherit"
+
 [resources]
 systemd_scope = true
 # Slices that `wardex run --slice <name>` may use.

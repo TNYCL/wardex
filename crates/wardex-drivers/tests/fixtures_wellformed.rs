@@ -41,4 +41,5 @@ fn fixtures_are_wellformed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     assert!(check_dir(&root.join("claude")) > 0);
     assert!(check_dir(&root.join("codex")) > 0);
+    assert!(check_dir(&root.join("grok")) > 0);
 }

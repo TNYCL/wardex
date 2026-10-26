@@ -7,9 +7,11 @@ pub mod claude;
 pub mod claude_store;
 pub mod codex;
 pub mod codex_store;
+pub mod grok;
 pub mod runner;
 
 pub use claude::ClaudeDriver;
 pub use claude_store::ClaudeStore;
 pub use codex::CodexDriver;
 pub use codex_store::CodexStore;
+pub use grok::GrokDriver;

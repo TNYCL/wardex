@@ -127,7 +127,7 @@ fn definitions() -> Value {
         if *name=="wardex.approval" {required.extend(["request_id","request_seq","approval_kind"]);}
         let payload=json!({"type":"object","properties":{
             "schema_version":{"const":1},"session_id":{"type":"string"},"seq":{"type":"integer","minimum":1},
-            "driver":{"type":"string","enum":["claude","codex"]},"agent":{"type":["string","null"]},"task":{"type":["string","null"]},
+            "driver":{"type":"string","enum":["claude","codex","grok"]},"agent":{"type":["string","null"]},"task":{"type":["string","null"]},
             "request_id":{"type":"string"},"request_seq":{"type":"integer"},"question_count":{"type":"integer"},
             "approval_kind":{"type":"string"},"interrupted":{"type":"boolean"},"state":{"type":"string"},
             "reason":{"type":["string","null"]},"exit_code":{"type":["integer","null"]},

@@ -97,6 +97,10 @@ filter. Discovery returns the argument and payload schemas.
 | `wardex.stuck` | A running session needs attention. |
 | `wardex.resolved` | A native request was resolved or cancelled. |
 
+The `driver` enum in the published payload schema grows with new drivers
+(0.3 adds `grok`) while `schema_version` stays 1; consumers should accept
+unknown driver names.
+
 Payloads contain a version, session ID, per-session sequence, driver and
 labels (previews capped at 256 characters), plus minimal lifecycle/request fields. They exclude prompts, full
 answers, tool input/output, commands, error text, cwd and native transcript

@@ -131,6 +131,8 @@ impl ProcSnapshot {
                     (None, false) => {}
                 }
             }
+            // No external session store is read for this driver.
+            DriverKind::Grok => {}
         }
         Liveness::Inactive
     }

@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Grok Build driver (`--driver grok`, MCP `run` `driver: "grok"`): `grok
+  agent --no-leader stdio` over the Agent Client Protocol, recorded against
+  Grok 1.0.70. Turns, tool calls, `ask_user_question` questions (answered by
+  question text), interrupt (`session/cancel`) and resume (`session/resume`,
+  no history replay).
+- Model and effort for Grok are applied with `session/set_config_option` and
+  read back. The `started` event carries what Grok reports; a requested value
+  Grok does not apply fails the session instead of running with other
+  settings.
+- `drivers.grok.approval` (`inherit` by default, `ask`, `always_approve`)
+  selects Grok's execution mode. ACP permission requests become `approval`
+  events answered once (`allow_once` / `reject_once`), never "always".
+  Wardex never answers them on its own.
+- Drivers declare whether they can enforce read-only sessions; `run` and
+  `adopt` refuse `--readonly` for drivers that cannot.
+
+### Compatibility and operations
+
+- Not supported for Grok: `--readonly` (refused), fork and external
+  sessions. With the recording host's settings Grok's own permission modes
+  decided every tool call, so no ACP permission request was observed live;
+  that path is tested against ACP-schema messages only.
+- No database migration, but no clean downgrade either once Grok sessions
+  exist: Wardex 0.2.x and earlier reject rows with an unknown driver, so
+  their session lists that include such a row fail, and their startup
+  recovery fails if a Grok session was live when the daemon stopped. Keep a
+  database backup from before the upgrade if you may roll back. Older
+  versions also reject a `[drivers.grok]` config section.
+- The MCP Events payload schema's `driver` enum now includes `grok`
+  (`schema_version` stays 1).
+
 ## [0.2.0] - 2026-10-25
 
 ### Added
