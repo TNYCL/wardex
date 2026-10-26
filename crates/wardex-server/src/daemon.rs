@@ -19,7 +19,7 @@ use wardex_core::external::ExternalSource;
 use wardex_core::manager::{ExternalSetup, Manager};
 use wardex_core::process::Launcher;
 use wardex_core::store::{Store, StoreError};
-use wardex_drivers::{ClaudeDriver, ClaudeStore, CodexDriver, CodexStore, GrokDriver};
+use wardex_drivers::{AgyDriver, ClaudeDriver, ClaudeStore, CodexDriver, CodexStore, GrokDriver};
 
 use crate::api::Response;
 use crate::socket::Control;
@@ -76,6 +76,7 @@ pub fn drivers(config: &Config) -> Vec<Arc<dyn Driver>> {
         Arc::new(ClaudeDriver::new(config.drivers.claude.clone())),
         Arc::new(CodexDriver::new(config.drivers.codex.clone())),
         Arc::new(GrokDriver::new(config.drivers.grok.clone())),
+        Arc::new(AgyDriver::new(config.drivers.agy.clone())),
     ]
 }
 

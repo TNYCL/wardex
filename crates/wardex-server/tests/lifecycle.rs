@@ -60,6 +60,7 @@ impl Driver for Agent {
                         let _ = tx.send(DriverEvent::Exited {
                             code: Some(0),
                             stderr_tail: Vec::new(),
+                            interrupted: false,
                         });
                         return;
                     }

@@ -13,7 +13,8 @@ record_codex.py / record_grok.py / record_agy.py. The sanitizer:
   `available_commands_update` (the user's skills and plugins), and keeps only
   the version from the `initialize` result's `_meta` (host name, agent ids),
 - shortens opaque thinking signatures and replaces API ids with placeholders,
-- drops stderr lines.
+- drops stderr lines and other records outside the fixture format (the
+  `signal` marker of record_agy.py).
 
 Always grep the output for anything personal before committing it.
 """
@@ -93,7 +94,7 @@ def scrub(v):
 
 
 def keep(rec):
-    if rec["dir"] == "stderr":
+    if rec["dir"] not in ("in", "out", "exit"):
         return False
     m = rec["msg"]
     if isinstance(m, dict) and str(m.get("method", "")).startswith(CODEX_DROP):

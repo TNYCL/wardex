@@ -59,6 +59,10 @@ pub enum DriverEvent {
     Exited {
         code: Option<i32>,
         stderr_tail: Vec<String>,
+        /// The driver signalled the process to interrupt a turn (for CLIs
+        /// whose interrupt ends the process). Once that turn is over, a
+        /// non-zero exit code is not a failure.
+        interrupted: bool,
     },
 }
 

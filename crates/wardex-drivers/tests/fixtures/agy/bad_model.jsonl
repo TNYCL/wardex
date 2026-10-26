@@ -1,0 +1,4 @@
+{"t": 0.0, "dir": "in", "msg": {"event": "user", "message": {"content": "Reply with exactly: pong"}}}
+{"t": 1.512, "dir": "out", "msg": {"event": "result", "result": {"conversation_id": "", "status": "ERROR", "response": "", "error": "invalid model selection (--model \"gemini-3.8-flash-medium\" --effort \"high\"): --model gemini-3.8-flash-medium conflicts with --effort=high", "duration_seconds": 0, "num_turns": 0, "usage": {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 0}}}}
+{"t": 1.512, "dir": "in", "msg": {"event": "user", "message": {"content": "Reply with exactly: ping"}}}
+{"t": 1.605, "dir": "exit", "msg": 1}

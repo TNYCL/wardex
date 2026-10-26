@@ -1,9 +1,9 @@
 # Wardex scope (Phase 1 + Phase 2)
 
 Wardex is an open-source orchestrator daemon, written in Rust, that starts,
-watches and manages Claude Code, Codex and Grok Build sessions. Bots and other agents reach
-those sessions over MCP; important events are pushed via webhooks. Target
-scale: ~30 concurrent agents on one Linux host. It replaces ad-hoc setups built
+watches and manages Claude Code, Codex, Grok Build and Antigravity CLI
+sessions. Bots and other agents reach those sessions over MCP; important
+events are pushed via webhooks. Target scale: ~30 concurrent agents on one Linux host. It replaces ad-hoc setups built
 on tmux, `send-keys` and output scraping.
 
 ## 0. Ground rules
@@ -20,7 +20,8 @@ on tmux, `send-keys` and output scraping.
   every session. Sessions are told apart by `agent` and `task` labels.
 - **Hands off CLI config:** Wardex only passes per-session flags and
   protocol options (`--model`, `-c`, `--enable`, ACP session options, …). It
-  never edits `~/.claude*`, `~/.codex/` or `~/.grok/` and does
+  never edits `~/.claude*`, `~/.codex/`, `~/.grok/` or Antigravity's
+  settings and does
   not set a separate `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so sessions share the
   user's existing settings, auth and quota. Wardex may **read** the CLIs'
   session stores there (external session discovery and history, §2.4); it
@@ -82,6 +83,20 @@ stdio).
 - Questions (`_x.ai/ask_user_question`) become `question` events, answered by
   question text. Interrupt via `session/cancel`; resume via `session/resume`.
 - Not supported: `--readonly` (refused), fork, external sessions.
+
+**Antigravity CLI (0.3):** `agy --input-format stream-json --output-format
+stream-json` (headless, one process per session).
+
+- `--model` / `--effort` are passed as given; agy echoes the model only and
+  never reports the effort. Resume via `--conversation`.
+- Execution mode is the operator's choice (`drivers.agy.approval`):
+  `inherit` (default) or `always_approve` (`--dangerously-skip-permissions`).
+  Headless agy denies actions that need review yet reports success; Wardex
+  reports such a turn as `error`, not `done`.
+- Interrupt: SIGINT, which ends the agy process; the session ends `done` and
+  `send` resumes it.
+- Not supported: questions and approvals (headless agy cannot ask),
+  `--readonly` (refused), fork, external sessions.
 
 **Driver trait:** `start`, `send_message`, `answer`, `interrupt`, `stop`,
 `events() -> Stream<Event>`, plus whether the CLI can keep a session
@@ -262,7 +277,7 @@ from an external session that has not run in Wardex yet), also sent as
   with matching labels, live or ended.
 
 - All accept `--json`. The CLI talks to the daemon over a local Unix socket.
-- `run`: `--driver claude|codex|grok`, `--model`, `--reasoning`, `--cwd`,
+- `run`: `--driver claude|codex|grok|agy`, `--model`, `--reasoning`, `--cwd`,
   `--worktree`, `--branch`, `--readonly`, `--agent`, `--task`, `--slice`,
   `--prompt` or `--prompt-file`.
 - `summary`: final result text, touched files, duration, event/tool counts.

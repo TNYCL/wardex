@@ -66,6 +66,7 @@ impl Driver for CodexDriver {
             program: &self.config.bin,
             args: &args,
             cwd: &spec.cwd,
+            env: &[],
         };
         spawn_with(launcher, &req, CodexProtocol::new(&spec))
     }

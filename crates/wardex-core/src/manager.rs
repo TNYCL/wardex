@@ -1053,13 +1053,18 @@ impl Manager {
             while let Some(ev) = events.recv().await {
                 match ev {
                     DriverEvent::Event(kind) => this.on_event(&id, generation, kind).await,
-                    DriverEvent::Exited { code, stderr_tail } => {
-                        this.on_exit(&id, generation, code, stderr_tail).await;
+                    DriverEvent::Exited {
+                        code,
+                        stderr_tail,
+                        interrupted,
+                    } => {
+                        this.on_exit(&id, generation, code, stderr_tail, interrupted)
+                            .await;
                         return;
                     }
                 }
             }
-            this.on_exit(&id, generation, None, Vec::new()).await;
+            this.on_exit(&id, generation, None, Vec::new(), false).await;
         });
         Ok(())
     }
@@ -1335,6 +1340,7 @@ impl Manager {
         generation: u32,
         code: Option<i32>,
         stderr_tail: Vec<String>,
+        interrupted: bool,
     ) {
         let unit = self
             .live()
@@ -1375,7 +1381,7 @@ impl Manager {
                     EndReason::Shutdown
                 };
                 (SessionState::Orphaned, reason)
-            } else if entry.idle_exit || (code == Some(0) && !entry.turn_active) {
+            } else if entry.idle_exit || ((code == Some(0) || interrupted) && !entry.turn_active) {
                 let reason = entry.idle_reason.unwrap_or(EndReason::Done);
                 (SessionState::Done, reason)
             } else {

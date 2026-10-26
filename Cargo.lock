@@ -2747,6 +2747,7 @@ dependencies = [
 name = "wardex-drivers"
 version = "0.2.0"
 dependencies = [
+ "nix",
  "ruzstd",
  "serde_json",
  "tempfile",

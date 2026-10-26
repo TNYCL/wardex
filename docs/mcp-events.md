@@ -98,7 +98,7 @@ filter. Discovery returns the argument and payload schemas.
 | `wardex.resolved` | A native request was resolved or cancelled. |
 
 The `driver` enum in the published payload schema grows with new drivers
-(0.3 adds `grok`) while `schema_version` stays 1; consumers should accept
+(0.3 adds `grok` and `agy`) while `schema_version` stays 1; consumers should accept
 unknown driver names.
 
 Payloads contain a version, session ID, per-session sequence, driver and

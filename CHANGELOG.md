@@ -23,21 +23,38 @@ All notable changes to this project are documented here. The format follows
   Wardex never answers them on its own.
 - Drivers declare whether they can enforce read-only sessions; `run` and
   `adopt` refuse `--readonly` for drivers that cannot.
+- Antigravity CLI driver (`--driver agy`, MCP `run` `driver: "agy"`): `agy`
+  in headless stream-json mode, recorded against agy 1.4.7. Turns, tool
+  calls, `--model` / `--effort`, resume (`--conversation`) and interrupt
+  (SIGINT; the process ends, the session ends `done` and `send` resumes it).
+- `drivers.agy.approval` (`inherit` by default, `always_approve` for
+  `--dangerously-skip-permissions`) selects agy's execution mode;
+  `drivers.agy.extra_args` passes other options such as `--sandbox`.
 
 ### Compatibility and operations
 
+- Headless agy denies actions that need review and still reports success;
+  Wardex reports such a turn as an `error` naming the denied actions, not as
+  `done`.
+- Not supported for agy: questions and approvals (headless agy cannot ask),
+  `--readonly` (refused), fork and external sessions. agy never reports its
+  effort; `started` carries only the model it echoes. Model ids that embed an
+  effort conflict with `--reasoning`.
+- Wardex starts agy with `AGY_CLI_DISABLE_AUTO_UPDATE=1`; update agy
+  yourself. Without systemd scopes, a tool command running when an agy turn
+  is interrupted can outlive the session.
 - Not supported for Grok: `--readonly` (refused), fork and external
   sessions. With the recording host's settings Grok's own permission modes
   decided every tool call, so no ACP permission request was observed live;
   that path is tested against ACP-schema messages only.
-- No database migration, but no clean downgrade either once Grok sessions
-  exist: Wardex 0.2.x and earlier reject rows with an unknown driver, so
-  their session lists that include such a row fail, and their startup
-  recovery fails if a Grok session was live when the daemon stopped. Keep a
-  database backup from before the upgrade if you may roll back. Older
-  versions also reject a `[drivers.grok]` config section.
-- The MCP Events payload schema's `driver` enum now includes `grok`
-  (`schema_version` stays 1).
+- No database migration, but no clean downgrade either once Grok or agy
+  sessions exist: Wardex 0.2.x and earlier reject rows with an unknown
+  driver, so their session lists that include such a row fail, and their
+  startup recovery fails if such a session was live when the daemon stopped.
+  Keep a database backup from before the upgrade if you may roll back. Older
+  versions also reject `[drivers.grok]` and `[drivers.agy]` config sections.
+- The MCP Events payload schema's `driver` enum now includes `grok` and
+  `agy` (`schema_version` stays 1).
 
 ## [0.2.0] - 2026-10-25
 

@@ -1,6 +1,6 @@
 [package]
 name = "wardex-drivers"
-description = "Claude Code and Codex drivers for Wardex"
+description = "Claude Code, Codex, Grok Build and Antigravity drivers for Wardex"
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
@@ -13,6 +13,7 @@ include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
 wardex-core.workspace = true
+nix.workspace = true
 ruzstd.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

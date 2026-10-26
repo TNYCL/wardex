@@ -92,7 +92,7 @@ Session ids can be shortened to any unique prefix.
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `run` | `driver` (`claude`/`codex`/`grok`; `grok` refuses `readonly`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
+| `run` | `driver` (`claude`/`codex`/`grok`/`agy`; `grok` and `agy` refuse `readonly`), `prompt`, `cwd` (absolute, on the Wardex host); optional `model`, `reasoning`, `worktree`, `branch`, `remove_worktree`, `readonly`, `agent`, `task`, `slice` | `{session, warnings}` |
 | `overview` | optional `events` (latest events per session, default 3) | live sessions with state, pending questions, running tools, RSS/CPU, duration, `idle_since_ms`, `shutdown_in_ms` and latest events; counts per state; sessions ended in the last 24h |
 | `list` | optional `all`; filters `agent`, `task` (globs with `*`, `?`), `ended` (ended sessions only), `resumable` (ended sessions `send` can continue), `origin` (`wardex`, `adopted`, `forked`) | session records (with `ended_reason`, `origin`), newest first, at most 500 |
 | `status` | `id` | record, pending questions, running tools, RSS/CPU |
@@ -145,7 +145,9 @@ items:
   report it, so for Claude it stays empty unless given per run or through
   `drivers.claude.default_reasoning`. Grok reports both model and effort; the
   `started` event carries what it reports, and a requested value Grok does not
-  apply fails the session.
+  apply fails the session. Antigravity (`agy`) echoes only the model it was
+  given and never reports the effort, so its `reasoning` is the requested
+  value.
 - `summary.duration_ms` runs from creation to the end of the last turn (to
   now while a turn runs). `last_turn_ended_ms` is when that turn ended and
   `last_turn_ms` how long it took, from its prompt.
@@ -235,8 +237,9 @@ Without webhooks, poll `overview` or follow one session with `tail` +
 
 A short description the bot's instructions can include:
 
-> Wardex (MCP server `wardex`) runs Claude Code, Codex and Grok Build sessions
-> for you. Start one with `run` (`driver` claude, codex or grok, absolute `cwd`, `agent` set
+> Wardex (MCP server `wardex`) runs Claude Code, Codex, Grok Build and
+> Antigravity sessions for you. Start one with `run` (`driver` claude, codex,
+> grok or agy, absolute `cwd`, `agent` set
 > to your name and `task` to a short label). Sessions work on their own. When
 > one asks a question it shows up in `pending_questions`; reply with `answer`.
 > When a turn is done, read `summary` and continue with `send` if needed.
