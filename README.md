@@ -9,7 +9,7 @@ client.**
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](https://github.com/TNYCL/wardex#license)
 [![MSRV: 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://github.com/TNYCL/wardex/blob/main/Cargo.toml)
 
-> **Status: early release (0.2).** Linux only. Interfaces, config and the
+> **Status: early release (0.3).** Linux only. Interfaces, config and the
 > database schema may still change between minor versions; see the
 > [changelog](https://github.com/TNYCL/wardex/blob/main/CHANGELOG.md) before
 > upgrading.

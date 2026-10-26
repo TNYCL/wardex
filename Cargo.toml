@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -13,9 +13,9 @@ keywords = ["claude-code", "codex", "agents", "orchestrator", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-wardex-core = { path = "crates/wardex-core", version = "0.2.0" }
-wardex-drivers = { path = "crates/wardex-drivers", version = "0.2.0" }
-wardex-server = { path = "crates/wardex-server", version = "0.2.0" }
+wardex-core = { path = "crates/wardex-core", version = "0.3.0" }
+wardex-drivers = { path = "crates/wardex-drivers", version = "0.3.0" }
+wardex-server = { path = "crates/wardex-server", version = "0.3.0" }
 
 anyhow = "1.0"
 base64 = "0.23"
